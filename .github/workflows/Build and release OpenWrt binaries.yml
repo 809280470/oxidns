@@ -1,0 +1,96 @@
+name: Build and release OpenWrt binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.1.0)'
+        required: false
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, armv7-unknown-linux-musleabihf]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build with cross
+        uses: cross-rs/cross@v0.2.1
+        with:
+          args: build --release --target ${{ matrix.target }}
+
+      - name: Collect artifact
+        run: |
+          mkdir -p artifacts
+          BIN=target/${{ matrix.target }}/release/oxidns
+          if [ -f "$BIN" ]; then
+            cp "$BIN" artifacts/oxidns-${{ matrix.target }}
+            chmod +x artifacts/oxidns-${{ matrix.target }}
+          else
+            echo "Warning: built binary not found: $BIN"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidns-${{ matrix.target }}
+          path: artifacts/oxidns-${{ matrix.target }}
+
+  release:
+    name: Create GitHub Release and upload assets
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release and upload assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -e
+          TAG="$REF_NAME"
+          if [ -z "$TAG" ]; then
+            TAG="$INPUT_TAG"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "No tag provided. For workflow_dispatch provide 'tag' input or trigger via a tag push (vX.Y.Z)."
+            exit 1
+          fi
+
+          echo "Creating release $TAG"
+          RESPONSE=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" \
+            "https://api.github.com/repos/$REPO/releases" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"Automated OpenWrt binaries\"}")
+
+          UPLOAD_URL=$(echo "$RESPONSE" | python -c "import sys, json; print(json.load(sys.stdin).get('upload_url',''))")
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "Failed to create release: $RESPONSE"
+            exit 1
+          fi
+          UPLOAD_URL=${UPLOAD_URL%\{*}
+
+          echo "Uploading artifacts from artifacts/"
+          for f in artifacts/*; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f")
+            echo "Uploading $NAME"
+            curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" "$UPLOAD_URL?name=$NAME" || { echo "upload failed: $NAME"; exit 1; }
+          done
+
+          echo "Release $TAG created and assets uploaded."
