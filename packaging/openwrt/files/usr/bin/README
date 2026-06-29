@@ -1,0 +1,7 @@
+This directory is intended to hold the prebuilt oxidns binaries for OpenWrt packaging.
+
+Place the oxidns binary built for the target architecture at:
+
+  usr/bin/oxidns
+
+Do not commit large binaries to the repository in general — prefer building via CI and publishing Release assets, then download them during SDK packaging.

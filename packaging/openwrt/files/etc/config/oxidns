@@ -1,0 +1,4 @@
+# UCI config for oxidns
+config oxidns 'main'
+	option enabled '1'
+	option config_path '/etc/oxidns/config.yaml'
