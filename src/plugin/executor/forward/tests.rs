@@ -25,11 +25,18 @@ use crate::plugin::executor::{ExecStep, Executor};
 use crate::plugin::{PluginFactory, UninitializedPlugin};
 use crate::proto::{A, Message, Name, Question, RData, Rcode, Record, RecordType};
 
+#[derive(Debug, Clone, Copy)]
+enum MockAnswer {
+    None,
+    A,
+    Cname,
+}
+
 #[derive(Debug)]
 struct MockUpstream {
     connection_info: ConnectionInfo,
     response_code: Option<Rcode>,
-    answer: bool,
+    answer: MockAnswer,
     fail_message: Option<String>,
     delay: Duration,
 }
@@ -41,7 +48,13 @@ impl MockUpstream {
 
     fn ok_with_answer(delay: Duration) -> Self {
         let mut upstream = Self::response(Rcode::NoError, delay);
-        upstream.answer = true;
+        upstream.answer = MockAnswer::A;
+        upstream
+    }
+
+    fn ok_with_cname_answer(delay: Duration) -> Self {
+        let mut upstream = Self::response(Rcode::NoError, delay);
+        upstream.answer = MockAnswer::Cname;
         upstream
     }
 
@@ -50,7 +63,7 @@ impl MockUpstream {
             connection_info: ConnectionInfo::with_addr("1.1.1.1")
                 .expect("mock upstream addr must be valid"),
             response_code: Some(response_code),
-            answer: false,
+            answer: MockAnswer::None,
             fail_message: None,
             delay,
         }
@@ -61,7 +74,7 @@ impl MockUpstream {
             connection_info: ConnectionInfo::with_addr("1.1.1.1")
                 .expect("mock upstream addr must be valid"),
             response_code: None,
-            answer: false,
+            answer: MockAnswer::None,
             fail_message: Some(msg.to_string()),
             delay,
         }
@@ -79,12 +92,24 @@ impl Upstream for MockUpstream {
         }
         let response_code = self.response_code.unwrap_or(Rcode::NoError);
         let mut response = request.response(response_code);
-        if self.answer {
-            response.add_answer(Record::from_rdata(
-                Name::from_ascii("example.com.").unwrap(),
-                60,
-                RData::A(A("192.0.2.1".parse().unwrap())),
-            ));
+        match self.answer {
+            MockAnswer::None => {}
+            MockAnswer::A => {
+                response.add_answer(Record::from_rdata(
+                    Name::from_ascii("example.com.").unwrap(),
+                    60,
+                    RData::A(A("192.0.2.1".parse().unwrap())),
+                ));
+            }
+            MockAnswer::Cname => {
+                response.add_answer(Record::from_rdata(
+                    Name::from_ascii("example.com.").unwrap(),
+                    60,
+                    RData::CNAME(crate::proto::CNAME(
+                        Name::from_ascii("target.example.com.").unwrap(),
+                    )),
+                ));
+            }
         }
         Ok(response)
     }
@@ -452,6 +477,54 @@ async fn balanced_selection_waits_briefly_for_positive_after_negative() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn balanced_selection_waits_for_complete_answer_after_cname_only() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Balanced,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn balanced_selection_keeps_cname_only_above_negative_fallback() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::response(
+                Rcode::NXDomain,
+                Duration::from_millis(20),
+            )),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Balanced,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::CNAME));
+    assert!(!response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
 async fn prefer_positive_waits_for_late_positive() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
@@ -471,6 +544,54 @@ async fn prefer_positive_waits_for_late_positive() {
     assert!(matches!(step, ExecStep::Next));
     assert_eq!(response.rcode(), Rcode::NoError);
     assert_eq!(response.answers().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn prefer_positive_waits_for_complete_answer_after_cname_only() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::PreferPositive,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn prefer_positive_keeps_cname_only_above_negative_fallback() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::response(
+                Rcode::NXDomain,
+                Duration::from_millis(20),
+            )),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::PreferPositive,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::CNAME));
+    assert!(!response.has_answer_type(RecordType::A));
 }
 
 #[tokio::test(start_paused = true)]
@@ -530,4 +651,59 @@ async fn consensus_selection_waits_when_negative_votes_disagree() {
     assert!(matches!(step, ExecStep::Next));
     assert_eq!(response.rcode(), Rcode::NoError);
     assert_eq!(response.answers().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn consensus_selection_does_not_count_cname_only_as_negative_vote() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 3,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::response(
+                Rcode::NXDomain,
+                Duration::from_millis(20),
+            )),
+            Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Consensus,
+        metrics: Arc::new(ForwardMetrics::new(
+            "forward-test".to_string(),
+            vec!["u0".to_string(), "u1".to_string(), "u2".to_string()],
+        )),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn consensus_selection_keeps_cname_only_above_negative_fallback() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::response(
+                Rcode::NXDomain,
+                Duration::from_millis(20),
+            )),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Consensus,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::CNAME));
+    assert!(!response.has_answer_type(RecordType::A));
 }
