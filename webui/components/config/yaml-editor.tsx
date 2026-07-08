@@ -1,11 +1,19 @@
 "use client";
 
-import Editor, { type OnMount } from "@monaco-editor/react";
+import { EditorState, StateEffect } from "@codemirror/state";
+import {
+  EditorView,
+  highlightActiveLine,
+  highlightActiveLineGutter,
+  lineNumbers as codeMirrorLineNumbers,
+} from "@codemirror/view";
 import { useTheme } from "next-themes";
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -13,21 +21,15 @@ import {
 import type { ConfigField } from "@/lib/plugin-definitions";
 import { ConfigValidationError, validateConfigText } from "@/lib/oxidns-api";
 import {
-  clearOxiDnsYamlModelContext,
-  registerOxiDnsYamlLanguage,
-  setOxiDnsYamlModelContext,
-  updateOxiDnsYamlMarkers,
+  applyOxiDnsYamlDiagnostics,
+  oxidnsYamlExtensions,
   type OxiDnsYamlDiagnostic,
   type OxiDnsYamlEditorVariant,
-} from "@/lib/oxidns-yaml-monaco";
+} from "@/lib/oxidns-yaml-codemirror";
 import type { PluginInstance } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
-
-type MonacoApi = Parameters<OnMount>[1];
-type MonacoEditor = Parameters<OnMount>[0];
-type MonacoModel = ReturnType<MonacoEditor["getModel"]>;
 
 export interface YamlEditorHandle {
   jumpToLine: (line: number) => void;
@@ -44,7 +46,7 @@ interface YamlEditorProps {
   pluginKind?: string;
   fields?: ConfigField[];
   currentPluginName?: string;
-  /** Bound to Cmd+S (macOS) / Ctrl+S (Windows/Linux) via Monaco. */
+  /** Bound to Cmd+S (macOS) / Ctrl+S (Windows/Linux). */
   onSave?: () => void;
   /** Run the backend /config/validate pass. Disable in offline mode. */
   backendValidation?: boolean;
@@ -70,27 +72,14 @@ export const YamlEditor = forwardRef<YamlEditorHandle, YamlEditorProps>(
   ) {
     const { locale, t } = useI18n();
     const { resolvedTheme } = useTheme();
-    const editorRef = useRef<MonacoEditor | null>(null);
-    const monacoRef = useRef<MonacoApi | null>(null);
-    const modelRef = useRef<MonacoModel | null>(null);
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const viewRef = useRef<EditorView | null>(null);
     const validationSeqRef = useRef(0);
-    // Bound once in onMount; deref the latest handler so we never re-bind.
+    const onChangeRef = useRef(onChange);
     const onSaveRef = useRef(onSave);
+    const externalUpdateRef = useRef(false);
+    onChangeRef.current = onChange;
     onSaveRef.current = onSave;
-
-    useImperativeHandle(
-      ref,
-      () => ({
-        jumpToLine(line: number) {
-          const editor = editorRef.current;
-          if (!editor) return;
-          editor.revealLineInCenter(line);
-          editor.setPosition({ lineNumber: line, column: 1 });
-          editor.focus();
-        },
-      }),
-      [],
-    );
 
     const [backendDiagnostics, setBackendDiagnostics] = useState<
       OxiDnsYamlDiagnostic[]
@@ -106,61 +95,102 @@ export const YamlEditor = forwardRef<YamlEditorHandle, YamlEditorProps>(
       }),
       [variant, locale, plugins, pluginKind, fields, currentPluginName],
     );
-    const theme =
-      resolvedTheme === "light" ? "oxidns-yaml-light" : "oxidns-yaml-dark";
+    const editorTheme = resolvedTheme === "light" ? "light" : "dark";
+    const handleSave = useCallback(() => {
+      onSaveRef.current?.();
+    }, []);
 
-    // beforeMount runs synchronously before monaco.editor.create(), ensuring
-    // custom themes are defined before the editor tries to apply them via the
-    // theme prop. Without this, the editor briefly renders with vs-dark / vs.
-    const handleBeforeMount = (monaco: MonacoApi) => {
-      registerOxiDnsYamlLanguage(monaco);
-    };
-
-    const handleMount: OnMount = (editor, monaco) => {
-      editorRef.current = editor;
-      monacoRef.current = monaco;
-      const model = editor.getModel();
-      modelRef.current = model;
-
-      registerOxiDnsYamlLanguage(monaco);
-      // KeyMod.CtrlCmd maps to ⌘ on macOS and Ctrl on Windows/Linux
-      // automatically, so the save shortcut is OS-correct by construction and
-      // the browser "save page" dialog is suppressed while the editor is focused.
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-        onSaveRef.current?.();
-      });
-      if (model) {
-        setOxiDnsYamlModelContext(model, context);
-        updateOxiDnsYamlMarkers(monaco, model, context, backendDiagnostics);
-      }
-    };
-
-    useEffect(() => {
-      const model = modelRef.current;
-      if (!model) return;
-      setOxiDnsYamlModelContext(model, context);
-    }, [context]);
-
-    useEffect(() => {
-      const monaco = monacoRef.current;
-      const model = modelRef.current;
-      if (!monaco || !model) return;
-      updateOxiDnsYamlMarkers(
-        monaco,
-        model,
+    const extensions = useMemo(
+      () => [
+        lineNumbers ? codeMirrorLineNumbers() : [],
+        highlightActiveLine(),
+        lineNumbers ? highlightActiveLineGutter() : [],
+        EditorState.readOnly.of(readOnly),
+        EditorView.editable.of(!readOnly),
+        EditorView.updateListener.of((update) => {
+          if (!update.docChanged || externalUpdateRef.current) return;
+          onChangeRef.current?.(update.state.doc.toString());
+        }),
+        ...oxidnsYamlExtensions(context, {
+          backendDiagnostics:
+            variant === "config" && !readOnly && backendValidation
+              ? backendDiagnostics
+              : [],
+          lineNumbers,
+          onSave: handleSave,
+          readOnly,
+          theme: editorTheme,
+        }),
+      ],
+      [
+        backendDiagnostics,
+        backendValidation,
         context,
-        variant === "config" && !readOnly && backendValidation
-          ? backendDiagnostics
-          : [],
-      );
-    }, [
-      backendValidation,
-      backendDiagnostics,
-      context,
-      readOnly,
-      value,
-      variant,
-    ]);
+        editorTheme,
+        handleSave,
+        lineNumbers,
+        readOnly,
+        variant,
+      ],
+    );
+
+    useLayoutEffect(() => {
+      const container = containerRef.current;
+      if (!container || viewRef.current) return;
+      const view = new EditorView({
+        parent: container,
+        state: EditorState.create({
+          doc: value,
+          extensions,
+        }),
+      });
+      viewRef.current = view;
+
+      return () => {
+        view.destroy();
+        viewRef.current = null;
+      };
+      // The initial view is created once; extension and value updates are
+      // handled by the effects below so scroll position is not reset.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch({ effects: StateEffect.reconfigure.of(extensions) });
+    }, [extensions]);
+
+    useEffect(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      const currentValue = view.state.doc.toString();
+      if (currentValue === value) return;
+      externalUpdateRef.current = true;
+      view.dispatch({
+        changes: { from: 0, to: currentValue.length, insert: value },
+      });
+      externalUpdateRef.current = false;
+    }, [value]);
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        jumpToLine(lineNumber: number) {
+          const view = viewRef.current;
+          if (!view) return;
+          const line = view.state.doc.line(
+            Math.min(Math.max(1, lineNumber), view.state.doc.lines),
+          );
+          view.dispatch({
+            selection: { anchor: line.from },
+            effects: EditorView.scrollIntoView(line.from, { y: "center" }),
+          });
+          view.focus();
+        },
+      }),
+      [],
+    );
 
     useEffect(() => {
       if (variant !== "config" || readOnly || !backendValidation) {
@@ -199,73 +229,32 @@ export const YamlEditor = forwardRef<YamlEditorHandle, YamlEditorProps>(
     }, [backendValidation, readOnly, t, value, variant]);
 
     useEffect(() => {
-      const model = modelRef.current;
-      return () => {
-        if (model) clearOxiDnsYamlModelContext(model);
-      };
-    }, []);
-
-    useEffect(() => {
-      const monaco = monacoRef.current;
-      if (!monaco) return;
-      monaco.editor.setTheme(theme);
-    }, [theme]);
+      const view = viewRef.current;
+      if (!view) return;
+      applyOxiDnsYamlDiagnostics(
+        view,
+        context,
+        variant === "config" && !readOnly && backendValidation
+          ? backendDiagnostics
+          : [],
+      );
+    }, [
+      backendDiagnostics,
+      backendValidation,
+      context,
+      readOnly,
+      value,
+      variant,
+    ]);
 
     return (
       <div
+        ref={containerRef}
         className={cn(
-          "relative overflow-hidden rounded-md border bg-muted/30 font-mono text-sm [&_.monaco-editor_.sticky-widget]:bg-background [&_.monaco-editor_.sticky-widget_.sticky-widget-line-numbers]:bg-background [&>section]:min-h-[inherit]",
+          "relative h-full min-h-0 overflow-hidden rounded-md border bg-muted/30 font-mono text-sm [&_.cm-editor]:h-full [&_.cm-editor]:min-h-0 [&_.cm-scroller]:h-full [&_.cm-scroller]:overflow-auto",
           className,
         )}
-      >
-        <Editor
-          height="100%"
-          value={value}
-          defaultLanguage="yaml"
-          language="yaml"
-          theme={theme}
-          beforeMount={handleBeforeMount}
-          onMount={handleMount}
-          onChange={(nextValue) => onChange?.(nextValue ?? "")}
-          options={{
-            readOnly,
-            tabSize: 2,
-            insertSpaces: true,
-            detectIndentation: false,
-            minimap: { enabled: false },
-            lineNumbers: lineNumbers ? "on" : "off",
-            lineNumbersMinChars: 4,
-            lineDecorationsWidth: 10,
-            glyphMargin: false,
-            folding: true,
-            scrollBeyondLastLine: false,
-            wordWrap: "on",
-            wrappingIndent: "same",
-            automaticLayout: true,
-            fontSize: 14,
-            lineHeight: 24,
-            fontFamily:
-              "JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace",
-            letterSpacing: 0,
-            padding: { top: 12, bottom: 12 },
-            renderLineHighlight: "line",
-            stickyScroll: { enabled: true },
-            scrollbar: {
-              verticalScrollbarSize: 10,
-              horizontalScrollbarSize: 10,
-            },
-            quickSuggestions: {
-              other: true,
-              comments: false,
-              strings: true,
-            },
-            suggestOnTriggerCharacters: true,
-            fixedOverflowWidgets: true,
-            contextmenu: true,
-            readOnlyMessage: { value: t(WEBUI.common.readOnly) },
-          }}
-        />
-      </div>
+      />
     );
   },
 );
