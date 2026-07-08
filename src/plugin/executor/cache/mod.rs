@@ -861,9 +861,7 @@ impl Cache {
                         hit_kind: Some(CacheHitKind::Fresh),
                         refresh_entry: None,
                     });
-                }
-
-                if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms {
+                } else if self.config.lazy_cache_ttl.is_some() && now < item.expire_at_ms {
                     let refresh_entry = CacheEntryIdentity {
                         value: item.value.clone(),
                         cache_time_ms: item.cache_time_ms,
@@ -2474,6 +2472,50 @@ mod tests {
         assert!(context.response().is_none());
         assert_eq!(cache.cache_map.get().unwrap().len(), 0);
         assert_eq!(cache.metrics.miss_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            cache
+                .metrics
+                .skip_no_ttl_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_cname_only_address_entry_is_not_served_as_lazy_stale_hit() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(30);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let mut context = make_context(make_request_with_query("example.com.", false, false));
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+        let now = AppClock::elapsed_millis();
+        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+            key,
+            Arc::new(CacheItem::new(
+                cname_only_response_for_domain("example.com.", 60),
+                60,
+                now.saturating_sub(1_000),
+            )),
+            now.saturating_sub(61_000),
+            now.saturating_add(30_000),
+            now,
+        );
+
+        let lookup = cache
+            .try_cache_hit(&mut context, cache.cache_map.get().unwrap())
+            .expect("cache lookup should exist");
+
+        assert_eq!(lookup.hit_kind, None);
+        assert!(context.response().is_none());
+        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
+        assert_eq!(cache.metrics.miss_total.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            cache.metrics.stale_hit_total.load(AtomicOrdering::Relaxed),
+            0
+        );
         assert_eq!(
             cache
                 .metrics
