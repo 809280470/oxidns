@@ -32,7 +32,7 @@ use crate::infra::observability::metrics::{
 use crate::infra::task as task_center;
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
-use crate::proto::{Message, Rcode};
+use crate::proto::{Message, Rcode, RecordType};
 use crate::{continue_next, plugin_factory};
 
 #[cfg(feature = "api")]
@@ -783,12 +783,10 @@ impl Cache {
     }
 
     #[inline]
-    fn can_lazy_cache_response(&self, response: &Message) -> bool {
+    fn can_lazy_cache_response(&self, response: &Message, record_type: RecordType) -> bool {
         self.config.lazy_cache_ttl.is_some()
-            && response.rcode() == Rcode::NoError
-            && !response.answers().is_empty()
             && matches!(
-                self.compute_positive_ttl(response),
+                self.compute_positive_ttl(response, record_type),
                 CacheTtlDecision::Cache(_)
             )
     }
@@ -942,8 +940,12 @@ impl Cache {
     }
 
     #[inline]
-    fn compute_positive_ttl(&self, response: &Message) -> CacheTtlDecision {
-        if response.rcode() != Rcode::NoError {
+    fn compute_positive_ttl(
+        &self,
+        response: &Message,
+        record_type: RecordType,
+    ) -> CacheTtlDecision {
+        if !is_complete_positive_response(response, record_type) {
             return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
         }
 
@@ -995,8 +997,8 @@ impl Cache {
     }
 
     #[inline]
-    fn compute_cache_ttl(&self, response: &Message) -> CacheTtlDecision {
-        match self.compute_positive_ttl(response) {
+    fn compute_cache_ttl(&self, response: &Message, record_type: RecordType) -> CacheTtlDecision {
+        match self.compute_positive_ttl(response, record_type) {
             CacheTtlDecision::Cache(ttl) => CacheTtlDecision::Cache(ttl),
             CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl) => {
                 CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
@@ -1016,8 +1018,8 @@ impl Cache {
     fn update_cache_entry(&self, cache_map: &CacheMap, key: CacheKey, response: Message, ttl: u32) {
         let now = AppClock::elapsed_millis();
         let fresh_until_ms = Self::compute_fresh_until_ms(now, ttl);
-        let expire_time =
-            self.compute_expire_time(now, ttl, self.can_lazy_cache_response(&response));
+        let enable_lazy = self.can_lazy_cache_response(&response, key.record_type);
+        let expire_time = self.compute_expire_time(now, ttl, enable_lazy);
         let item = CacheItem::new(response, ttl, fresh_until_ms);
         debug!(
             "cached: domain={}, type={:?}, class={:?}, ttl={}",
@@ -1080,6 +1082,7 @@ impl Cache {
                 Ok(Ok(Some(response))) if !response.truncated() => {
                     let ttl = compute_cache_ttl_with_policy(
                         &response,
+                        key.record_type,
                         max_positive_ttl,
                         min_positive_ttl,
                         cache_negative,
@@ -1090,11 +1093,10 @@ impl Cache {
                         let now = AppClock::elapsed_millis();
                         let fresh_until_ms = Cache::compute_fresh_until_ms(now, ttl);
                         let enable_lazy = lazy_cache_ttl.is_some()
-                            && response.rcode() == Rcode::NoError
-                            && !response.answers().is_empty()
                             && matches!(
                                 compute_positive_ttl_with_policy(
                                     &response,
+                                    key.record_type,
                                     max_positive_ttl,
                                     min_positive_ttl
                                 ),
@@ -1312,7 +1314,7 @@ impl Executor for Cache {
                 return Ok(next_step);
             }
 
-            match self.compute_cache_ttl(response) {
+            match self.compute_cache_ttl(response, key.record_type) {
                 CacheTtlDecision::Cache(ttl) => {
                     self.update_cache_entry(cache_map, key, response.clone(), ttl);
                 }
@@ -1327,10 +1329,11 @@ impl Executor for Cache {
 
 fn compute_positive_ttl_with_policy(
     response: &Message,
+    record_type: RecordType,
     max_positive_ttl: Option<u32>,
     min_positive_ttl: Option<u32>,
 ) -> CacheTtlDecision {
-    if response.rcode() != Rcode::NoError {
+    if !is_complete_positive_response(response, record_type) {
         return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
     }
 
@@ -1378,13 +1381,19 @@ fn compute_negative_ttl_with_policy(
 
 fn compute_cache_ttl_with_policy(
     response: &Message,
+    record_type: RecordType,
     max_positive_ttl: Option<u32>,
     min_positive_ttl: Option<u32>,
     cache_negative: bool,
     max_negative_ttl: u32,
     negative_ttl_without_soa: u32,
 ) -> CacheTtlDecision {
-    match compute_positive_ttl_with_policy(response, max_positive_ttl, min_positive_ttl) {
+    match compute_positive_ttl_with_policy(
+        response,
+        record_type,
+        max_positive_ttl,
+        min_positive_ttl,
+    ) {
         CacheTtlDecision::Cache(ttl) => CacheTtlDecision::Cache(ttl),
         CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl) => {
             CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
@@ -1402,6 +1411,13 @@ fn compute_cache_ttl_with_policy(
             }
         }
     }
+}
+
+#[inline]
+fn is_complete_positive_response(response: &Message, record_type: RecordType) -> bool {
+    response.rcode() == Rcode::NoError
+        && !response.answers().is_empty()
+        && (record_type == RecordType::ANY || response.has_answer_type(record_type))
 }
 
 fn parse_cache_config(args: Option<Value>) -> Result<CacheConfig> {
@@ -1604,7 +1620,7 @@ mod tests {
     use super::*;
     use crate::plugin::executor::Executor;
     use crate::plugin::executor::sequence::chain::ChainProgram;
-    use crate::proto::rdata::SOA;
+    use crate::proto::rdata::{CNAME, SOA};
     use crate::proto::{
         DNSClass, Edns, EdnsOption, Message, Name, Question, RData, Record, RecordType,
     };
@@ -1754,10 +1770,19 @@ mod tests {
     }
 
     fn make_request_with_query(name: &str, do_bit: bool, cd_bit: bool) -> Message {
+        make_request_with_qtype(name, RecordType::A, do_bit, cd_bit)
+    }
+
+    fn make_request_with_qtype(
+        name: &str,
+        qtype: RecordType,
+        do_bit: bool,
+        cd_bit: bool,
+    ) -> Message {
         let mut request = Message::new();
         request.add_question(Question::new(
             Name::from_ascii(name).unwrap(),
-            RecordType::A,
+            qtype,
             DNSClass::IN,
         ));
         request.set_checking_disabled(cd_bit);
@@ -1801,6 +1826,32 @@ mod tests {
         response.add_answer(Record::from_rdata(
             Name::from_ascii(domain).unwrap(),
             ttl,
+            RData::A(crate::proto::rdata::A(Ipv4Addr::new(1, 1, 1, 1))),
+        ));
+        response
+    }
+
+    fn cname_only_response_for_domain(domain: &str, ttl: u32) -> Message {
+        let mut response = Message::new();
+        response.set_rcode(Rcode::NoError);
+        response.add_question(Question::new(
+            Name::from_ascii(domain).unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii(domain).unwrap(),
+            ttl,
+            RData::CNAME(CNAME(Name::from_ascii("target.example.com.").unwrap())),
+        ));
+        response
+    }
+
+    fn cname_with_a_response_for_domain(domain: &str, cname_ttl: u32, a_ttl: u32) -> Message {
+        let mut response = cname_only_response_for_domain(domain, cname_ttl);
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("target.example.com.").unwrap(),
+            a_ttl,
             RData::A(crate::proto::rdata::A(Ipv4Addr::new(1, 1, 1, 1))),
         ));
         response
@@ -1972,6 +2023,24 @@ mod tests {
                 RData::A(crate::proto::rdata::A(Ipv4Addr::new(9, 9, 9, 9))),
             ));
             context.set_response(response);
+            Ok(ExecStep::Next)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CnameOnlyRefreshExecutor;
+
+    #[async_trait]
+    impl Plugin for CnameOnlyRefreshExecutor {
+        fn tag(&self) -> &str {
+            "cname_only_refresh_executor"
+        }
+    }
+
+    #[async_trait]
+    impl Executor for CnameOnlyRefreshExecutor {
+        async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
+            context.set_response(cname_only_response_for_domain("example.com.", 60));
             Ok(ExecStep::Next)
         }
     }
@@ -2190,7 +2259,7 @@ mod tests {
         response.set_rcode(Rcode::ServFail);
 
         assert_eq!(
-            cache.compute_cache_ttl(&response),
+            cache.compute_cache_ttl(&response, RecordType::A),
             CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
         );
     }
@@ -2210,7 +2279,7 @@ mod tests {
         ));
 
         assert_eq!(
-            cache.compute_cache_ttl(&response),
+            cache.compute_cache_ttl(&response, RecordType::A),
             CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
         );
     }
@@ -2230,7 +2299,7 @@ mod tests {
         ));
 
         assert_eq!(
-            cache.compute_cache_ttl(&response),
+            cache.compute_cache_ttl(&response, RecordType::A),
             CacheTtlDecision::Cache(4)
         );
     }
@@ -2251,9 +2320,54 @@ mod tests {
         ));
 
         assert_eq!(
-            cache.compute_cache_ttl(&response),
+            cache.compute_cache_ttl(&response, RecordType::A),
             CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
         );
+    }
+
+    #[test]
+    fn cname_only_response_is_not_positive_cacheable_for_address_key() {
+        let cache = test_cache(default_test_config());
+        let response = cname_only_response_for_domain("example.com.", 60);
+
+        assert_eq!(
+            cache.compute_cache_ttl(&response, RecordType::A),
+            CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
+        );
+        assert_eq!(cache.compute_negative_ttl(&response), None);
+    }
+
+    #[test]
+    fn cname_chain_with_requested_answer_is_positive_cacheable() {
+        let cache = test_cache(default_test_config());
+        let response = cname_with_a_response_for_domain("example.com.", 30, 120);
+
+        assert_eq!(
+            cache.compute_cache_ttl(&response, RecordType::A),
+            CacheTtlDecision::Cache(30)
+        );
+    }
+
+    #[test]
+    fn any_query_allows_non_empty_cname_answer() {
+        let cache = test_cache(default_test_config());
+        let response = cname_only_response_for_domain("example.com.", 60);
+
+        assert_eq!(
+            cache.compute_cache_ttl(&response, RecordType::ANY),
+            CacheTtlDecision::Cache(60)
+        );
+    }
+
+    #[test]
+    fn empty_noerror_remains_nodata_but_cname_only_does_not() {
+        let cache = test_cache(default_test_config());
+        let mut nodata = Message::new();
+        nodata.set_rcode(Rcode::NoError);
+        let cname_only = cname_only_response_for_domain("example.com.", 60);
+
+        assert_eq!(cache.compute_negative_ttl(&nodata), Some(60));
+        assert_eq!(cache.compute_negative_ttl(&cname_only), None);
     }
 
     #[tokio::test]
@@ -2279,6 +2393,56 @@ mod tests {
                 .skip_truncated_total
                 .load(AtomicOrdering::Relaxed),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn cname_only_response_is_not_cached_under_address_key() {
+        AppClock::start();
+        let mut cache = test_cache(default_test_config());
+        let _ = cache.init_for_test().await;
+
+        let mut context = make_context(make_request_with_query("example.com.", false, false));
+        context.set_response(cname_only_response_for_domain("example.com.", 60));
+
+        cache.execute_with_next(&mut context, None).await.unwrap();
+
+        assert_eq!(cache.cache_map.get().unwrap().len(), 0);
+        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(
+            cache
+                .metrics
+                .skip_no_ttl_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn any_query_caches_non_empty_cname_answer() {
+        AppClock::start();
+        let mut cache = test_cache(default_test_config());
+        let _ = cache.init_for_test().await;
+
+        let mut context = make_context(make_request_with_qtype(
+            "example.com.",
+            RecordType::ANY,
+            false,
+            false,
+        ));
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+        context.set_response(cname_only_response_for_domain("example.com.", 60));
+
+        cache.execute_with_next(&mut context, None).await.unwrap();
+
+        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 1);
+        assert!(
+            cache
+                .cache_map
+                .get()
+                .unwrap()
+                .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+                .is_some()
         );
     }
 
@@ -2614,6 +2778,66 @@ mod tests {
                 .value
                 .resp
                 .has_answer_ip(|ip| ip == std::net::IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)))
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_refresh_does_not_update_address_key_with_cname_only_response() {
+        AppClock::start();
+        let mut cfg = default_test_config();
+        cfg.lazy_cache_ttl = Some(30);
+        cfg.short_circuit = Some(true);
+        let mut cache = test_cache(cfg);
+        let _ = cache.init_for_test().await;
+
+        let program =
+            ChainProgram::single_with_next_executor_for_test(Arc::new(CnameOnlyRefreshExecutor));
+        let next = ExecutorNext::from_program_for_test(program, 0);
+
+        let mut context = make_context(make_request_with_query("example.com.", false, false));
+        let key = Cache::build_cache_key(&mut context, false).unwrap();
+        let old_response = cacheable_response_for_domain("example.com.", 120);
+        let now = AppClock::elapsed_millis();
+        cache.cache_map.get().unwrap().insert_or_update_with_meta(
+            key.clone(),
+            Arc::new(CacheItem::new(old_response, 120, now.saturating_sub(1_000))),
+            now.saturating_sub(121_000),
+            now.saturating_add(10_000),
+            now.saturating_sub(100),
+        );
+
+        let _ = cache
+            .execute_with_next(&mut context, Some(next))
+            .await
+            .unwrap();
+        wait_until("lazy refresh CNAME-only skip should be recorded", || {
+            cache
+                .metrics
+                .lazy_refresh_failed_total
+                .load(AtomicOrdering::Relaxed)
+                == 1
+        })
+        .await;
+
+        assert_eq!(cache.metrics.insert_total.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(
+            cache
+                .metrics
+                .skip_no_ttl_total
+                .load(AtomicOrdering::Relaxed),
+            1
+        );
+        let stored = cache
+            .cache_map
+            .get()
+            .unwrap()
+            .get_retained_cloned(&key, AppClock::elapsed_millis(), 0)
+            .expect("old stale entry should remain present");
+        assert!(
+            stored
+                .value
+                .resp
+                .has_answer_ip(|ip| ip == std::net::IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
         );
     }
 
