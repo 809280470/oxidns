@@ -329,9 +329,20 @@ fn should_replace_best(
 }
 
 fn response_rank(response: &Message, requested_qtype: Option<RecordType>) -> u8 {
+    if is_incomplete_noerror_answer(response, requested_qtype) {
+        return 3;
+    }
+
     match classify_response(response, requested_qtype) {
-        ResponseClass::Positive => 3,
+        ResponseClass::Positive => 4,
         ResponseClass::Negative => 2,
         ResponseClass::Other => 1,
     }
+}
+
+#[inline]
+fn is_incomplete_noerror_answer(response: &Message, requested_qtype: Option<RecordType>) -> bool {
+    response.rcode() == Rcode::NoError
+        && !response.answers().is_empty()
+        && !is_complete_positive_response(response, requested_qtype)
 }

@@ -499,6 +499,32 @@ async fn balanced_selection_waits_for_complete_answer_after_cname_only() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn balanced_selection_keeps_cname_only_above_negative_fallback() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::response(
+                Rcode::NXDomain,
+                Duration::from_millis(20),
+            )),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Balanced,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::CNAME));
+    assert!(!response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
 async fn prefer_positive_waits_for_late_positive() {
     let forwarder = ConcurrentForwarder {
         tag: "forward-test".to_string(),
@@ -540,6 +566,32 @@ async fn prefer_positive_waits_for_complete_answer_after_cname_only() {
     assert!(matches!(step, ExecStep::Next));
     assert_eq!(response.rcode(), Rcode::NoError);
     assert!(response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn prefer_positive_keeps_cname_only_above_negative_fallback() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::response(
+                Rcode::NXDomain,
+                Duration::from_millis(20),
+            )),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::PreferPositive,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::CNAME));
+    assert!(!response.has_answer_type(RecordType::A));
 }
 
 #[tokio::test(start_paused = true)]
@@ -628,4 +680,30 @@ async fn consensus_selection_does_not_count_cname_only_as_negative_vote() {
     assert!(matches!(step, ExecStep::Next));
     assert_eq!(response.rcode(), Rcode::NoError);
     assert!(response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn consensus_selection_keeps_cname_only_above_negative_fallback() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::response(
+                Rcode::NXDomain,
+                Duration::from_millis(20),
+            )),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Consensus,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::CNAME));
+    assert!(!response.has_answer_type(RecordType::A));
 }
