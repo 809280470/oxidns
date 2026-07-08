@@ -291,7 +291,8 @@ fn classify_response(response: &Message, requested_qtype: Option<RecordType>) ->
         Rcode::NoError if is_complete_positive_response(response, requested_qtype) => {
             ResponseClass::Positive
         }
-        Rcode::NoError | Rcode::NXDomain => ResponseClass::Negative,
+        Rcode::NoError if response.answers().is_empty() => ResponseClass::Negative,
+        Rcode::NXDomain => ResponseClass::Negative,
         _ => ResponseClass::Other,
     }
 }

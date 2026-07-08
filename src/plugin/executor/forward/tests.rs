@@ -25,7 +25,7 @@ use crate::plugin::executor::{ExecStep, Executor};
 use crate::plugin::{PluginFactory, UninitializedPlugin};
 use crate::proto::{A, Message, Name, Question, RData, Rcode, Record, RecordType};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum MockAnswer {
     None,
     A,
@@ -483,7 +483,7 @@ async fn balanced_selection_waits_for_complete_answer_after_cname_only() {
         active_concurrent: 2,
         upstreams: vec![
             Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
-            Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(20))),
+            Arc::new(MockUpstream::ok_with_answer(Duration::from_millis(200))),
         ],
         short_circuit: false,
         response_selection: ResponseSelectionMode::Balanced,
