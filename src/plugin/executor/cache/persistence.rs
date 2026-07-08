@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::key::{CacheKey, EcsScopeDigest, normalize_domain_key};
-use super::{CacheItem, CacheMap};
+use super::{CacheItem, CacheMap, is_cache_entry_response_valid};
 use crate::infra::cache::ttl::TtlCacheEntry;
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
@@ -67,6 +67,10 @@ pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
 
         let remaining_ttl_ms = expire_at_ms.saturating_sub(now);
         if remaining_ttl_ms == 0 {
+            continue;
+        }
+
+        if !is_cache_entry_response_valid(&value.resp, key.record_type) {
             continue;
         }
 
@@ -225,6 +229,10 @@ pub(super) fn load_cache_from_bytes(
             }
         };
 
+        if !is_cache_entry_response_valid(&resp, key.record_type) {
+            continue;
+        }
+
         let expire_time = now.saturating_add(entry.remaining_ttl_ms);
         let cache_time = now.saturating_sub(entry.cache_age_ms);
         let fresh_until_ms = cache_time.saturating_add(u64::from(entry.ttl) * 1000);
@@ -246,6 +254,8 @@ pub(super) fn load_cache_from_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::rdata::CNAME;
+    use crate::proto::{Name, Question, RData, Record};
 
     fn make_entry() -> PersistedCacheEntry {
         PersistedCacheEntry {
@@ -264,6 +274,22 @@ mod tests {
             ttl: 60,
             remaining_ttl_ms: 30_000,
         }
+    }
+
+    fn cname_only_response_bytes() -> Vec<u8> {
+        let mut response = Message::new();
+        response.set_rcode(crate::proto::Rcode::NoError);
+        response.add_question(Question::new(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            60,
+            RData::CNAME(CNAME(Name::from_ascii("target.example.com.").unwrap())),
+        ));
+        response.to_bytes().expect("response should encode")
     }
 
     #[test]
@@ -319,5 +345,25 @@ mod tests {
         let cache_key = to_cache_key(&entry, false).expect("cache key should be built");
 
         assert_eq!(cache_key.ecs_scope, None);
+    }
+
+    #[test]
+    fn test_load_cache_skips_cname_only_address_entry() {
+        AppClock::start();
+        let cache_map = CacheMap::with_capacity(1);
+        let mut entry = make_entry();
+        entry.record_type = u16::from(RecordType::A);
+        entry.ecs_family = None;
+        entry.ecs_source_prefix = None;
+        entry.ecs_scope_prefix = None;
+        entry.ecs_network = None;
+        entry.resp_bytes = cname_only_response_bytes();
+
+        let data = wincode::serialize(&vec![entry]).expect("entry should serialize");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, false).expect("load should succeed");
+
+        assert_eq!(loaded, 0);
+        assert_eq!(cache_map.len(), 0);
     }
 }
