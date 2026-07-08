@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type React from "react";
 import { SheetTitle } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { AlertTriangle, Pencil, Pin, PinOff, Rocket, Save } from "lucide-react";
 import { useAppStore } from "@/lib/store";
+import { extractOutboundProfileNames } from "@/lib/oxidns-config-schema";
 import { isPluginKindSupported } from "@/lib/build-capabilities";
 import { cn } from "@/lib/utils";
 import { Spinner } from "@/components/ui/spinner";
@@ -57,9 +58,14 @@ export function PluginDetailTemplate({
     isRestarting,
     configError,
     plugins,
+    configModel,
     dependencyGraph,
     buildInfo,
   } = useAppStore();
+  const outboundProfileNames = useMemo(
+    () => extractOutboundProfileNames(configModel),
+    [configModel],
+  );
   const appliedStatus = usePluginAppliedStatus(plugin.name);
   const hasMetricSeries = useAppStore(
     (s) => (s.pluginMetrics[plugin.name]?.length ?? 0) > 0,
@@ -365,6 +371,7 @@ export function PluginDetailTemplate({
                     readOnly={!editingConfig}
                     pluginKind={plugin.pluginKind}
                     currentPluginName={plugin.name}
+                    outboundProfileNames={outboundProfileNames}
                   />
                 ) : (
                   <Textarea

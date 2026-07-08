@@ -46,6 +46,7 @@ interface YamlEditorProps {
   pluginKind?: string;
   fields?: ConfigField[];
   currentPluginName?: string;
+  outboundProfileNames?: string[];
   /** Bound to Cmd+S (macOS) / Ctrl+S (Windows/Linux). */
   onSave?: () => void;
   /** Run the backend /config/validate pass. Disable in offline mode. */
@@ -65,6 +66,7 @@ export const YamlEditor = forwardRef<YamlEditorHandle, YamlEditorProps>(
       pluginKind,
       fields,
       currentPluginName,
+      outboundProfileNames,
       onSave,
       backendValidation = true,
     },
@@ -92,8 +94,17 @@ export const YamlEditor = forwardRef<YamlEditorHandle, YamlEditorProps>(
         pluginKind,
         fields,
         currentPluginName,
+        outboundProfileNames,
       }),
-      [variant, locale, plugins, pluginKind, fields, currentPluginName],
+      [
+        variant,
+        locale,
+        plugins,
+        pluginKind,
+        fields,
+        currentPluginName,
+        outboundProfileNames,
+      ],
     );
     const editorTheme = resolvedTheme === "light" ? "light" : "dark";
     const handleSave = useCallback(() => {

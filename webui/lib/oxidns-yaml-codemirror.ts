@@ -24,6 +24,14 @@ import {
   HighlightStyle,
 } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
+import { parseDocument } from "yaml";
+import {
+  extractOutboundProfileNames,
+  getOxiDnsConfigSubKeys,
+  getOxiDnsConfigValueSuggestions,
+  OXIDNS_LOG_LEVELS,
+  type OxiDnsConfigValueSuggestion,
+} from "@/lib/oxidns-config-schema";
 import {
   getPluginKindDefinition,
   getLocalizedPluginKindDefinition,
@@ -49,6 +57,7 @@ export interface OxiDnsYamlEditorContext {
   pluginKind?: string;
   fields?: ConfigField[];
   currentPluginName?: string;
+  outboundProfileNames?: string[];
 }
 
 export interface OxiDnsYamlDiagnostic {
@@ -60,15 +69,6 @@ export interface OxiDnsYamlDiagnostic {
   end_column?: number;
 }
 
-const topLevelKeys = [
-  "include",
-  "runtime",
-  "api",
-  "log",
-  "network",
-  "plugins",
-  "init_order",
-];
 const sequenceControls = ["accept", "return", "reject", "mark", "jump", "goto"];
 const sequenceControlExamples = [
   "reject SERVFAIL",
@@ -76,7 +76,6 @@ const sequenceControlExamples = [
   "reject NOERROR",
   "reject 3",
 ];
-const logLevels = ["off", "trace", "debug", "info", "warn", "error"];
 const editorFontFamily =
   "JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, Consolas, Liberation Mono, monospace";
 
@@ -493,43 +492,11 @@ export function applyOxiDnsYamlDiagnostics(
   view.dispatch(
     setDiagnostics(view.state, [
       ...buildLocalDiagnostics(view.state, context),
-      ...backendDiagnostics.map((diagnostic) =>
+      ...backendDiagnostics.flatMap((diagnostic) =>
         diagnosticFromBackend(view.state, diagnostic),
       ),
     ]),
   );
-}
-
-function configSubKeysForPath(path: string[]): string[] | null {
-  const [p0, p1, p2, p3, p4, p5] = path;
-  if (p0 === "log") return p1 ? null : ["level", "file", "rotation"];
-  if (p0 === "runtime") return p1 ? null : ["worker_threads"];
-  if (p0 === "api") {
-    if (!p1) return ["http"];
-    if (p1 === "http") {
-      if (!p2) return ["listen", "ssl", "auth", "cors", "webui"];
-      if (p2 === "ssl")
-        return ["cert", "key", "client_ca", "require_client_cert"];
-      if (p2 === "auth") return ["type", "username", "password"];
-      if (p2 === "cors") return ["allowed_origins"];
-      if (p2 === "webui") return ["root", "index"];
-    }
-  }
-  if (p0 === "network") {
-    if (!p1) return ["outbound"];
-    if (p1 === "outbound") {
-      if (!p2) return ["default", "profiles"];
-      if (p2 === "profiles") {
-        if (!p3) return null;
-        if (!p4) return ["resolver", "proxy"];
-        if (p4 === "proxy") return p5 ? null : ["socks5"];
-        if (p4 === "resolver") {
-          if (!p5) return ["nameservers", "ip_version", "timeout", "proxy"];
-        }
-      }
-    }
-  }
-  return null;
 }
 
 function buildCompletionResult(
@@ -551,41 +518,55 @@ function buildCompletionResult(
   const path = getYamlPath(completionContext.state, line.number);
   const { from, to } = getReplacementRange(completionContext.pos, prefix);
   const valueKey = getValueKey(prefix);
+  const fields = fieldsForCompletion(
+    completionContext.state,
+    line.number,
+    context,
+    path,
+  );
+  const pluginKind =
+    context.pluginKind ??
+    inferConfigPluginKind(completionContext.state, line.number, path);
   const suggestions: Completion[] = [];
 
   if (isReferencePrefix(prefix)) {
     suggestions.push(
       ...pluginReferenceSuggestions(
         context,
-        expectedReferenceTypes(context, path, valueKey),
+        expectedReferenceTypes(context, fields, path, valueKey),
         prefix.trimEnd().endsWith("!$"),
       ),
     );
   }
 
   if (isKeyPosition(prefix)) {
-    suggestions.push(...keySuggestions(context, path));
+    suggestions.push(...keySuggestions(context, path, fields));
   }
 
-  if (valueKey === "type") {
+  if (context.variant === "config") {
+    suggestions.push(
+      ...configValueSuggestions(
+        completionContext.state,
+        context,
+        path,
+        valueKey,
+      ),
+    );
+  }
+
+  if (valueKey === "type" && isPluginKindValuePath(path)) {
     suggestions.push(...pluginKindSuggestions(context));
   }
 
-  if (
-    valueKey === "level" &&
-    context.variant === "config" &&
-    path.includes("log")
-  ) {
-    suggestions.push(...logLevelSuggestions(context));
-  }
-
-  const field = findFieldForKey(context.fields, valueKey);
+  const field = findFieldForPath(fields, path, valueKey);
   if (field) {
-    suggestions.push(...fieldValueSuggestions(context, field));
+    suggestions.push(
+      ...fieldValueSuggestions(completionContext.state, context, field),
+    );
   }
 
-  if (shouldSuggestSequenceExpressions(context, path, valueKey)) {
-    const types = expectedReferenceTypes(context, path, valueKey);
+  if (shouldSuggestSequenceExpressions(context, pluginKind, path, valueKey)) {
+    const types = expectedReferenceTypes(context, fields, path, valueKey);
     suggestions.push(...quickSetupSuggestions(context, types));
     suggestions.push(...pluginReferenceSuggestions(context, types));
     if (types?.includes("executor")) {
@@ -683,7 +664,7 @@ function buildDiagnostics(
 ) {
   return [
     ...buildLocalDiagnostics(state, context),
-    ...backendDiagnostics.map((diagnostic) =>
+    ...backendDiagnostics.flatMap((diagnostic) =>
       diagnosticFromBackend(state, diagnostic),
     ),
   ];
@@ -726,7 +707,7 @@ function buildLocalDiagnostics(
       getYamlPath(state, lineNumber).includes("plugins")
     ) {
       const typeMatch = checkText.match(
-        /^(\s*)type\s*:\s*["']?([A-Za-z0-9_-]+)/,
+        /^(\s*)(?:-\s*)?type\s*:\s*["']?([A-Za-z0-9_-]+)/,
       );
       const pluginKind = typeMatch?.[2];
       if (pluginKind && !knownPluginKinds.has(pluginKind)) {
@@ -769,47 +750,34 @@ function buildLocalDiagnostics(
 function diagnosticFromBackend(
   state: EditorState,
   diagnostic: OxiDnsYamlDiagnostic,
-): Diagnostic {
+): Diagnostic[] {
   const message = diagnostic.message;
-  if (diagnostic.line && diagnostic.column) {
+  if (hasBackendLocation(diagnostic)) {
     const line = state.doc.line(Math.min(diagnostic.line, state.doc.lines));
-    const from = line.from + Math.max(0, diagnostic.column - 1);
-    const endLine = state.doc.line(
-      Math.min(diagnostic.end_line ?? diagnostic.line, state.doc.lines),
-    );
-    const to =
-      endLine.from +
-      Math.max(
-        diagnostic.end_column
-          ? diagnostic.end_column - 1
-          : Math.max(diagnostic.column, endLine.length),
-        diagnostic.column,
-      );
-    return {
-      severity: diagnosticSeverity(diagnostic.severity),
-      message,
-      from,
-      to: Math.max(from + 1, to),
-      source: "OxiDNS",
-    };
+    return [
+      {
+        severity: diagnosticSeverity(diagnostic.severity),
+        message,
+        from: line.from,
+        to: Math.max(line.from + 1, line.to),
+        source: "OxiDNS",
+      },
+    ];
   }
 
-  const target =
-    quotedMatch(message, /Unknown plugin type:\s*([^\s]+)/) ??
-    quotedMatch(message, /Unknown plugin type '([^']+)'/) ??
-    quotedMatch(message, /Duplicate plugin tag '([^']+)'/) ??
-    quotedMatch(message, /references missing plugin '([^']+)'/) ??
-    quotedMatch(message, /but '([^']+)' is/) ??
-    quotedMatch(message, /plugin type '([^']+)'/);
-  const located = target ? locateToken(state, target) : null;
+  return [];
+}
 
-  return {
-    severity: "error",
-    message,
-    from: located?.from ?? 0,
-    to: located?.to ?? Math.min(1, state.doc.length),
-    source: "OxiDNS",
-  };
+function hasBackendLocation(
+  diagnostic: OxiDnsYamlDiagnostic,
+): diagnostic is OxiDnsYamlDiagnostic & { line: number; column: number } {
+  if (!diagnostic.line || !diagnostic.column) return false;
+  return !(
+    diagnostic.line === 1 &&
+    diagnostic.column === 1 &&
+    (diagnostic.end_line ?? 1) === 1 &&
+    (diagnostic.end_column ?? 2) <= 2
+  );
 }
 
 function diagnosticSeverity(
@@ -831,45 +799,18 @@ function localizedPluginKindDefinition(kind: string, locale: Locale) {
   );
 }
 
-function quotedMatch(message: string, pattern: RegExp) {
-  return message.match(pattern)?.[1] ?? null;
-}
-
-function locateToken(state: EditorState, token: string) {
-  const needles = [`$${token}`, token];
-  for (let lineNumber = 1; lineNumber <= state.doc.lines; lineNumber += 1) {
-    const line = state.doc.line(lineNumber);
-    for (const needle of needles) {
-      const index = line.text.indexOf(needle);
-      if (index >= 0) {
-        return {
-          from: line.from + index,
-          to: line.from + index + needle.length,
-        };
-      }
-    }
-  }
-  return null;
-}
-
 function keySuggestions(
   context: OxiDnsYamlEditorContext,
   path: string[],
+  fields: ConfigField[] | undefined,
 ): Completion[] {
   if (context.variant === "config") {
-    if (path.length <= 1) {
-      return topLevelKeys.map((key) => keyCompletion(key));
-    }
-    const subKeys = configSubKeysForPath(path);
+    const subKeys = getOxiDnsConfigSubKeys(path);
     if (subKeys !== null) {
       return subKeys.map((key) => keyCompletion(key));
     }
   }
 
-  const fields =
-    context.variant === "plugin-args"
-      ? fieldsForPath(context.fields, path)
-      : context.fields;
   return (fields ?? []).map((field) => keyCompletion(field.key));
 }
 
@@ -887,13 +828,88 @@ function pluginKindSuggestions(context: OxiDnsYamlEditorContext): Completion[] {
 
 function logLevelSuggestions(context: OxiDnsYamlEditorContext): Completion[] {
   const locale = contextLocale(context);
-  return logLevels.map((level) => ({
+  return OXIDNS_LOG_LEVELS.map((level) => ({
     label: level,
     type: "enum",
     apply: level,
     detail: translate(locale, WEBUI.common.logLevel),
     sortText: `0-${level}`,
   }));
+}
+
+function configValueSuggestions(
+  state: EditorState,
+  context: OxiDnsYamlEditorContext,
+  path: string[],
+  valueKey: string | null,
+): Completion[] {
+  const suggestions =
+    valueKey === "level" && path.includes("log")
+      ? logLevelSuggestions(context)
+      : getOxiDnsConfigValueSuggestions(path, valueKey).map(
+          configValueCompletion,
+        );
+
+  if (shouldSuggestOutboundProfiles(path, valueKey)) {
+    suggestions.push(...outboundProfileSuggestions(state, context));
+  }
+
+  return suggestions;
+}
+
+function configValueCompletion(
+  suggestion: OxiDnsConfigValueSuggestion,
+): Completion {
+  return {
+    label: suggestion.label,
+    type: suggestion.type ?? "text",
+    apply: suggestion.apply ?? suggestion.label,
+    detail: suggestion.detail,
+    sortText: `0-${suggestion.label}`,
+  };
+}
+
+function shouldSuggestOutboundProfiles(
+  path: string[],
+  valueKey: string | null,
+) {
+  if (valueKey === "outbound") return true;
+  return (
+    valueKey === "default" && path[0] === "network" && path[1] === "outbound"
+  );
+}
+
+function isPluginKindValuePath(path: string[]) {
+  if (path[0] !== "plugins") return false;
+  return !path.includes("args");
+}
+
+function outboundProfileSuggestions(
+  state: EditorState,
+  context: OxiDnsYamlEditorContext,
+): Completion[] {
+  return outboundProfileNames(state, context).map((profile) => ({
+    label: profile,
+    type: "variable",
+    apply: profile,
+    detail: "network.outbound profile",
+    sortText: `0-${profile}`,
+  }));
+}
+
+function outboundProfileNames(
+  state: EditorState,
+  context: OxiDnsYamlEditorContext,
+): string[] {
+  if (context.outboundProfileNames) return context.outboundProfileNames;
+  if (context.variant !== "config") return [];
+  try {
+    const document = parseDocument(state.doc.toString());
+    if (document.errors.length > 0) return [];
+    return extractOutboundProfileNames(document.toJSON());
+  } catch {
+    return [];
+  }
 }
 
 function pluginReferenceSuggestions(
@@ -997,10 +1013,15 @@ function jumpGotoTagSuggestions(
 }
 
 function fieldValueSuggestions(
+  state: EditorState,
   context: OxiDnsYamlEditorContext,
   field: ConfigField,
 ): Completion[] {
   const locale = contextLocale(context);
+  if (field.dynamicOptions === "outboundProfiles") {
+    return outboundProfileSuggestions(state, context);
+  }
+
   if (field.type === "select") {
     return (
       field.options?.map((option) => ({
@@ -1064,10 +1085,11 @@ function keyCompletion(key: string): Completion {
 
 function expectedReferenceTypes(
   context: OxiDnsYamlEditorContext,
+  fields: ConfigField[] | undefined,
   path: string[],
   valueKey: string | null,
 ): PluginType[] | undefined {
-  const field = findFieldForKey(context.fields, valueKey);
+  const field = findFieldForPath(fields, path, valueKey);
   if (field?.referenceTypes?.length) return field.referenceTypes;
 
   const joined = path.join(".");
@@ -1091,11 +1113,12 @@ function expectedReferenceTypes(
 
 function shouldSuggestSequenceExpressions(
   context: OxiDnsYamlEditorContext,
+  pluginKind: string | undefined,
   path: string[],
   valueKey: string | null,
 ) {
   if (context.variant === "sequence") return true;
-  if (context.pluginKind === "sequence" || context.pluginKind === "cron") {
+  if (pluginKind === "sequence" || pluginKind === "cron") {
     const joined = path.join(".");
     return (
       valueKey === "matches" ||
@@ -1108,13 +1131,44 @@ function shouldSuggestSequenceExpressions(
   return false;
 }
 
+function fieldsForCompletion(
+  state: EditorState,
+  lineNumber: number,
+  context: OxiDnsYamlEditorContext,
+  path: string[],
+): ConfigField[] | undefined {
+  if (context.variant === "plugin-args") {
+    return fieldsForPath(context.fields, path);
+  }
+  if (context.variant === "config" && isConfigPluginArgsPath(path)) {
+    const pluginKind = inferConfigPluginKind(state, lineNumber, path);
+    return fieldsForPath(
+      getPluginKindDefinition(pluginKind ?? "")?.configSchema,
+      path,
+    );
+  }
+  return context.fields;
+}
+
 function fieldsForPath(
   fields: ConfigField[] | undefined,
   path: string[],
 ): ConfigField[] | undefined {
   if (!fields || path.length === 0) return fields;
-  const normalizedPath = path.filter((part) => part !== "args");
+  let normalizedPath = path.filter(
+    (part) => part !== "plugins" && part !== "args",
+  );
   let current: ConfigField[] | undefined = fields;
+  const argsField =
+    fields.length === 1 && fields[0].key === "args" ? fields[0] : undefined;
+  const argsChildFields = childFields(argsField);
+  if (argsChildFields) {
+    current = argsChildFields;
+    normalizedPath = path.filter((part) => part !== "plugins");
+    if (normalizedPath[0] === "args") {
+      normalizedPath = normalizedPath.slice(1);
+    }
+  }
 
   for (const key of normalizedPath.slice(0, -1)) {
     const field = current?.find((entry) => entry.key === key);
@@ -1123,6 +1177,10 @@ function fieldsForPath(
   }
 
   return current ?? fields;
+}
+
+function isConfigPluginArgsPath(path: string[]) {
+  return path[0] === "plugins" && path.includes("args");
 }
 
 function childFields(
@@ -1154,12 +1212,130 @@ function findFieldForKey(
   return undefined;
 }
 
+function findFieldForPath(
+  fields: ConfigField[] | undefined,
+  path: string[],
+  key: string | null,
+): ConfigField | undefined {
+  if (!fields || !key) return undefined;
+  const direct = fieldsForPath(fields, path)?.find(
+    (field) => field.key === key,
+  );
+  return direct ?? findFieldForKey(fields, key);
+}
+
+function inferConfigPluginKind(
+  state: EditorState,
+  lineNumber: number,
+  path: string[],
+): string | undefined {
+  if (path[0] !== "plugins") return undefined;
+  const pluginsLine = findPluginsLine(state, lineNumber);
+  if (!pluginsLine) return undefined;
+
+  const pluginItemIndent = findPluginItemIndent(
+    state,
+    pluginsLine.lineNumber,
+    lineNumber,
+    pluginsLine.indent,
+  );
+  if (pluginItemIndent === undefined) return undefined;
+
+  const itemStart = findCurrentPluginItemStart(
+    state,
+    pluginsLine.lineNumber,
+    lineNumber,
+    pluginItemIndent,
+  );
+  if (itemStart === undefined) return undefined;
+
+  return findPluginKindInItem(state, itemStart, lineNumber, pluginItemIndent);
+}
+
+function findPluginsLine(state: EditorState, lineNumber: number) {
+  for (let index = lineNumber; index >= 1; index -= 1) {
+    const line = state.doc.line(index).text;
+    const topLevel = line.match(/^(\s*)plugins\s*:/);
+    if (topLevel) return { lineNumber: index, indent: topLevel[1].length };
+    if (
+      index !== lineNumber &&
+      /^\S/.test(line) &&
+      !/^plugins\s*:/.test(line)
+    ) {
+      return null;
+    }
+  }
+  return null;
+}
+
+function findPluginItemIndent(
+  state: EditorState,
+  pluginsLineNumber: number,
+  lineNumber: number,
+  pluginsIndent: number,
+) {
+  let itemIndent: number | undefined;
+  for (let index = pluginsLineNumber + 1; index <= lineNumber; index += 1) {
+    const line = state.doc.line(index).text;
+    const match = line.match(/^(\s*)-\s+/);
+    if (!match) continue;
+    const indent = match[1].length;
+    if (indent <= pluginsIndent) continue;
+    itemIndent =
+      itemIndent === undefined ? indent : Math.min(itemIndent, indent);
+  }
+  return itemIndent;
+}
+
+function findCurrentPluginItemStart(
+  state: EditorState,
+  pluginsLineNumber: number,
+  lineNumber: number,
+  pluginItemIndent: number,
+) {
+  for (let index = lineNumber; index > pluginsLineNumber; index -= 1) {
+    const line = state.doc.line(index).text;
+    const match = line.match(/^(\s*)-\s+/);
+    if (match && match[1].length === pluginItemIndent) return index;
+  }
+  return undefined;
+}
+
+function findPluginKindInItem(
+  state: EditorState,
+  itemStart: number,
+  lineNumber: number,
+  pluginItemIndent: number,
+) {
+  for (let index = itemStart; index <= lineNumber; index += 1) {
+    const line = state.doc.line(index).text;
+    if (index > itemStart) {
+      const nextItem = line.match(/^(\s*)-\s+/);
+      if (nextItem && nextItem[1].length === pluginItemIndent) break;
+    }
+    const type = line.match(/^\s*(?:-\s*)?type\s*:\s*["']?([A-Za-z0-9_-]+)/);
+    if (type?.[1]) return type[1];
+  }
+  return undefined;
+}
+
 function getYamlPath(state: EditorState, lineNumber: number) {
   const stack: Array<{ indent: number; key: string }> = [];
   for (let index = 1; index <= lineNumber; index += 1) {
     const raw = state.doc.line(index).text;
+    const currentIndent = raw.match(/^(\s*)/)?.[1].length ?? 0;
     const match = raw.match(/^(\s*)(?:-\s*)?([A-Za-z0-9_-]+)\s*:/);
-    if (!match) continue;
+    if (!match) {
+      if (index === lineNumber) {
+        while (
+          stack.length &&
+          stack[stack.length - 1].indent >= currentIndent
+        ) {
+          stack.pop();
+        }
+      }
+      continue;
+    }
     const indent = match[1].length;
     const key = match[2];
     while (stack.length && stack[stack.length - 1].indent >= indent) {

@@ -36,6 +36,7 @@ interface PluginConfigModeEditorProps {
   yamlLabel?: string;
   pluginKind?: string;
   currentPluginName?: string;
+  outboundProfileNames?: string[];
 }
 
 export function PluginConfigModeEditor({
@@ -50,6 +51,7 @@ export function PluginConfigModeEditor({
   yamlLabel = "YAML",
   pluginKind,
   currentPluginName,
+  outboundProfileNames,
 }: PluginConfigModeEditorProps) {
   const { t } = useI18n();
   const resolvedFieldLabel = fieldLabel ?? t(WEBUI.common.fields);
@@ -154,6 +156,7 @@ export function PluginConfigModeEditor({
           pluginKind={pluginKind}
           fields={fields}
           currentPluginName={currentPluginName}
+          outboundProfileNames={outboundProfileNames}
         />
       )}
     </div>
