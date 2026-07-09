@@ -21,6 +21,9 @@ pub enum ConfigError {
     #[error("Plugin tag cannot be empty")]
     EmptyPluginTag,
 
+    #[error("Invalid plugin tag '{0}': only ASCII letters, digits, '_', '-', and '.' are allowed")]
+    InvalidPluginTag(String),
+
     #[error("Invalid log level: {0}")]
     InvalidLogLevel(String),
 
@@ -154,6 +157,9 @@ impl Config {
             if plugin.tag.is_empty() {
                 return Err(ConfigError::EmptyPluginTag);
             }
+            if !is_valid_plugin_tag(&plugin.tag) {
+                return Err(ConfigError::InvalidPluginTag(plugin.tag.clone()));
+            }
             if let Some(prev_idx) = seen_tags.insert(plugin.tag.as_str(), idx) {
                 return Err(ConfigError::DuplicatePluginTag {
                     tag: plugin.tag.clone(),
@@ -170,6 +176,13 @@ impl Config {
 
         Ok(())
     }
+}
+
+pub fn is_valid_plugin_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 /// Shared network configuration.
@@ -781,6 +794,25 @@ mod tests {
             .validate()
             .expect_err("should reject empty plugin type");
         assert!(matches!(err, ConfigError::EmptyPluginType));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_plugin_tags() {
+        for tag in ["has space", "中文", "tag/slash", "tag:colon", "tag%20"] {
+            let config = Config {
+                include: Vec::new(),
+                runtime: RuntimeConfig::default(),
+                api: ApiConfig::default(),
+                log: LogConfig::default(),
+                network: NetworkConfig::default(),
+                plugins: vec![plugin(tag, "debug_print")],
+            };
+
+            let err = config
+                .validate()
+                .expect_err("should reject invalid plugin tag");
+            assert!(matches!(err, ConfigError::InvalidPluginTag(_)));
+        }
     }
 
     #[test]

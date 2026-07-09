@@ -95,7 +95,8 @@ export const enUSWebui = {
     tryAdjustSearch: "Try adjusting the search terms or",
     configureTitle: "Configure {name}",
     instanceName: "Instance Name",
-    instanceNameHint: "Use lowercase letters, numbers, and underscores",
+    instanceNameHint:
+      "Use ASCII letters, digits, underscores (_), hyphens (-), and dots (.)",
     instanceNamePlaceholder: "Example: {kind}_main",
     configTitle: "Plugin Config",
     pin: "Pin",
@@ -691,6 +692,8 @@ export const enUSWebui = {
     unsafeReferences:
       "Some references cannot be removed safely. Use replacement or fix them manually in the editor.",
     pluginNameRequired: "Plugin name is required",
+    pluginNameInvalid:
+      "Plugin name can only contain ASCII letters, digits, underscores (_), hyphens (-), and dots (.)",
     pluginNameUnchanged: "Plugin name is unchanged",
     pluginNameExists: "Plugin name already exists",
     configHasErrorsBeforeRename:

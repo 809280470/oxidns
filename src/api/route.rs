@@ -9,6 +9,7 @@ use ahash::AHashMap;
 use http::Method;
 
 use crate::api::ApiHandler;
+use crate::config::types::is_valid_plugin_tag;
 use crate::infra::error::{DnsError, Result};
 
 #[derive(Clone, Debug)]
@@ -56,13 +57,12 @@ impl PrefixRoute {
 }
 
 pub(crate) fn build_plugin_route_path(plugin_tag: &str, subpath: &str) -> Result<String> {
-    if plugin_tag.bytes().any(|b| matches!(b, b'/' | b'?' | b'#')) {
+    if !is_valid_plugin_tag(plugin_tag) {
         return Err(DnsError::plugin(format!(
-            "plugin tag '{}' is not valid for API route paths",
+            "plugin tag '{}' is not valid for API route paths; only ASCII letters, digits, '_', '-', and '.' are allowed",
             plugin_tag
         )));
     }
-    let plugin_tag = encode_path_segment(plugin_tag);
 
     let subpath = if subpath.is_empty() {
         ""
@@ -76,32 +76,6 @@ pub(crate) fn build_plugin_route_path(plugin_tag: &str, subpath: &str) -> Result
     };
 
     normalize_route_path(&format!("/plugins/{plugin_tag}{subpath}"))
-}
-
-fn encode_path_segment(segment: &str) -> String {
-    urlencoding::encode(segment).into_owned()
-}
-
-pub(crate) fn canonicalize_route_path(path: &str) -> Result<String> {
-    let path = normalize_route_path(path)?;
-    let mut canonical = String::with_capacity(path.len());
-    for (index, segment) in path.split('/').enumerate() {
-        if index > 0 {
-            canonical.push('/');
-        }
-        let decoded = decode_path_segment(segment)?;
-        canonical.push_str(&encode_path_segment(decoded.as_ref()));
-    }
-    Ok(canonical)
-}
-
-fn decode_path_segment(segment: &str) -> Result<std::borrow::Cow<'_, str>> {
-    urlencoding::decode(segment).map_err(|err| {
-        DnsError::plugin(format!(
-            "API route path segment '{}' is not valid percent-encoded UTF-8: {}",
-            segment, err
-        ))
-    })
 }
 
 pub(super) fn normalize_route_path(path: &str) -> Result<String> {

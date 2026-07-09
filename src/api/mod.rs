@@ -56,7 +56,7 @@ pub use hub::{ApiHub, ApiRegister, PluginApiRegister};
 pub(super) use request::{rewrite_request_path, strip_api_prefix};
 pub use response::{json_error, json_ok, json_response, simple_response, streaming_response};
 #[cfg(test)]
-pub(super) use route::{build_plugin_route_path, canonicalize_route_path};
+pub(super) use route::build_plugin_route_path;
 
 use crate::infra::error::Result;
 
