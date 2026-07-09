@@ -36,7 +36,6 @@ interface ConfigDiffDialogProps {
   modifiedTitle?: string;
 }
 
-const MIN_DIFF_VIEW_WIDTH = 320;
 const MIN_DIFF_VIEW_HEIGHT = 160;
 
 interface CodeMirrorMergeViewProps {
@@ -74,8 +73,8 @@ function CodeMirrorMergeView({
     };
 
     const hasRenderableSize = () => {
-      const { width, height } = mergeRoot.getBoundingClientRect();
-      return width >= MIN_DIFF_VIEW_WIDTH && height >= MIN_DIFF_VIEW_HEIGHT;
+      const { height } = mergeRoot.getBoundingClientRect();
+      return height >= MIN_DIFF_VIEW_HEIGHT;
     };
 
     const cancelScheduledMount = () => {

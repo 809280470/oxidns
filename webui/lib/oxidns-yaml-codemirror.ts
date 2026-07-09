@@ -4,6 +4,7 @@ import {
   type CompletionContext,
   type CompletionResult,
 } from "@codemirror/autocomplete";
+import { history, historyKeymap } from "@codemirror/commands";
 import { yaml } from "@codemirror/lang-yaml";
 import { linter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
 import { EditorState, type Extension } from "@codemirror/state";
@@ -445,6 +446,7 @@ export function oxidnsYamlExtensions(
         ),
       { delay: 250 },
     ),
+    history(),
     keymap.of([
       {
         key: "Mod-s",
@@ -454,6 +456,7 @@ export function oxidnsYamlExtensions(
           return true;
         },
       },
+      ...historyKeymap,
     ]),
     EditorView.lineWrapping,
     EditorState.tabSize.of(2),
@@ -752,32 +755,20 @@ function diagnosticFromBackend(
   diagnostic: OxiDnsYamlDiagnostic,
 ): Diagnostic[] {
   const message = diagnostic.message;
-  if (hasBackendLocation(diagnostic)) {
-    const line = state.doc.line(Math.min(diagnostic.line, state.doc.lines));
-    return [
-      {
-        severity: diagnosticSeverity(diagnostic.severity),
-        message,
-        from: line.from,
-        to: Math.max(line.from + 1, line.to),
-        source: "OxiDNS",
-      },
-    ];
-  }
-
-  return [];
-}
-
-function hasBackendLocation(
-  diagnostic: OxiDnsYamlDiagnostic,
-): diagnostic is OxiDnsYamlDiagnostic & { line: number; column: number } {
-  if (!diagnostic.line || !diagnostic.column) return false;
-  return !(
-    diagnostic.line === 1 &&
-    diagnostic.column === 1 &&
-    (diagnostic.end_line ?? 1) === 1 &&
-    (diagnostic.end_column ?? 2) <= 2
-  );
+  const lineNumber =
+    diagnostic.line && diagnostic.column
+      ? Math.min(diagnostic.line, state.doc.lines)
+      : 1;
+  const line = state.doc.line(lineNumber);
+  return [
+    {
+      severity: diagnosticSeverity(diagnostic.severity),
+      message,
+      from: line.from,
+      to: Math.max(line.from + 1, line.to),
+      source: "OxiDNS",
+    },
+  ];
 }
 
 function diagnosticSeverity(
@@ -892,7 +883,6 @@ function outboundProfileSuggestions(
     label: profile,
     type: "variable",
     apply: profile,
-    detail: "network.outbound profile",
     sortText: `0-${profile}`,
   }));
 }
@@ -969,14 +959,12 @@ function controlSuggestions(): Completion[] {
     label: control,
     type: "keyword",
     apply: control,
-    detail: "sequence control",
     sortText: `3-${control}`,
   }));
   const examples = sequenceControlExamples.map((control) => ({
     label: control,
     type: "text",
     apply: control,
-    detail: "sequence control example",
     sortText: `3-${control}`,
   }));
   return [...controls, ...examples];

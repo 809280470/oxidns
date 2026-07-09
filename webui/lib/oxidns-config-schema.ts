@@ -107,46 +107,40 @@ export function getOxiDnsConfigValueSuggestions(
     return OXIDNS_LOG_LEVELS.map((level) => ({
       label: level,
       type: "enum",
-      detail: "log level",
     }));
   }
   if (valueKey === "type" && joined.startsWith("log.rotation")) {
     return OXIDNS_LOG_ROTATION_TYPES.map((type) => ({
       label: type,
       type: "enum",
-      detail: "log rotation",
     }));
   }
   if (valueKey === "type" && joined.startsWith("api.http.auth")) {
-    return [{ label: "basic", type: "enum", detail: "API auth" }];
+    return [{ label: "basic", type: "enum" }];
   }
   if (valueKey === "require_client_cert") {
-    return booleanSuggestions("TLS client certificate");
+    return booleanSuggestions();
   }
   if (valueKey === "resolver" && joined.includes("network.outbound.profiles")) {
-    return [{ label: "system", type: "enum", detail: "system resolver" }];
+    return [{ label: "system", type: "enum" }];
   }
   if (valueKey === "ip_version") {
     return [
-      { label: "4", type: "enum", detail: "A records" },
-      { label: "6", type: "enum", detail: "AAAA records" },
+      { label: "4", type: "enum" },
+      { label: "6", type: "enum" },
     ];
   }
   if (valueKey === "proxy") {
     if (joined.includes(".resolver")) {
       return [
-        { label: "none", type: "enum", detail: "direct nameserver access" },
-        {
-          label: "profile",
-          type: "enum",
-          detail: "reuse profile SOCKS5 proxy",
-        },
+        { label: "none", type: "enum" },
+        { label: "profile", type: "enum" },
       ];
     }
     if (joined.includes("network.outbound.profiles")) {
       return [
-        { label: "none", type: "enum", detail: "direct" },
-        { label: "direct", type: "enum", detail: "direct" },
+        { label: "none", type: "enum" },
+        { label: "direct", type: "enum" },
       ];
     }
   }
@@ -155,7 +149,6 @@ export function getOxiDnsConfigValueSuggestions(
       label: example,
       apply: example,
       type: "text",
-      detail: "nameserver",
     }));
   }
 
@@ -174,10 +167,10 @@ export function extractOutboundProfileNames(config: unknown): string[] {
   return Object.keys(profiles).filter((name) => name.trim().length > 0);
 }
 
-function booleanSuggestions(detail: string): OxiDnsConfigValueSuggestion[] {
+function booleanSuggestions(): OxiDnsConfigValueSuggestion[] {
   return [
-    { label: "true", type: "constant", detail },
-    { label: "false", type: "constant", detail },
+    { label: "true", type: "constant" },
+    { label: "false", type: "constant" },
   ];
 }
 
