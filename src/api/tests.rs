@@ -126,11 +126,11 @@ fn test_build_plugin_route_path_without_subpath() {
 
 #[test]
 fn test_build_plugin_route_path_encodes_tag_segment() {
-    let route =
-        build_plugin_route_path("Query Recorder 记录", "/records").expect("route should be built");
+    let route = build_plugin_route_path("Query Recorder 记录!*'()", "/records")
+        .expect("route should be built");
     assert_eq!(
         route,
-        "/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95/records"
+        "/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95!*'()/records"
     );
 }
 
@@ -389,13 +389,17 @@ async fn test_plugin_route_with_encoded_tag_segment() {
     let hub = test_api_hub(addr, None);
     let register = ApiRegister::new(hub.clone());
     register
-        .register_plugin_get("Query Recorder 记录", "/records", Arc::new(TestEchoHandler))
+        .register_plugin_get(
+            "Query Recorder 记录!*'()",
+            "/records",
+            Arc::new(TestEchoHandler),
+        )
         .expect("register plugin route");
 
     start_test_api_hub(&hub).await;
     let client = http1_client();
     let uri: Uri =
-        format!("http://{addr}/api/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95/records")
+        format!("http://{addr}/api/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95!*'()/records")
             .parse()
             .expect("encoded plugin route uri");
     let response = client

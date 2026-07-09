@@ -83,9 +83,18 @@ fn encode_path_segment(segment: &str) -> String {
     let mut encoded = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(char::from(byte));
-            }
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => encoded.push(char::from(byte)),
             _ => {
                 let _ = write!(encoded, "%{byte:02X}");
             }
