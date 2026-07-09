@@ -125,6 +125,16 @@ fn test_build_plugin_route_path_without_subpath() {
 }
 
 #[test]
+fn test_build_plugin_route_path_rejects_invalid_tag_segment() {
+    let err = build_plugin_route_path("Query Recorder 记录!*'()", "/records")
+        .expect_err("invalid tag should be rejected");
+    assert_eq!(
+        err.to_string(),
+        "Plugin error: plugin tag 'Query Recorder 记录!*'()' is not valid for API route paths; only ASCII letters, digits, '_', '-', and '.' are allowed"
+    );
+}
+
+#[test]
 fn test_basic_auth_matches_expected_credentials() {
     let auth = ApiAuthConfig::Basic {
         username: "admin".to_string(),
@@ -370,6 +380,40 @@ async fn test_global_api_route_macros_noop_when_api_is_disabled() {
         DELETE_PREFIX "/noop/" => TestEchoHandler,
     )
     .expect("plugin route no-op");
+}
+
+#[tokio::test]
+async fn test_plugin_route_with_safe_tag_segment() {
+    AppClock::start();
+    let addr = reserve_local_addr();
+    let hub = test_api_hub(addr, None);
+    let register = ApiRegister::new(hub.clone());
+    register
+        .register_plugin_get(
+            "query_recorder.main-1",
+            "/records",
+            Arc::new(TestEchoHandler),
+        )
+        .expect("register plugin route");
+
+    start_test_api_hub(&hub).await;
+    let client = http1_client();
+    let uri: Uri = format!("http://{addr}/api/plugins/query_recorder.main-1/records")
+        .parse()
+        .expect("plugin route uri");
+    let response = client
+        .request(
+            HyperRequest::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Empty::new())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    hub.stop().await;
 }
 
 #[tokio::test]

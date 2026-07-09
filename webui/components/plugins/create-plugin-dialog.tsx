@@ -47,6 +47,7 @@ import {
 } from "@/components/plugins/plugin-config-fields-editor";
 import { PluginConfigModeEditor } from "@/components/plugins/plugin-config-mode-editor";
 import { isPluginKindSupported } from "@/lib/build-capabilities";
+import { isReservedPluginTag, isValidPluginTag } from "@/lib/plugin-tags";
 import { cn } from "@/lib/utils";
 
 const SequenceComposer = dynamic(
@@ -136,6 +137,20 @@ export function CreatePluginDialog({
   const isConfigSaving = useAppStore((s) => s.isConfigSaving);
   const plugins = useAppStore((s) => s.plugins);
   const buildInfo = useAppStore((s) => s.buildInfo);
+  const normalizedInstanceName = instanceName.trim();
+  const instanceNameError = useMemo(() => {
+    if (!normalizedInstanceName) return null;
+    if (!isValidPluginTag(normalizedInstanceName)) {
+      return t(WEBUI.storeErrors.pluginNameInvalid);
+    }
+    if (isReservedPluginTag(normalizedInstanceName)) {
+      return t(WEBUI.storeErrors.pluginNameReserved);
+    }
+    if (plugins.some((plugin) => plugin.name === normalizedInstanceName)) {
+      return t(WEBUI.storeErrors.pluginNameExists);
+    }
+    return null;
+  }, [normalizedInstanceName, plugins, t]);
   const configModel = useAppStore((s) => s.configModel);
   const outboundProfileNames = useMemo(
     () => extractOutboundProfileNames(configModel),
@@ -197,13 +212,13 @@ export function CreatePluginDialog({
   };
 
   const handleCreate = async () => {
-    if (!selectedKind || !instanceName.trim()) return;
+    if (!selectedKind || !normalizedInstanceName || instanceNameError) return;
     if (!isPluginKindSupported(buildInfo, selectedKind.type, selectedKind.kind))
       return;
 
     const processedConfig = configValues;
 
-    const tag = instanceName.trim();
+    const tag = normalizedInstanceName;
     addPlugin({
       name: tag,
       type: selectedKind.type,
@@ -234,7 +249,8 @@ export function CreatePluginDialog({
   };
 
   const isValid = () => {
-    if (!selectedKind || !instanceName.trim()) return false;
+    if (!selectedKind || !normalizedInstanceName || instanceNameError)
+      return false;
     if (!isPluginKindSupported(buildInfo, selectedKind.type, selectedKind.kind))
       return false;
     return (
@@ -417,9 +433,17 @@ export function CreatePluginDialog({
                         kind: selectedKind.kind,
                       })}
                       className="font-mono"
+                      aria-invalid={Boolean(instanceNameError)}
                     />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {t(WEBUI.plugins.instanceNameHint)}
+                    <p
+                      className={cn(
+                        "mt-1 text-xs",
+                        instanceNameError
+                          ? "text-destructive"
+                          : "text-muted-foreground",
+                      )}
+                    >
+                      {instanceNameError ?? t(WEBUI.plugins.instanceNameHint)}
                     </p>
                   </Field>
 
