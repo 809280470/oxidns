@@ -27,6 +27,7 @@ import {
   Search,
 } from "lucide-react";
 import { useAppStore } from "@/lib/store";
+import { extractOutboundProfileNames } from "@/lib/oxidns-config-schema";
 import type { PluginType } from "@/lib/types";
 import {
   getPluginCatalogItemsByType,
@@ -135,6 +136,11 @@ export function CreatePluginDialog({
   const isConfigSaving = useAppStore((s) => s.isConfigSaving);
   const plugins = useAppStore((s) => s.plugins);
   const buildInfo = useAppStore((s) => s.buildInfo);
+  const configModel = useAppStore((s) => s.configModel);
+  const outboundProfileNames = useMemo(
+    () => extractOutboundProfileNames(configModel),
+    [configModel],
+  );
 
   const pluginsByType = useMemo(() => {
     const supported = supportedPluginKinds?.length
@@ -445,6 +451,7 @@ export function CreatePluginDialog({
                         onValidityChange={setConfigValid}
                         pluginKind={selectedKind.kind}
                         currentPluginName={instanceName.trim() || undefined}
+                        outboundProfileNames={outboundProfileNames}
                       />
                     )}
                   </div>

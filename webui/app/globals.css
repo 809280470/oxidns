@@ -195,6 +195,32 @@ body {
     display: none;
   }
 
+  .oxidns-config-diff-host .cm-mergeView {
+    height: 100%;
+    min-height: 0;
+    overflow: auto;
+  }
+
+  .oxidns-config-diff-host .cm-mergeViewEditors {
+    min-height: 100%;
+    min-width: 920px;
+  }
+
+  .oxidns-config-diff-host .cm-mergeViewEditor {
+    min-width: 0;
+    overflow: visible;
+  }
+
+  .oxidns-config-diff-host .cm-editor {
+    height: auto !important;
+    min-height: 0 !important;
+  }
+
+  .oxidns-config-diff-host .cm-scroller {
+    height: auto !important;
+    overflow: visible !important;
+  }
+
   .sequence-flow .react-flow__pane {
     z-index: 0;
     cursor: grab;
