@@ -727,8 +727,9 @@ fn find_asset<'a>(release: &'a GitHubRelease, name: &str) -> Result<&'a ReleaseA
 fn current_archive_name(bundle: UpgradeBundle) -> Result<String> {
     let selected = resolve_requested_bundle(bundle, crate::infra::build_info::PRIMARY_BUNDLE)?;
     let target = current_release_target()?;
+    let target = release_target_for_bundle(selected, target);
     let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
-    archive_name_for_bundle(selected, &target, ext)
+    archive_name_for_bundle(selected, target.as_str(), ext)
 }
 
 fn resolve_requested_bundle(
@@ -761,6 +762,17 @@ fn archive_name_for_bundle(bundle: UpgradeBundle, target: &str, ext: &str) -> Re
             "upgrade bundle auto must be resolved before archive naming",
         )),
     }
+}
+
+fn release_target_for_bundle(bundle: UpgradeBundle, target: String) -> String {
+    if matches!(bundle, UpgradeBundle::Minimal | UpgradeBundle::Standard) {
+        match target.as_str() {
+            "x86_64-unknown-linux-gnu" => return "x86_64-unknown-linux-musl".to_string(),
+            "aarch64-unknown-linux-gnu" => return "aarch64-unknown-linux-musl".to_string(),
+            _ => {}
+        }
+    }
+    target
 }
 
 fn current_release_target() -> Result<String> {
@@ -1146,6 +1158,29 @@ mod tests {
             standard,
             "oxidns-standard-aarch64-unknown-linux-musl.tar.gz"
         );
+    }
+
+    #[test]
+    fn release_target_for_slim_bundles_uses_published_linux_musl_assets() {
+        let x86_64 = release_target_for_bundle(
+            UpgradeBundle::Standard,
+            "x86_64-unknown-linux-gnu".to_string(),
+        );
+        let aarch64 = release_target_for_bundle(
+            UpgradeBundle::Minimal,
+            "aarch64-unknown-linux-gnu".to_string(),
+        );
+
+        assert_eq!(x86_64, "x86_64-unknown-linux-musl");
+        assert_eq!(aarch64, "aarch64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn release_target_for_full_bundle_preserves_linux_gnu_assets() {
+        let target =
+            release_target_for_bundle(UpgradeBundle::Full, "x86_64-unknown-linux-gnu".to_string());
+
+        assert_eq!(target, "x86_64-unknown-linux-gnu");
     }
 
     #[test]
