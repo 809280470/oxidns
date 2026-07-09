@@ -3,7 +3,6 @@
 
 //! Route registration keys and path matching helpers.
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ahash::AHashMap;
@@ -80,27 +79,29 @@ pub(crate) fn build_plugin_route_path(plugin_tag: &str, subpath: &str) -> Result
 }
 
 fn encode_path_segment(segment: &str) -> String {
-    let mut encoded = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~'
-            | b'!'
-            | b'*'
-            | b'\''
-            | b'('
-            | b')' => encoded.push(char::from(byte)),
-            _ => {
-                let _ = write!(encoded, "%{byte:02X}");
-            }
+    urlencoding::encode(segment).into_owned()
+}
+
+pub(crate) fn canonicalize_route_path(path: &str) -> Result<String> {
+    let path = normalize_route_path(path)?;
+    let mut canonical = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            canonical.push('/');
         }
+        let decoded = decode_path_segment(segment)?;
+        canonical.push_str(&encode_path_segment(decoded.as_ref()));
     }
-    encoded
+    Ok(canonical)
+}
+
+fn decode_path_segment(segment: &str) -> Result<std::borrow::Cow<'_, str>> {
+    urlencoding::decode(segment).map_err(|err| {
+        DnsError::plugin(format!(
+            "API route path segment '{}' is not valid percent-encoded UTF-8: {}",
+            segment, err
+        ))
+    })
 }
 
 pub(super) fn normalize_route_path(path: &str) -> Result<String> {

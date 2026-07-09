@@ -23,7 +23,7 @@ use crate::api::auth::is_authorized;
 use crate::api::cors::add_cors_headers;
 use crate::api::health::HealthState;
 use crate::api::request::{read_hyper_request, rewrite_request_path, strip_api_prefix};
-use crate::api::route::{PrefixRoute, RouteKey, lookup_handler};
+use crate::api::route::{PrefixRoute, RouteKey, canonicalize_route_path, lookup_handler};
 #[cfg(feature = "webui")]
 use crate::api::static_files::StaticFileServer;
 use crate::api::{ApiHandler, ApiResponse, simple_response};
@@ -203,6 +203,10 @@ async fn handle_hyper_request(
                 Bytes::from("404 Not Found"),
             ));
         }
+    };
+    let api_path = match canonicalize_route_path(&api_path) {
+        Ok(path) => path,
+        Err(_) => return Ok(simple_response(StatusCode::BAD_REQUEST, Bytes::new())),
     };
     let request = match rewrite_request_path(request, &api_path) {
         Ok(request) => request,

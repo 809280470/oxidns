@@ -130,7 +130,19 @@ fn test_build_plugin_route_path_encodes_tag_segment() {
         .expect("route should be built");
     assert_eq!(
         route,
-        "/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95!*'()/records"
+        "/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95%21%2A%27%28%29/records"
+    );
+}
+
+#[test]
+fn test_canonicalize_route_path_normalizes_percent_encoded_segments() {
+    let path = canonicalize_route_path(
+        "/plugins/Query%20Recorder%20%e8%ae%b0%e5%bd%95%21*%27%28%29/records",
+    )
+    .expect("path should canonicalize");
+    assert_eq!(
+        path,
+        "/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95%21%2A%27%28%29/records"
     );
 }
 
@@ -398,10 +410,11 @@ async fn test_plugin_route_with_encoded_tag_segment() {
 
     start_test_api_hub(&hub).await;
     let client = http1_client();
-    let uri: Uri =
-        format!("http://{addr}/api/plugins/Query%20Recorder%20%E8%AE%B0%E5%BD%95!*'()/records")
-            .parse()
-            .expect("encoded plugin route uri");
+    let uri: Uri = format!(
+        "http://{addr}/api/plugins/Query%20Recorder%20%e8%ae%b0%e5%bd%95%21*%27%28%29/records"
+    )
+    .parse()
+    .expect("encoded plugin route uri");
     let response = client
         .request(
             HyperRequest::builder()
