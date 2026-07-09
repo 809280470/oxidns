@@ -4,7 +4,7 @@ import {
   type CompletionContext,
   type CompletionResult,
 } from "@codemirror/autocomplete";
-import { history, historyKeymap } from "@codemirror/commands";
+import { history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { yaml } from "@codemirror/lang-yaml";
 import { linter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
 import { EditorState, type Extension } from "@codemirror/state";
@@ -456,6 +456,7 @@ export function oxidnsYamlExtensions(
           return true;
         },
       },
+      indentWithTab,
       ...historyKeymap,
     ]),
     EditorView.lineWrapping,
