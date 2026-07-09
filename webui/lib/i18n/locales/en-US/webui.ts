@@ -694,6 +694,8 @@ export const enUSWebui = {
     pluginNameRequired: "Plugin name is required",
     pluginNameInvalid:
       "Plugin name can only contain ASCII letters, digits, underscores (_), hyphens (-), and dots (.)",
+    pluginNameReserved:
+      "Plugin names cannot start with qs.exec., qs.match., or qs.cron.",
     pluginNameUnchanged: "Plugin name is unchanged",
     pluginNameExists: "Plugin name already exists",
     configHasErrorsBeforeRename:

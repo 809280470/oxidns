@@ -715,6 +715,7 @@ export const WEBUI = {
     unsafeReferences: "webui.storeErrors.unsafeReferences",
     pluginNameRequired: "webui.storeErrors.pluginNameRequired",
     pluginNameInvalid: "webui.storeErrors.pluginNameInvalid",
+    pluginNameReserved: "webui.storeErrors.pluginNameReserved",
     pluginNameUnchanged: "webui.storeErrors.pluginNameUnchanged",
     pluginNameExists: "webui.storeErrors.pluginNameExists",
     configHasErrorsBeforeRename:

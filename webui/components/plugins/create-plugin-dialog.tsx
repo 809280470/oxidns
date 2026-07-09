@@ -47,7 +47,7 @@ import {
 } from "@/components/plugins/plugin-config-fields-editor";
 import { PluginConfigModeEditor } from "@/components/plugins/plugin-config-mode-editor";
 import { isPluginKindSupported } from "@/lib/build-capabilities";
-import { isValidPluginTag } from "@/lib/plugin-tags";
+import { isReservedPluginTag, isValidPluginTag } from "@/lib/plugin-tags";
 import { cn } from "@/lib/utils";
 
 const SequenceComposer = dynamic(
@@ -142,6 +142,9 @@ export function CreatePluginDialog({
     if (!normalizedInstanceName) return null;
     if (!isValidPluginTag(normalizedInstanceName)) {
       return t(WEBUI.storeErrors.pluginNameInvalid);
+    }
+    if (isReservedPluginTag(normalizedInstanceName)) {
+      return t(WEBUI.storeErrors.pluginNameReserved);
     }
     if (plugins.some((plugin) => plugin.name === normalizedInstanceName)) {
       return t(WEBUI.storeErrors.pluginNameExists);

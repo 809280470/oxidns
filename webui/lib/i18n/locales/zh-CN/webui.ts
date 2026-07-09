@@ -671,6 +671,8 @@ export const zhCNWebui = {
     pluginNameRequired: "插件名称不能为空",
     pluginNameInvalid:
       "插件名称只能包含英文字母、数字、下划线（_）、横线（-）和点（.）",
+    pluginNameReserved:
+      "插件名称不能以 qs.exec.、qs.match. 或 qs.cron. 开头",
     pluginNameUnchanged: "插件名称没有变化",
     pluginNameExists: "插件名称已存在",
     configHasErrorsBeforeRename: "当前配置有错误，请先在编辑器中修复后再重命名",

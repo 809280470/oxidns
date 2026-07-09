@@ -29,7 +29,7 @@ import { usePluginAppliedStatus } from "@/hooks/use-plugin-applied";
 import { WEBUI } from "@/lib/i18n";
 import { pluginTypeLabel } from "@/lib/i18n/plugin-defined";
 import { useI18n } from "@/lib/i18n/provider";
-import { isValidPluginTag } from "@/lib/plugin-tags";
+import { isReservedPluginTag, isValidPluginTag } from "@/lib/plugin-tags";
 import type { PluginDetailTemplateProps, PluginSummaryItem } from "./types";
 import { pluginTypeColors, pluginTypeIcons } from "./display";
 import { getPluginCatalogItem, renderPluginKindIcon } from "./catalog";
@@ -103,6 +103,8 @@ export function PluginDetailTemplate({
   const nameValidationError =
     normalizedNewName && !isValidPluginTag(normalizedNewName)
       ? t(WEBUI.storeErrors.pluginNameInvalid)
+      : normalizedNewName && isReservedPluginTag(normalizedNewName)
+        ? t(WEBUI.storeErrors.pluginNameReserved)
       : null;
   const displayedNameError = nameError ?? nameValidationError;
   const nameSaveDisabled =

@@ -56,7 +56,7 @@ import {
   type ConfigSnapshot,
 } from "./config-history";
 import { WEBUI, tClient } from "./i18n";
-import { isValidPluginTag } from "./plugin-tags";
+import { isReservedPluginTag, isValidPluginTag } from "./plugin-tags";
 import {
   createProcessInstanceBaseline,
   hasProcessIdentityBaseline,
@@ -779,6 +779,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       return {
         status: "invalid",
         message: tClient(WEBUI.storeErrors.pluginNameInvalid),
+      };
+    }
+    if (isReservedPluginTag(nextName)) {
+      return {
+        status: "invalid",
+        message: tClient(WEBUI.storeErrors.pluginNameReserved),
       };
     }
     if (nextName === plugin.name) {
