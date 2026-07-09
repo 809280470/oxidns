@@ -1,27 +1,37 @@
-FROM debian:bookworm-slim
+# syntax=docker/dockerfile:1
 
-ARG OXIDNS_VERSION=dev
+FROM alpine:3.22 AS runtime-files
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /etc/oxidns
 
-COPY .docker-dist/oxidns /usr/local/bin/oxidns
 COPY .docker-dist/config.yaml /etc/oxidns/config.yaml
+
+RUN sed -i 's/:5335/:53/' /etc/oxidns/config.yaml || true
+
+FROM busybox:musl
+
+ARG OXIDNS_VERSION=dev
+
+WORKDIR /etc/oxidns
+
+COPY --from=runtime-files /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=runtime-files /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=runtime-files /usr/share/zoneinfo/UTC /etc/localtime
+COPY --from=runtime-files /tmp /tmp
+COPY --from=runtime-files /etc/oxidns/config.yaml /etc/oxidns/config.yaml
+COPY --chmod=0755 .docker-dist/oxidns /usr/local/bin/oxidns
 COPY .docker-dist/webui /etc/oxidns/webui
 COPY .docker-dist/LICENSE /usr/share/licenses/oxidns/LICENSE
 
-RUN chmod +x /usr/local/bin/oxidns \
-    && sed -i 's/:5335/:53/' /etc/oxidns/config.yaml || true
-
 ENV OXIDNS_VERSION=${OXIDNS_VERSION}
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV TZ=UTC
 
 EXPOSE 53/udp
 EXPOSE 53/tcp
 EXPOSE 9199/tcp
 
-ENTRYPOINT ["oxidns"]
+ENTRYPOINT ["/usr/local/bin/oxidns"]
 CMD ["start", "-c", "/etc/oxidns/config.yaml", "-d", "/etc/oxidns"]
