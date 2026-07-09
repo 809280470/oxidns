@@ -3,6 +3,7 @@
 
 //! Route registration keys and path matching helpers.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use ahash::AHashMap;
@@ -62,6 +63,7 @@ pub(crate) fn build_plugin_route_path(plugin_tag: &str, subpath: &str) -> Result
             plugin_tag
         )));
     }
+    let plugin_tag = encode_path_segment(plugin_tag);
 
     let subpath = if subpath.is_empty() {
         ""
@@ -75,6 +77,21 @@ pub(crate) fn build_plugin_route_path(plugin_tag: &str, subpath: &str) -> Result
     };
 
     normalize_route_path(&format!("/plugins/{plugin_tag}{subpath}"))
+}
+
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
 }
 
 pub(super) fn normalize_route_path(path: &str) -> Result<String> {
