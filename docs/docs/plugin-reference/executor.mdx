@@ -436,6 +436,8 @@ import Admonition from "@theme/Admonition";
 - `forward_latency_count`
 - `forward_latency_sum_ms`
 
+`forward_incomplete_alias_selected_total` 仅统计执行语义分类的并发选择模式（`balanced`、`prefer_positive`、`consensus`）。单上游和 `fastest` 不会为了该指标额外扫描响应。
+
 每个上游另外导出带 `upstream` 标签的指标（标签值为上游 tag，未配置时为解析后的地址）：
 
 - `forward_upstream_query_total`

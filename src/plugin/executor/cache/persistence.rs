@@ -12,7 +12,10 @@ use tracing::{info, warn};
 use wincode::{SchemaRead, SchemaWrite};
 
 use super::key::{CacheKey, EcsScopeDigest, normalize_domain_key};
-use super::{CacheItem, CacheMap, clamp_persisted_cache_ttl, is_cache_entry_response_valid};
+use super::{
+    CacheItem, CacheMap, clamp_persisted_cache_ttl, is_cache_disposition_valid,
+    response_disposition_for_cache,
+};
 use crate::infra::cache::ttl::TtlCacheEntry;
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
@@ -70,8 +73,11 @@ pub(super) fn dump_cache_to_bytes(cache_map: &CacheMap) -> Result<Vec<u8>> {
             continue;
         }
 
-        if !is_cache_entry_response_valid(&value.resp, &key) {
-            continue;
+        if !value.is_validated() {
+            let disposition = response_disposition_for_cache(&value.resp, &key);
+            if !is_cache_disposition_valid(disposition) {
+                continue;
+            }
         }
 
         let resp_bytes = match value.resp.to_bytes() {
@@ -229,12 +235,13 @@ pub(super) fn load_cache_from_bytes(
             }
         };
 
-        if !is_cache_entry_response_valid(&resp, &key) {
+        let disposition = response_disposition_for_cache(&resp, &key);
+        if !is_cache_disposition_valid(disposition) {
             continue;
         }
 
         let (ttl, remaining_ttl_ms) =
-            clamp_persisted_cache_ttl(&resp, &key, entry.ttl, entry.remaining_ttl_ms);
+            clamp_persisted_cache_ttl(&resp, &key, disposition, entry.ttl, entry.remaining_ttl_ms);
         if ttl == 0 || remaining_ttl_ms == 0 {
             continue;
         }

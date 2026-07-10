@@ -18,9 +18,9 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 
        **Changes**
 
-       - `fix(dns)`: add a shared response classifier for complete positives, definitive negatives, incomplete aliases, and other responses. Requested RRs must belong to the original QNAME or its CNAME-chain terminal instead of merely appearing somewhere in Answer.
-       - `fix(forward)`: `balanced`, `prefer_positive`, and `consensus` prefer complete CNAME-chain answers. Bare CNAME responses cannot win early or vote as negatives, but are preserved when no better response exists. `CNAME + SOA` is recognized as NODATA, and a selected-incomplete-alias metric is exported.
-       - `fix(cache)`: bare CNAME responses no longer populate A/AAAA and similar address-query keys. Admission and dump/load validate QNAME/QTYPE/QCLASS, while alias-NODATA lifetime is capped by the lowest SOA, Answer (including CNAME), and configured TTL. A new `incomplete_answer` cache skip reason is exported.
+       - `fix(dns)`: add a shared response classifier for complete positives, definitive negatives, incomplete aliases, and other responses. Requested RRs must belong to the original QNAME or its CNAME-chain terminal instead of merely appearing somewhere in Answer, with one Answer scan per CNAME hop.
+       - `fix(forward)`: `balanced`, `prefer_positive`, and `consensus` prefer complete CNAME-chain answers. Bare CNAME responses cannot win early or vote as negatives, but are preserved when no better response exists. `CNAME + SOA` is recognized as NODATA; selected dispositions are reused, while single-upstream and `fastest` paths avoid metric-only response scans.
+       - `fix(cache)`: bare CNAME responses no longer populate A/AAAA and similar address-query keys. Admission and dump/load validate QNAME/QTYPE/QCLASS, while alias-NODATA lifetime is capped by the lowest SOA, Answer (including CNAME), and configured TTL. Admission, lazy refresh, and persistence reuse one classification, and a new `incomplete_answer` cache skip reason is exported.
        - `feat(release)`: add ARMv7 targets and normalize published target selection; switch Docker images to Alpine; add the full OpenWrt LuCI application lifecycle.
        - `fix(config/api)`: unsafe or reserved quick-setup plugin tags are rejected. API plugin routes canonically URL-encode special characters to prevent path ambiguity.
        - `fix(webui)`: migrate the YAML configuration editor to CodeMirror and improve editing behavior; keep frontend plugin-tag route handling aligned with backend encoding.

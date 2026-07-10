@@ -381,6 +381,8 @@ Exported through the global `GET /api/metrics` endpoint:
 - `forward_latency_count`
 - `forward_latency_sum_ms`
 
+`forward_incomplete_alias_selected_total` only covers selection-aware concurrent modes (`balanced`, `prefer_positive`, and `consensus`). Single-upstream and `fastest` paths do not scan responses solely for this metric.
+
 Per-upstream series are also exported with an `upstream` label (the upstream tag, or its resolved address when no tag is configured):
 
 - `forward_upstream_query_total`

@@ -393,7 +393,7 @@ async fn single_metrics_record_error_and_timeout() {
 }
 
 #[tokio::test]
-async fn single_metrics_record_selected_incomplete_alias() {
+async fn single_does_not_classify_for_incomplete_alias_metric() {
     let metrics = test_metrics();
     let forwarder = SingleDnsForwarder {
         tag: "forward-test".to_string(),
@@ -410,7 +410,61 @@ async fn single_metrics_record_selected_incomplete_alias() {
         metrics
             .incomplete_alias_selected_total
             .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn concurrent_selection_records_selected_incomplete_alias() {
+    let metrics = test_metrics();
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 1,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Balanced,
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(
+        metrics
+            .incomplete_alias_selected_total
+            .load(Ordering::Relaxed),
         1
+    );
+}
+
+#[tokio::test]
+async fn fastest_does_not_classify_for_incomplete_alias_metric() {
+    let metrics = test_metrics();
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 1,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+            Arc::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Fastest,
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(
+        metrics
+            .incomplete_alias_selected_total
+            .load(Ordering::Relaxed),
+        0
     );
 }
 

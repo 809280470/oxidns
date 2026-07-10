@@ -18,9 +18,9 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 
        **主要变更**
 
-       - `fix(dns)`：新增共享响应分类器，区分完整正响应、确定负响应、incomplete alias 与其他异常响应；完整性校验确认目标 RR 位于原始 QNAME/CNAME 链尾，不再仅按 Answer 中是否出现相同 qtype 判断。
-       - `fix(forward)`：`balanced`、`prefer_positive`、`consensus` 会优先完整 CNAME 链答案；裸 CNAME 不会提前胜出或计入负响应共识，但没有更优结果时仍原样返回。`CNAME + SOA` 正确识别为 NODATA；新增 incomplete alias 选择指标。
-       - `fix(cache)`：裸 CNAME 不再写入 A/AAAA 等地址查询 key；缓存准入与 dump/load 会核对 QNAME/QTYPE/QCLASS；别名型 NODATA 的寿命不会超过 SOA、CNAME 等 Answer 和配置上限中的最小 TTL；并新增 `incomplete_answer` 缓存跳过指标。
+       - `fix(dns)`：新增共享响应分类器，区分完整正响应、确定负响应、incomplete alias 与其他异常响应；完整性校验确认目标 RR 位于原始 QNAME/CNAME 链尾，不再仅按 Answer 中是否出现相同 qtype 判断；CNAME 每跳只扫描一次 Answer。
+       - `fix(forward)`：`balanced`、`prefer_positive`、`consensus` 会优先完整 CNAME 链答案；裸 CNAME 不会提前胜出或计入负响应共识，但没有更优结果时仍原样返回。`CNAME + SOA` 正确识别为 NODATA；选择结果会复用已计算的分类，单上游和 `fastest` 不为指标增加响应扫描。
+       - `fix(cache)`：裸 CNAME 不再写入 A/AAAA 等地址查询 key；缓存准入与 dump/load 会核对 QNAME/QTYPE/QCLASS；别名型 NODATA 的寿命不会超过 SOA、CNAME 等 Answer 和配置上限中的最小 TTL；准入、lazy refresh 与持久化复用单次分类，并新增 `incomplete_answer` 缓存跳过指标。
        - `feat(release)`：新增 ARMv7 目标支持并规范发布产物 target 选择；Docker 镜像迁移到 Alpine 基础镜像；OpenWrt LuCI 应用脚本支持完整生命周期。
        - `fix(config/api)`：插件 tag 现在拒绝不安全或保留的 quick-setup 名称；API 插件路由对特殊字符进行规范 URL 编码，避免路径歧义。
        - `fix(webui)`：配置 YAML 编辑器迁移到 CodeMirror 并完善编辑行为；前端插件 tag 路由与后端编码规则保持一致。

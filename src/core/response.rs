@@ -61,9 +61,9 @@ impl ResponseDisposition {
 #[inline]
 pub fn classify_response(response: &Message, question: Option<&Question>) -> ResponseDisposition {
     if let Some(question) = question
-        && response
-            .first_question()
-            .is_some_and(|response_question| response_question != question)
+        && response.first_question().is_some_and(|response_question| {
+            !std::ptr::eq(response_question, question) && response_question != question
+        })
     {
         return ResponseDisposition::Other;
     }
@@ -117,15 +117,11 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
     let mut saw_alias = false;
 
     for hop in 0..=MAX_CNAME_HOPS {
-        if has_answer_at_name(response, current, qtype, question.qclass()) {
-            return ResponseDisposition::CompletePositive;
-        }
-
-        let Some(target) = unique_cname_target(response, current, question.qclass()) else {
-            break;
-        };
-        let Ok(target) = target else {
-            return ResponseDisposition::Other;
+        let target = match inspect_answers_at_name(response, current, qtype, question.qclass()) {
+            OwnerAnswer::Requested => return ResponseDisposition::CompletePositive,
+            OwnerAnswer::Alias(target) => target,
+            OwnerAnswer::ConflictingAlias => return ResponseDisposition::Other,
+            OwnerAnswer::None => break,
         };
         if hop == MAX_CNAME_HOPS || target == current {
             return ResponseDisposition::Other;
@@ -144,16 +140,52 @@ pub fn classify_response(response: &Message, question: Option<&Question>) -> Res
     }
 }
 
+enum OwnerAnswer<'a> {
+    Requested,
+    Alias(&'a Name),
+    ConflictingAlias,
+    None,
+}
+
+/// Inspect one CNAME-chain owner with a single pass over the answer section.
+///
+/// A requested RR takes precedence over conflicting CNAME records at the same
+/// owner, matching the classifier's historic positive-answer behavior.
 #[inline]
-fn has_answer_at_name(
-    response: &Message,
+fn inspect_answers_at_name<'a>(
+    response: &'a Message,
     name: &Name,
     record_type: RecordType,
     dns_class: DNSClass,
-) -> bool {
-    response.answers().iter().any(|record| {
-        record.name() == name && record.class() == dns_class && record.rr_type() == record_type
-    })
+) -> OwnerAnswer<'a> {
+    let mut cname_target = None;
+    let mut conflicting_alias = false;
+
+    for record in response.answers() {
+        if record.name() != name || record.class() != dns_class {
+            continue;
+        }
+        if record.rr_type() == record_type {
+            return OwnerAnswer::Requested;
+        }
+
+        let Some(candidate) = record.cname_target() else {
+            continue;
+        };
+        if let Some(existing) = cname_target {
+            conflicting_alias |= existing != candidate;
+        } else {
+            cname_target = Some(candidate);
+        }
+    }
+
+    if conflicting_alias {
+        OwnerAnswer::ConflictingAlias
+    } else if let Some(target) = cname_target {
+        OwnerAnswer::Alias(target)
+    } else {
+        OwnerAnswer::None
+    }
 }
 
 #[inline]
@@ -170,33 +202,6 @@ fn has_negative_soa_for_class(response: &Message, dns_class: DNSClass) -> bool {
         .authorities()
         .iter()
         .any(|record| record.class() == dns_class && record.rr_type() == RecordType::SOA)
-}
-
-/// Returns `None` when `name` has no CNAME and `Some(Err(()))` for conflicting
-/// CNAME RDATA at the same owner name.
-#[inline]
-fn unique_cname_target<'a>(
-    response: &'a Message,
-    name: &Name,
-    dns_class: DNSClass,
-) -> Option<std::result::Result<&'a Name, ()>> {
-    let mut target = None;
-    for record in response.answers() {
-        if record.name() != name || record.class() != dns_class {
-            continue;
-        }
-        let Some(candidate) = record.cname_target() else {
-            continue;
-        };
-        if let Some(existing) = target {
-            if existing != candidate {
-                return Some(Err(()));
-            }
-        } else {
-            target = Some(candidate);
-        }
-    }
-    target.map(Ok)
 }
 
 #[cfg(test)]
@@ -296,6 +301,37 @@ mod tests {
         assert_eq!(
             classify_response(&response, Some(&request)),
             ResponseDisposition::Other
+        );
+    }
+
+    #[test]
+    fn marks_conflicting_alias_targets_without_requested_rr_as_other() {
+        let request = question("www.example.com.", RecordType::A);
+        let mut response = response_with_question(request.clone());
+        add_cname(&mut response, "www.example.com.", "edge-a.example.com.");
+        add_cname(&mut response, "www.example.com.", "edge-b.example.com.");
+
+        assert_eq!(
+            classify_response(&response, Some(&request)),
+            ResponseDisposition::Other
+        );
+    }
+
+    #[test]
+    fn requested_rr_wins_over_conflicting_alias_targets_at_same_owner() {
+        let request = question("www.example.com.", RecordType::A);
+        let mut response = response_with_question(request.clone());
+        add_cname(&mut response, "www.example.com.", "edge-a.example.com.");
+        add_cname(&mut response, "www.example.com.", "edge-b.example.com.");
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("www.example.com.").unwrap(),
+            60,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+
+        assert_eq!(
+            classify_response(&response, Some(&request)),
+            ResponseDisposition::CompletePositive
         );
     }
 

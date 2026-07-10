@@ -175,7 +175,7 @@ impl MetricSource for ForwardMetrics {
         ));
         sink.emit(MetricSample::counter(
             "forward_incomplete_alias_selected_total",
-            "Total forward queries that returned an incomplete CNAME alias response as the best available result.",
+            "Total selection-aware concurrent forward queries that selected an incomplete CNAME alias response as the best available result; single-upstream and fastest modes are excluded.",
             &labels,
             self.incomplete_alias_selected_total.load(Ordering::Relaxed),
         ));

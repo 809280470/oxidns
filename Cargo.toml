@@ -365,6 +365,10 @@ harness = false
 name = "ip_rule_matcher"
 harness = false
 
+[[bench]]
+name = "response_classification"
+harness = false
+
 
 [[bin]]
 name = "oxidns"

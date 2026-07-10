@@ -23,6 +23,8 @@ OxiDNS is not only interested in peak numbers for the simplest possible case. Th
 * These snapshots are better read as version-specific distributions of strengths against mosdns
 * Because the 2026-04-13 compare pack updated the scenario catalog, query sets, and some workload definitions, the absolute numbers in `v0.1.0` and `v0.3.0` should not be treated as a direct regression chart across versions
 
+Run `cargo bench --bench response_classification` for the source-level DNS response-classification microbenchmark. It covers direct A, 1/4/16-hop CNAME chains, CNAME-only, CNAME+NODATA, and NXDOMAIN.
+
 Legend:
 
 * <span className="benchmark-delta benchmark-delta--up">Green</span> means OxiDNS performs better on that metric

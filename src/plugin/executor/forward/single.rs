@@ -9,7 +9,6 @@ use tracing::{info, warn};
 use super::is_timeout_error;
 use super::metrics::ForwardMetrics;
 use crate::core::context::DnsContext;
-use crate::core::response::{ResponseDisposition, classify_response};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::upstream::Upstream;
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
@@ -60,11 +59,6 @@ impl Executor for SingleDnsForwarder {
         self.metrics.record_upstream_start(0);
         match self.upstream.query(context.request.clone()).await {
             Ok(res) => {
-                if classify_response(&res, context.request.first_question())
-                    == ResponseDisposition::IncompleteAlias
-                {
-                    self.metrics.record_incomplete_alias_selected();
-                }
                 context.set_response(res);
                 self.metrics.record_success(start_ms);
                 self.metrics.record_upstream_success(0, start_ms);

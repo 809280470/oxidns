@@ -53,19 +53,26 @@ struct NegativeVote {
 }
 
 #[derive(Debug)]
-struct SelectionState {
-    question: Option<Question>,
+pub(super) struct SelectedResponse {
+    pub(super) message: Message,
+    pub(super) disposition: Option<ResponseDisposition>,
+}
+
+#[derive(Debug)]
+struct SelectionState<'a> {
+    question: Option<&'a Question>,
     completed: usize,
     last_error: Option<String>,
     last_timeout: bool,
     best_response: Option<Message>,
     best_response_rank: Option<u8>,
+    best_response_disposition: Option<ResponseDisposition>,
     negative_votes: usize,
     negative_vote_buckets: Vec<NegativeVote>,
 }
 
-impl SelectionState {
-    fn new(question: Option<Question>) -> Self {
+impl<'a> SelectionState<'a> {
+    fn new(question: Option<&'a Question>) -> Self {
         Self {
             question,
             completed: 0,
@@ -73,13 +80,14 @@ impl SelectionState {
             last_timeout: false,
             best_response: None,
             best_response_rank: None,
+            best_response_disposition: None,
             negative_votes: 0,
             negative_vote_buckets: Vec::new(),
         }
     }
 
     fn record_response(&mut self, response: Message) -> ResponseClass {
-        let disposition = classify_dns_response(&response, self.question.as_ref());
+        let disposition = classify_dns_response(&response, self.question);
         let class = response_class(disposition);
         if class == ResponseClass::Negative {
             self.negative_votes += 1;
@@ -94,6 +102,7 @@ impl SelectionState {
         {
             self.best_response = Some(response);
             self.best_response_rank = Some(response_rank);
+            self.best_response_disposition = Some(disposition);
         }
         class
     }
@@ -108,8 +117,20 @@ impl SelectionState {
         self.last_error = Some(format!("forward subtask join failed: {}", err));
     }
 
-    fn finish(self) -> (Option<Message>, Option<String>, bool) {
-        (self.best_response, self.last_error, self.last_timeout)
+    fn take_selected_response(&mut self) -> Option<SelectedResponse> {
+        self.best_response.take().map(|message| SelectedResponse {
+            message,
+            disposition: self.best_response_disposition.take(),
+        })
+    }
+
+    fn finish(mut self) -> (Option<SelectedResponse>, Option<String>, bool) {
+        let selected = self.take_selected_response();
+        (selected, self.last_error, self.last_timeout)
+    }
+
+    fn finish_success(mut self) -> (Option<SelectedResponse>, Option<String>, bool) {
+        (self.take_selected_response(), None, false)
     }
 
     fn record_negative_vote(&mut self, key: NegativeResponseKey) {
@@ -135,9 +156,9 @@ impl SelectionState {
 pub(super) async fn select_response(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
-    question: Option<Question>,
+    question: Option<&Question>,
     mode: ResponseSelectionMode,
-) -> (Option<Message>, Option<String>, bool) {
+) -> (Option<SelectedResponse>, Option<String>, bool) {
     match mode {
         ResponseSelectionMode::Fastest => select_fastest(join_set).await,
         ResponseSelectionMode::Balanced => {
@@ -154,13 +175,20 @@ pub(super) async fn select_response(
 
 async fn select_fastest(
     join_set: &mut JoinSet<Result<Message>>,
-) -> (Option<Message>, Option<String>, bool) {
+) -> (Option<SelectedResponse>, Option<String>, bool) {
     let mut state = SelectionState::new(None);
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok(Ok(response)) => {
                 join_set.abort_all();
-                return (Some(response), None, false);
+                return (
+                    Some(SelectedResponse {
+                        message: response,
+                        disposition: None,
+                    }),
+                    None,
+                    false,
+                );
             }
             Ok(Err(err)) => state.record_error(err),
             Err(err) => state.record_join_error(err),
@@ -172,13 +200,13 @@ async fn select_fastest(
 async fn select_prefer_positive(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
-    question: Option<Question>,
-) -> (Option<Message>, Option<String>, bool) {
+    question: Option<&Question>,
+) -> (Option<SelectedResponse>, Option<String>, bool) {
     let mut state = SelectionState::new(question);
     while let Some(class) = next_response_class(join_set, &mut state).await {
         if class == ResponseClass::Positive {
             join_set.abort_all();
-            return (state.best_response, None, false);
+            return state.finish_success();
         }
         if state.completed >= active_concurrent {
             break;
@@ -190,8 +218,8 @@ async fn select_prefer_positive(
 async fn select_balanced(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
-    question: Option<Question>,
-) -> (Option<Message>, Option<String>, bool) {
+    question: Option<&Question>,
+) -> (Option<SelectedResponse>, Option<String>, bool) {
     let mut state = SelectionState::new(question);
     let mut negative_grace =
         std::pin::Pin::from(Box::new(tokio::time::sleep(BALANCED_NEGATIVE_GRACE)));
@@ -211,7 +239,7 @@ async fn select_balanced(
                 match class {
                     ResponseClass::Positive => {
                         join_set.abort_all();
-                        return (state.best_response, None, false);
+                        return state.finish_success();
                     }
                     ResponseClass::Negative => {
                         if state.completed >= active_concurrent {
@@ -230,7 +258,7 @@ async fn select_balanced(
             }
             _ = &mut negative_grace, if state.negative_votes > 0 => {
                 join_set.abort_all();
-                return (state.best_response, None, false);
+                return state.finish_success();
             }
         }
     }
@@ -239,8 +267,8 @@ async fn select_balanced(
 async fn select_consensus(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
-    question: Option<Question>,
-) -> (Option<Message>, Option<String>, bool) {
+    question: Option<&Question>,
+) -> (Option<SelectedResponse>, Option<String>, bool) {
     if active_concurrent < CONSENSUS_NEGATIVE_VOTES {
         return select_prefer_positive(join_set, active_concurrent, question).await;
     }
@@ -250,11 +278,11 @@ async fn select_consensus(
         match class {
             ResponseClass::Positive => {
                 join_set.abort_all();
-                return (state.best_response, None, false);
+                return state.finish_success();
             }
             ResponseClass::Negative if state.has_negative_consensus(CONSENSUS_NEGATIVE_VOTES) => {
                 join_set.abort_all();
-                return (state.best_response, None, false);
+                return state.finish_success();
             }
             ResponseClass::Negative | ResponseClass::Other => {
                 if state.completed >= active_concurrent {
@@ -268,7 +296,7 @@ async fn select_consensus(
 
 async fn next_response_class(
     join_set: &mut JoinSet<Result<Message>>,
-    state: &mut SelectionState,
+    state: &mut SelectionState<'_>,
 ) -> Option<ResponseClass> {
     loop {
         let joined = join_set.join_next().await?;
@@ -280,7 +308,7 @@ async fn next_response_class(
 
 fn handle_joined_response(
     joined: std::result::Result<Result<Message>, JoinError>,
-    state: &mut SelectionState,
+    state: &mut SelectionState<'_>,
 ) -> Option<ResponseClass> {
     state.completed += 1;
     match joined {

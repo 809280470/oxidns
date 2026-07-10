@@ -828,15 +828,6 @@ impl Cache {
     }
 
     #[inline]
-    fn can_lazy_cache_response(&self, response: &Message, key: &CacheKey) -> bool {
-        self.config.lazy_cache_ttl.is_some()
-            && matches!(
-                self.compute_positive_ttl(response, key),
-                CacheTtlDecision::Cache(_)
-            )
-    }
-
-    #[inline]
     fn compute_fresh_until_ms(now: u64, ttl: u32) -> u64 {
         now.saturating_add(u64::from(ttl) * 1000)
     }
@@ -860,9 +851,13 @@ impl Cache {
 
         match cache_map.get_retained_cloned_status(&key, now, touch_interval_ms) {
             Some(TtlCacheLookup::Hit(item)) => {
-                if !item.value.is_validated()
-                    && !is_cache_entry_response_valid(&item.value.resp, &key)
-                {
+                let invalid_disposition = if item.value.is_validated() {
+                    None
+                } else {
+                    let disposition = response_disposition_for_cache(&item.value.resp, &key);
+                    (!is_cache_disposition_valid(disposition)).then_some(disposition)
+                };
+                if let Some(disposition) = invalid_disposition {
                     if cache_map.remove_if(&key, |existing| {
                         existing.cache_time_ms == item.cache_time_ms
                             && existing.expire_at_ms == item.expire_at_ms
@@ -870,7 +865,7 @@ impl Cache {
                     }) {
                         self.updated_keys.fetch_add(1, Ordering::Relaxed);
                         self.metrics
-                            .record_skip(cache_skip_reason_for_response(&item.value.resp, &key));
+                            .record_skip(cache_skip_reason_for_disposition(disposition));
                         debug!(
                             "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
                             key.domain,
@@ -1004,8 +999,12 @@ impl Cache {
     }
 
     #[inline]
-    fn compute_positive_ttl(&self, response: &Message, key: &CacheKey) -> CacheTtlDecision {
-        if !response_disposition_for_cache(response, key).is_complete_positive() {
+    fn compute_positive_ttl_for_disposition(
+        &self,
+        response: &Message,
+        disposition: ResponseDisposition,
+    ) -> CacheTtlDecision {
+        if !disposition.is_complete_positive() {
             return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
         }
 
@@ -1032,12 +1031,17 @@ impl Cache {
     }
 
     #[inline]
-    fn compute_negative_ttl(&self, response: &Message, key: &CacheKey) -> Option<u32> {
+    fn compute_negative_ttl_for_disposition(
+        &self,
+        response: &Message,
+        key: &CacheKey,
+        disposition: ResponseDisposition,
+    ) -> Option<u32> {
         if !self.cache_negative {
             return None;
         }
 
-        response_disposition_for_cache(response, key).negative_kind()?;
+        disposition.negative_kind()?;
 
         let mut ttl = if let Some(soa_ttl) = negative_ttl_from_soa_for_key(response, key) {
             soa_ttl
@@ -1054,11 +1058,18 @@ impl Cache {
     }
 
     #[inline]
-    fn compute_cache_ttl(&self, response: &Message, key: &CacheKey) -> CacheTtlDecision {
-        match response_disposition_for_cache(response, key) {
-            ResponseDisposition::CompletePositive => self.compute_positive_ttl(response, key),
+    fn compute_cache_ttl_for_disposition(
+        &self,
+        response: &Message,
+        key: &CacheKey,
+        disposition: ResponseDisposition,
+    ) -> CacheTtlDecision {
+        match disposition {
+            ResponseDisposition::CompletePositive => {
+                self.compute_positive_ttl_for_disposition(response, disposition)
+            }
             ResponseDisposition::DefinitiveNegative(_) => self
-                .compute_negative_ttl(response, key)
+                .compute_negative_ttl_for_disposition(response, key, disposition)
                 .map(CacheTtlDecision::Cache)
                 .unwrap_or(CacheTtlDecision::Skip(CacheSkipReason::NoTtl)),
             ResponseDisposition::IncompleteAlias => {
@@ -1068,12 +1079,32 @@ impl Cache {
         }
     }
 
+    #[cfg(test)]
+    fn compute_negative_ttl(&self, response: &Message, key: &CacheKey) -> Option<u32> {
+        let disposition = response_disposition_for_cache(response, key);
+        self.compute_negative_ttl_for_disposition(response, key, disposition)
+    }
+
+    #[cfg(test)]
+    fn compute_cache_ttl(&self, response: &Message, key: &CacheKey) -> CacheTtlDecision {
+        let disposition = response_disposition_for_cache(response, key);
+        self.compute_cache_ttl_for_disposition(response, key, disposition)
+    }
+
     #[inline]
     #[hotpath::measure]
-    fn update_cache_entry(&self, cache_map: &CacheMap, key: CacheKey, response: Message, ttl: u32) {
+    fn update_cache_entry(
+        &self,
+        cache_map: &CacheMap,
+        key: CacheKey,
+        response: Message,
+        ttl: u32,
+        disposition: ResponseDisposition,
+    ) {
         let now = AppClock::elapsed_millis();
         let fresh_until_ms = Self::compute_fresh_until_ms(now, ttl);
-        let enable_lazy = self.can_lazy_cache_response(&response, &key);
+        let enable_lazy =
+            self.config.lazy_cache_ttl.is_some() && disposition.is_complete_positive();
         let expire_time = self.compute_expire_time(now, ttl, enable_lazy);
         let item = CacheItem::new_validated(response, ttl, fresh_until_ms);
         debug!(
@@ -1135,7 +1166,7 @@ impl Cache {
 
             match refresh {
                 Ok(Ok(Some(response))) if !response.truncated() => {
-                    let ttl = compute_cache_ttl_with_policy(
+                    let (ttl, disposition) = compute_cache_ttl_with_policy(
                         &response,
                         &key,
                         max_positive_ttl,
@@ -1147,16 +1178,8 @@ impl Cache {
                     if let CacheTtlDecision::Cache(ttl) = ttl {
                         let now = AppClock::elapsed_millis();
                         let fresh_until_ms = Cache::compute_fresh_until_ms(now, ttl);
-                        let enable_lazy = lazy_cache_ttl.is_some()
-                            && matches!(
-                                compute_positive_ttl_with_policy(
-                                    &response,
-                                    &key,
-                                    max_positive_ttl,
-                                    min_positive_ttl
-                                ),
-                                CacheTtlDecision::Cache(_)
-                            );
+                        let enable_lazy =
+                            lazy_cache_ttl.is_some() && disposition.is_complete_positive();
                         let expire_at_ms = if enable_lazy {
                             now.saturating_add(
                                 u64::from(ttl.max(lazy_cache_ttl.unwrap_or(ttl))) * 1000,
@@ -1369,9 +1392,10 @@ impl Executor for Cache {
                 return Ok(next_step);
             }
 
-            match self.compute_cache_ttl(response, &key) {
+            let disposition = response_disposition_for_cache(response, &key);
+            match self.compute_cache_ttl_for_disposition(response, &key, disposition) {
                 CacheTtlDecision::Cache(ttl) => {
-                    self.update_cache_entry(cache_map, key, response.clone(), ttl);
+                    self.update_cache_entry(cache_map, key, response.clone(), ttl, disposition);
                 }
                 CacheTtlDecision::Skip(reason) => {
                     self.metrics.record_skip(reason);
@@ -1384,14 +1408,9 @@ impl Executor for Cache {
 
 fn compute_positive_ttl_with_policy(
     response: &Message,
-    key: &CacheKey,
     max_positive_ttl: Option<u32>,
     min_positive_ttl: Option<u32>,
 ) -> CacheTtlDecision {
-    if !response_disposition_for_cache(response, key).is_complete_positive() {
-        return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
-    }
-
     let Some(ttl) = response.min_answer_ttl() else {
         return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
     };
@@ -1420,8 +1439,6 @@ fn compute_negative_ttl_with_policy(
         return None;
     }
 
-    response_disposition_for_cache(response, key).negative_kind()?;
-
     let mut ttl = negative_ttl_from_soa_for_key(response, key)
         .unwrap_or(negative_ttl_without_soa)
         .min(max_negative_ttl);
@@ -1439,10 +1456,11 @@ fn compute_cache_ttl_with_policy(
     cache_negative: bool,
     max_negative_ttl: u32,
     negative_ttl_without_soa: u32,
-) -> CacheTtlDecision {
-    match response_disposition_for_cache(response, key) {
+) -> (CacheTtlDecision, ResponseDisposition) {
+    let disposition = response_disposition_for_cache(response, key);
+    let decision = match disposition {
         ResponseDisposition::CompletePositive => {
-            compute_positive_ttl_with_policy(response, key, max_positive_ttl, min_positive_ttl)
+            compute_positive_ttl_with_policy(response, max_positive_ttl, min_positive_ttl)
         }
         ResponseDisposition::DefinitiveNegative(_) => {
             if let Some(ttl) = compute_negative_ttl_with_policy(
@@ -1461,11 +1479,22 @@ fn compute_cache_ttl_with_policy(
             CacheTtlDecision::Skip(CacheSkipReason::IncompleteAnswer)
         }
         ResponseDisposition::Other => CacheTtlDecision::Skip(CacheSkipReason::NoTtl),
-    }
+    };
+    (decision, disposition)
 }
 
 #[inline]
 fn response_disposition_for_cache(response: &Message, key: &CacheKey) -> ResponseDisposition {
+    if let Some(question) = response.first_question() {
+        if question.name().normalized() != key.domain
+            || question.qtype() != key.record_type
+            || question.qclass() != key.dns_class
+        {
+            return ResponseDisposition::Other;
+        }
+        return classify_response(response, Some(question));
+    }
+
     let Some(question) = key.question() else {
         return ResponseDisposition::Other;
     };
@@ -1473,16 +1502,17 @@ fn response_disposition_for_cache(response: &Message, key: &CacheKey) -> Respons
 }
 
 #[inline]
-fn cache_skip_reason_for_response(response: &Message, key: &CacheKey) -> CacheSkipReason {
-    match response_disposition_for_cache(response, key) {
+fn cache_skip_reason_for_disposition(disposition: ResponseDisposition) -> CacheSkipReason {
+    match disposition {
         ResponseDisposition::IncompleteAlias => CacheSkipReason::IncompleteAnswer,
         _ => CacheSkipReason::NoTtl,
     }
 }
 
-fn is_cache_entry_response_valid(response: &Message, key: &CacheKey) -> bool {
+#[inline]
+fn is_cache_disposition_valid(disposition: ResponseDisposition) -> bool {
     matches!(
-        response_disposition_for_cache(response, key),
+        disposition,
         ResponseDisposition::CompletePositive | ResponseDisposition::DefinitiveNegative(_)
     )
 }
@@ -1513,13 +1543,11 @@ fn negative_ttl_from_soa_for_key(response: &Message, key: &CacheKey) -> Option<u
 fn clamp_persisted_cache_ttl(
     response: &Message,
     key: &CacheKey,
+    disposition: ResponseDisposition,
     ttl: u32,
     remaining_ttl_ms: u64,
 ) -> (u32, u64) {
-    if !matches!(
-        response_disposition_for_cache(response, key),
-        ResponseDisposition::DefinitiveNegative(_)
-    ) {
+    if !matches!(disposition, ResponseDisposition::DefinitiveNegative(_)) {
         return (ttl, remaining_ttl_ms);
     }
 
@@ -2761,7 +2789,14 @@ mod tests {
             RData::A(crate::proto::rdata::A(Ipv4Addr::new(1, 1, 1, 1))),
         ));
 
-        cache.update_cache_entry(cache.cache_map.get().unwrap(), key, response, 120);
+        let disposition = response_disposition_for_cache(&response, &key);
+        cache.update_cache_entry(
+            cache.cache_map.get().unwrap(),
+            key,
+            response,
+            120,
+            disposition,
+        );
 
         let lookup = cache
             .try_cache_hit(&mut context, cache.cache_map.get().unwrap())
@@ -2957,7 +2992,14 @@ mod tests {
         ));
 
         let key = Cache::build_cache_key(&mut context, false).unwrap();
-        cache.update_cache_entry(cache.cache_map.get().unwrap(), key.clone(), response, 120);
+        let disposition = response_disposition_for_cache(&response, &key);
+        cache.update_cache_entry(
+            cache.cache_map.get().unwrap(),
+            key.clone(),
+            response,
+            120,
+            disposition,
+        );
 
         let stored = cache
             .cache_map
