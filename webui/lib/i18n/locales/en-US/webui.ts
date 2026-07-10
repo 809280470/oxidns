@@ -693,7 +693,15 @@ export const enUSWebui = {
       "Some references cannot be removed safely. Use replacement or fix them manually in the editor.",
     pluginNameRequired: "Plugin name is required",
     pluginNameInvalid:
+      "Plugin name must be a path-safe plugin tag",
+    pluginNameTooLong: "Plugin name must be at most 64 ASCII characters",
+    pluginNameNonAscii: "Plugin name must contain ASCII characters only",
+    pluginNameInvalidCharacter:
       "Plugin name can only contain ASCII letters, digits, underscores (_), hyphens (-), and dots (.)",
+    pluginNameEmptySegment:
+      "Plugin name cannot start or end with a dot, or contain consecutive dots",
+    pluginNameInvalidSegmentBoundary:
+      "Each dot-separated plugin name segment must start and end with a letter or digit",
     pluginNameReserved:
       "Plugin names cannot start with qs.exec., qs.match., or qs.cron.",
     pluginNameUnchanged: "Plugin name is unchanged",

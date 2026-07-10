@@ -10,7 +10,25 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-06
 
 <div className="release-stack">
-   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24" defaultOpen>
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-10" defaultOpen>
+       **版本定位**
+
+       - Minor Release。插件 `tag` 正式收敛为管理 API 路径中的安全、可读机器标识，避免浏览器、反向代理和 HTTP 实现在处理特殊路径字符时产生歧义。
+
+       **主要变更**
+
+       - `fix(config)` / `fix(api)`：`plugins[].tag` 统一限制为 1 到 64 个 ASCII 字符；支持字母、数字、`_`、`-` 和点分段，拒绝空段、`.`、`..`、首尾连接符及路径特殊字符。API 仍保持 `/api/plugins/{tag}/...`。
+       - `fix(webui)`：创建、重命名和 YAML 编辑器会显示具体 tag 错误并定位到对应值；WebUI 增加 tag 规则测试。
+       - `test(ci)`：新增 Rust/API/WebUI tag 边界覆盖，WebUI CI 执行 lint、test、typecheck 和 build。
+
+       **配置与升级说明**
+
+       - 这是破坏性配置变更。升级前请使用新二进制运行 `oxidns check -c config.yaml`。
+       - 历史 tag 若包含空格、中文、斜杠、百分号、前后点、连续点或以 `_` / `-` 开头或结尾，必须重命名；同时更新 `$tag`、`jump/goto` 和所有插件引用。
+       - `qs.exec.`、`qs.match.`、`qs.cron.` 为 Quick Setup 保留前缀，用户配置不得使用。
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24">
        **版本定位**
 
        - Minor Release。v1.4.0 的核心是补齐复杂网络环境下的“出口控制、上游诊断和并发裁决”能力：新增 `network.outbound` 统一出口层，新增 `oxidns probe upstream` 上游诊断命令，增强 `forward` 多上游并发结果选择，并优化缓存、DoH 入站、WebUI 升级体验和查询记录读取性能。

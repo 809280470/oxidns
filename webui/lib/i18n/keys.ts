@@ -715,6 +715,12 @@ export const WEBUI = {
     unsafeReferences: "webui.storeErrors.unsafeReferences",
     pluginNameRequired: "webui.storeErrors.pluginNameRequired",
     pluginNameInvalid: "webui.storeErrors.pluginNameInvalid",
+    pluginNameTooLong: "webui.storeErrors.pluginNameTooLong",
+    pluginNameNonAscii: "webui.storeErrors.pluginNameNonAscii",
+    pluginNameInvalidCharacter: "webui.storeErrors.pluginNameInvalidCharacter",
+    pluginNameEmptySegment: "webui.storeErrors.pluginNameEmptySegment",
+    pluginNameInvalidSegmentBoundary:
+      "webui.storeErrors.pluginNameInvalidSegmentBoundary",
     pluginNameReserved: "webui.storeErrors.pluginNameReserved",
     pluginNameUnchanged: "webui.storeErrors.pluginNameUnchanged",
     pluginNameExists: "webui.storeErrors.pluginNameExists",

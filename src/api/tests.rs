@@ -116,6 +116,10 @@ fn http2_client() -> Client<HttpConnector, Empty<Bytes>> {
 fn test_build_plugin_route_path() {
     let route = build_plugin_route_path("cache_main", "/flush").expect("route should be built");
     assert_eq!(route, "/plugins/cache_main/flush");
+
+    let quick_setup_route =
+        build_plugin_route_path("qs.exec.seq.0.cache", "/flush").expect("system tag route");
+    assert_eq!(quick_setup_route, "/plugins/qs.exec.seq.0.cache/flush");
 }
 
 #[test]
@@ -126,12 +130,32 @@ fn test_build_plugin_route_path_without_subpath() {
 
 #[test]
 fn test_build_plugin_route_path_rejects_invalid_tag_segment() {
-    let err = build_plugin_route_path("Query Recorder 记录!*'()", "/records")
+    let err = build_plugin_route_path("cache..cn", "/records")
         .expect_err("invalid tag should be rejected");
     assert_eq!(
         err.to_string(),
-        "Plugin error: plugin tag 'Query Recorder 记录!*'()' is not valid for API route paths; only ASCII letters, digits, '_', '-', and '.' are allowed"
+        "Plugin error: plugin tag 'cache..cn' is not valid for API route paths: contains an empty dot-separated segment"
     );
+}
+
+#[test]
+fn test_build_plugin_route_path_rejects_dot_segments() {
+    for tag in [".", "..", ".cache", "cache."] {
+        assert!(
+            build_plugin_route_path(tag, "/records").is_err(),
+            "{tag} should be rejected before route registration"
+        );
+    }
+}
+
+#[test]
+fn test_plugin_registrar_does_not_trim_tag_before_validation() {
+    let addr = reserve_local_addr();
+    let hub = test_api_hub(addr, None);
+    let register = ApiRegister::new(hub);
+
+    assert!(register.plugin(" cache_main").is_err());
+    assert!(register.plugin("cache_main ").is_err());
 }
 
 #[test]

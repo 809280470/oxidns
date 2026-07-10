@@ -66,6 +66,19 @@ Debian 默认布局中，配置文件放在 `/etc/oxidns/config.yaml`，运行�
 
 尚未确定插件组合方式时，建议先阅读《[常见策略场景](scenarios.md)》，再回到本页查询字段含义。
 
+## 插件 tag 规则
+
+`plugins[].tag` 是插件实例的全局唯一机器标识，同时直接用于管理 API 路径：`/api/plugins/{tag}/...`。因此 tag 必须满足以下规则：
+
+- 长度为 1 到 64 个 ASCII 字符；
+- 仅可使用英文字母、数字、`_`、`-` 和 `.`；
+- `.` 只能分隔非空名称段，且每一段必须以字母或数字开头和结尾；
+- `qs.exec.`、`qs.match.`、`qs.cron.` 为 Quick Setup 保留前缀，不能在用户配置中使用。
+
+例如 `cache_main`、`cache.cn`、`prod.cache-01` 合法；`.`、`..`、`cache..cn`、`_cache`、`cache-`、`国内缓存` 和 `cache/main` 不合法。
+
+从旧版本升级时，请先使用新二进制执行 `oxidns check -c config.yaml`。如需修改历史 tag，必须同步更新所有 `$tag`、`jump/goto`、插件依赖和其他对该 tag 的引用；OxiDNS 不会自动重命名，以免静默改变请求处理逻辑。
+
 ## 环境变量替换
 
 OxiDNS 在启动、`oxidns check`、管理 API 配置校验和保存前校验时，先把 YAML **解析成数据结构**，再在字符串标量内部展开 `${VAR}` 占位符。`config.yaml` 文件本身不会被改写；WebUI 读取和保存配置时看到的仍然是原始占位符。
