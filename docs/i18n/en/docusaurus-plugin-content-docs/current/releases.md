@@ -7,10 +7,39 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 
 # Release Notes
 
+## 2026-07
+
+<div className="release-stack">
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-10" defaultOpen>
+       **Release Scope**
+
+       - Minor Release. v1.5.0 makes DNS response handling query-aware: `forward` and `cache` follow the original QNAME's CNAME chain before accepting a requested type, preventing incomplete alias responses from winning incorrectly or entering A/AAAA cache keys.
+       - The release also includes ARMv7 delivery support, OpenWrt LuCI lifecycle support, an Alpine Docker image, WebUI editor improvements, API path canonicalization, and safer plugin-tag validation.
+
+       **Changes**
+
+       - `fix(dns)`: add a shared response classifier for complete positives, definitive negatives, incomplete aliases, and other responses. Requested RRs must belong to the original QNAME or its CNAME-chain terminal instead of merely appearing somewhere in Answer.
+       - `fix(forward)`: `balanced`, `prefer_positive`, and `consensus` prefer complete CNAME-chain answers. Bare CNAME responses cannot win early or vote as negatives, but are preserved when no better response exists. `CNAME + SOA` is recognized as NODATA, and a selected-incomplete-alias metric is exported.
+       - `fix(cache)`: bare CNAME responses no longer populate A/AAAA and similar address-query keys. Admission and dump/load validate QNAME/QTYPE/QCLASS, while alias-NODATA lifetime is capped by the lowest SOA, Answer (including CNAME), and configured TTL. A new `incomplete_answer` cache skip reason is exported.
+       - `feat(release)`: add ARMv7 targets and normalize published target selection; switch Docker images to Alpine; add the full OpenWrt LuCI application lifecycle.
+       - `fix(config/api)`: unsafe or reserved quick-setup plugin tags are rejected. API plugin routes canonically URL-encode special characters to prevent path ambiguity.
+       - `fix(webui)`: migrate the YAML configuration editor to CodeMirror and improve editing behavior; keep frontend plugin-tag route handling aligned with backend encoding.
+       - `deps/ci`: update dependencies and GitHub Actions caching, including a nightly Clippy compatibility fix for proto chunks.
+
+       **Compatibility and Upgrade Notes**
+
+       - The root crate version is `1.5.0`; `oxidns-proto` is updated to `0.1.4`; the release tag should be `v1.5.0`.
+       - No required YAML fields are added. `forward.concurrent` still means the number of upstreams started for the current request: `concurrent: 1` does not retry unstarted upstreams. An incomplete CNAME response can still be returned when no better result exists, but is never cached as an address answer.
+       - **Compatibility note**: unsafe plugin tags and reserved quick-setup tags now fail configuration validation. Run `oxidns check` before upgrading and rename affected plugin tags if needed.
+       - Deployments using cache dumps can upgrade directly. Legacy CNAME-only address entries are discarded while loading or validating cache entries so they cannot continue serving incomplete address answers.
+       - Container and ARM deployments should validate the new Alpine or ARMv7 release artifacts before replacing a production binary.
+   </ReleaseCard>
+</div>
+
 ## 2026-06
 
 <div className="release-stack">
-   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24" defaultOpen>
+   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24">
        **Release Scope**
 
        - Minor Release. v1.4.0 focuses on egress control, upstream diagnostics, and concurrent upstream decision making for complex network environments. It introduces `network.outbound` as a unified egress layer, adds the `oxidns probe upstream` diagnostics command, extends `forward` with configurable concurrent response selection, and improves cache behavior, DoH serving, WebUI upgrade flow, and query recorder read performance.

@@ -12,6 +12,7 @@ use super::is_timeout_error;
 use super::metrics::ForwardMetrics;
 use super::selection::{ResponseSelectionMode, select_response};
 use crate::core::context::DnsContext;
+use crate::core::response::{ResponseDisposition, classify_response};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::upstream::Upstream;
 use crate::infra::observability::metrics::{register_metric_source, unregister_metric_source};
@@ -61,6 +62,11 @@ impl Executor for ConcurrentForwarder {
         let start_ms = self.metrics.record_query_start();
         let (response, last_error, timed_out) = self.query_upstreams(context.request.clone()).await;
         if let Some(response) = response {
+            if classify_response(&response, context.request.first_question())
+                == ResponseDisposition::IncompleteAlias
+            {
+                self.metrics.record_incomplete_alias_selected();
+            }
             context.set_response(response);
             self.metrics.record_success(start_ms);
             return Ok(self.completion_step());
@@ -95,7 +101,7 @@ impl ConcurrentForwarder {
             return (None, Some("no upstream configured".to_string()), false);
         }
 
-        let requested_qtype = request.first_qtype();
+        let question = request.first_question().cloned();
         let mut join_set = JoinSet::new();
         let start_idx = rand::rng().random_range(0..total_upstreams);
 
@@ -127,7 +133,7 @@ impl ConcurrentForwarder {
         select_response(
             &mut join_set,
             self.active_concurrent,
-            requested_qtype,
+            question,
             self.response_selection,
         )
         .await

@@ -23,6 +23,7 @@ use crate::infra::error::{DnsError, Result};
 use crate::infra::network::upstream::{ConnectionInfo, QueryDeadline, Upstream};
 use crate::plugin::executor::{ExecStep, Executor};
 use crate::plugin::{PluginFactory, UninitializedPlugin};
+use crate::proto::rdata::SOA;
 use crate::proto::{A, Message, Name, Question, RData, Rcode, Record, RecordType};
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +31,7 @@ enum MockAnswer {
     None,
     A,
     Cname,
+    CnameWithSoa,
 }
 
 #[derive(Debug)]
@@ -55,6 +57,12 @@ impl MockUpstream {
     fn ok_with_cname_answer(delay: Duration) -> Self {
         let mut upstream = Self::response(Rcode::NoError, delay);
         upstream.answer = MockAnswer::Cname;
+        upstream
+    }
+
+    fn ok_with_cname_nodata(delay: Duration) -> Self {
+        let mut upstream = Self::response(Rcode::NoError, delay);
+        upstream.answer = MockAnswer::CnameWithSoa;
         upstream
     }
 
@@ -107,6 +115,28 @@ impl Upstream for MockUpstream {
                     60,
                     RData::CNAME(crate::proto::CNAME(
                         Name::from_ascii("target.example.com.").unwrap(),
+                    )),
+                ));
+            }
+            MockAnswer::CnameWithSoa => {
+                response.add_answer(Record::from_rdata(
+                    Name::from_ascii("example.com.").unwrap(),
+                    60,
+                    RData::CNAME(crate::proto::CNAME(
+                        Name::from_ascii("target.example.com.").unwrap(),
+                    )),
+                ));
+                response.add_authority(Record::from_rdata(
+                    Name::from_ascii("example.com.").unwrap(),
+                    120,
+                    RData::SOA(SOA::new(
+                        Name::from_ascii("ns1.example.com.").unwrap(),
+                        Name::from_ascii("hostmaster.example.com.").unwrap(),
+                        1,
+                        3600,
+                        600,
+                        86400,
+                        30,
                     )),
                 ));
             }
@@ -360,6 +390,28 @@ async fn single_metrics_record_error_and_timeout() {
     assert_eq!(metrics.error_total.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.timeout_total.load(Ordering::Relaxed), 1);
     assert_eq!(metrics.latency_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn single_metrics_record_selected_incomplete_alias() {
+    let metrics = test_metrics();
+    let forwarder = SingleDnsForwarder {
+        tag: "forward-test".to_string(),
+        upstream: Box::new(MockUpstream::ok_with_cname_answer(Duration::ZERO)),
+        short_circuit: false,
+        metrics: metrics.clone(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(
+        metrics
+            .incomplete_alias_selected_total
+            .load(Ordering::Relaxed),
+        1
+    );
 }
 
 #[tokio::test]
@@ -706,4 +758,29 @@ async fn consensus_selection_keeps_cname_only_above_negative_fallback() {
     assert_eq!(response.rcode(), Rcode::NoError);
     assert!(response.has_answer_type(RecordType::CNAME));
     assert!(!response.has_answer_type(RecordType::A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn consensus_selection_counts_cname_with_soa_as_nodata() {
+    let forwarder = ConcurrentForwarder {
+        tag: "forward-test".to_string(),
+        active_concurrent: 2,
+        upstreams: vec![
+            Arc::new(MockUpstream::ok_with_cname_nodata(Duration::ZERO)),
+            Arc::new(MockUpstream::ok_with_cname_nodata(Duration::from_millis(
+                20,
+            ))),
+        ],
+        short_circuit: false,
+        response_selection: ResponseSelectionMode::Consensus,
+        metrics: test_metrics(),
+    };
+
+    let mut context = make_context();
+    let step = forwarder.execute(&mut context).await.unwrap();
+    let response = context.response().expect("response must exist");
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.has_answer_type(RecordType::CNAME));
+    assert!(!response.authorities().is_empty());
 }

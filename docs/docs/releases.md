@@ -7,10 +7,39 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 
 # 版本更新
 
+## 2026-07
+
+<div className="release-stack">
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-10" defaultOpen>
+       **版本定位**
+
+       - Minor Release。v1.5.0 完善 DNS 响应的 query-aware 语义：`forward` 与 `cache` 会沿原始 QNAME 的 CNAME 链识别最终请求类型，避免不完整别名响应错误胜出或被写入 A/AAAA 缓存。
+       - 同时汇集 ARMv7 发布支持、OpenWrt LuCI 生命周期支持、Alpine Docker 镜像、WebUI 编辑器体验、API 路径规范化和插件 tag 校验等稳定性与运维改进。
+
+       **主要变更**
+
+       - `fix(dns)`：新增共享响应分类器，区分完整正响应、确定负响应、incomplete alias 与其他异常响应；完整性校验确认目标 RR 位于原始 QNAME/CNAME 链尾，不再仅按 Answer 中是否出现相同 qtype 判断。
+       - `fix(forward)`：`balanced`、`prefer_positive`、`consensus` 会优先完整 CNAME 链答案；裸 CNAME 不会提前胜出或计入负响应共识，但没有更优结果时仍原样返回。`CNAME + SOA` 正确识别为 NODATA；新增 incomplete alias 选择指标。
+       - `fix(cache)`：裸 CNAME 不再写入 A/AAAA 等地址查询 key；缓存准入与 dump/load 会核对 QNAME/QTYPE/QCLASS；别名型 NODATA 的寿命不会超过 SOA、CNAME 等 Answer 和配置上限中的最小 TTL；并新增 `incomplete_answer` 缓存跳过指标。
+       - `feat(release)`：新增 ARMv7 目标支持并规范发布产物 target 选择；Docker 镜像迁移到 Alpine 基础镜像；OpenWrt LuCI 应用脚本支持完整生命周期。
+       - `fix(config/api)`：插件 tag 现在拒绝不安全或保留的 quick-setup 名称；API 插件路由对特殊字符进行规范 URL 编码，避免路径歧义。
+       - `fix(webui)`：配置 YAML 编辑器迁移到 CodeMirror 并完善编辑行为；前端插件 tag 路由与后端编码规则保持一致。
+       - `deps/ci`：更新依赖和 GitHub Actions 缓存配置，并修复 nightly 下 proto chunk 的 Clippy 兼容性。
+
+       **配置与升级说明**
+
+       - 根 crate 版本号升级为 `1.5.0`；`oxidns-proto` 升级为 `0.1.4`；release tag 应使用 `v1.5.0`。
+       - 不新增必填 YAML 字段。`forward.concurrent` 仍只表示本次启动的并发上游数量，`concurrent: 1` 不会隐式重试未启动上游；不完整 CNAME 响应在没有更好结果时仍会返回，但不会缓存为地址答案。
+       - **兼容性注意**：不安全的插件 tag 与保留 quick-setup tag 现在会被配置校验拒绝。升级前请先运行 `oxidns check`，必要时重命名相关 plugin tag。
+       - 使用缓存 dump 的部署可直接升级；旧的 CNAME-only 地址缓存条目会在加载或命中校验时被丢弃，以避免继续向客户端返回不完整地址答案。
+       - 使用容器镜像或 ARM 设备的部署，请按新的 Alpine/ARMv7 发布产物进行验证后再替换生产二进制。
+   </ReleaseCard>
+</div>
+
 ## 2026-06
 
 <div className="release-stack">
-   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24" defaultOpen>
+   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24">
        **版本定位**
 
        - Minor Release。v1.4.0 的核心是补齐复杂网络环境下的“出口控制、上游诊断和并发裁决”能力：新增 `network.outbound` 统一出口层，新增 `oxidns probe upstream` 上游诊断命令，增强 `forward` 多上游并发结果选择，并优化缓存、DoH 入站、WebUI 升级体验和查询记录读取性能。
