@@ -145,6 +145,11 @@ fn enabled_public_features() -> Vec<&'static str> {
     );
     push_feature(
         &mut features,
+        cfg!(feature = "plugin-response"),
+        "plugin-response",
+    );
+    push_feature(
+        &mut features,
         cfg!(feature = "plugin-upgrade"),
         "plugin-upgrade",
     );
@@ -204,5 +209,9 @@ mod tests {
                 .contains(&"sequence".into())
         );
         assert!(info.supported_plugins.matchers.contains(&"qname".into()));
+        assert_eq!(
+            info.enabled_features.contains(&"plugin-response"),
+            cfg!(feature = "plugin-response")
+        );
     }
 }

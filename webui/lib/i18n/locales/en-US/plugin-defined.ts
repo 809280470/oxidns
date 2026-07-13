@@ -710,6 +710,63 @@ export const enUSPluginDefined = {
         },
       },
     },
+    response: {
+      name: "Response",
+      description:
+        "Build and replace a complete DNS response with explicit record sections",
+      fields: {
+        rcode: {
+          label: "Response code",
+          description:
+            "Base DNS RCODE as a decimal number or case-insensitive mnemonic.",
+          placeholder: "NOERROR / NXDOMAIN / 3",
+        },
+        authoritative: {
+          label: "Authoritative answer (AA)",
+          description: "Set the DNS Authoritative Answer flag.",
+        },
+        authentic_data: {
+          label: "Authentic data (AD)",
+          description: "Set the DNS Authentic Data flag.",
+        },
+        answers: {
+          label: "Answer records",
+          description:
+            "One zone-style RR per item; {qname} and {qclass} refer to the first query name and class.",
+          placeholder: "{qname} 300 {qclass} A 192.0.2.10",
+        },
+        "answers[]": {
+          label: "Enter value",
+          placeholder: "{qname} 300 {qclass} A 192.0.2.10",
+        },
+        authorities: {
+          label: "Authority records",
+          description:
+            "One zone-style RR per item; configure SOA here for NODATA negative caching.",
+          placeholder:
+            "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300",
+        },
+        "authorities[]": {
+          label: "Enter value",
+          placeholder:
+            "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300",
+        },
+        additionals: {
+          label: "Additional records",
+          description: "One zone-style RR per item.",
+          placeholder: "mail.example.com. 300 IN A 192.0.2.25",
+        },
+        "additionals[]": {
+          label: "Enter value",
+          placeholder: "mail.example.com. 300 IN A 192.0.2.25",
+        },
+        short_circuit: {
+          label: "Stop after generating response",
+          description:
+            "Stops the current executor chain by default; disable to continue with later rules.",
+        },
+      },
+    },
     redirect: {
       name: "Redirect",
       description:

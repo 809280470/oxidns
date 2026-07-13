@@ -140,6 +140,22 @@ export const zhCNDocs = {
     short_circuit:
       "- 类型：`bool`；必填：否；默认值：`false`\n- 作用：命中并生成本地响应后，是否立即停止后续 executor 链。\n- 说明：默认只设置 response 并继续执行；显式开启时返回 `Stop`。",
   },
+  response: {
+    rcode:
+      "- 类型：`string` 或 `number`；必填：否；默认值：`NOERROR`\n- 作用：设置基础 DNS RCODE，仅支持 `0..15`。",
+    answers:
+      "- 类型：`array`；必填：否；默认值：空数组\n- 每项必须是一条 zone 风格 RR：`<owner> <ttl> <class> <type> <rdata>`。",
+    authorities:
+      "- 类型：`array`；必填：否；默认值：空数组\n- 每项必须是一条 zone 风格 RR；SOA 应放在此区段以表达 NODATA 负缓存。",
+    additionals:
+      "- 类型：`array`；必填：否；默认值：空数组\n- 每项必须是一条 zone 风格 RR。",
+    authoritative:
+      "- 类型：`bool`；必填：否；默认值：`false`\n- 作用：设置 AA 标志。",
+    authentic_data:
+      "- 类型：`bool`；必填：否；默认值：`false`\n- 作用：设置 AD 标志。",
+    short_circuit:
+      "- 类型：`bool`；必填：否；默认值：`true`\n- 作用：设置响应后是否停止当前 executor 链。",
+  },
   redirect: {
     rules:
       "- 类型：`array`；必填：否；默认值：空数组\n- 作用：定义内联重定向规则。\n- 规则格式：\n  - `<域名规则> <目标域名>`\n- `<域名规则>` 支持：\n  - `full:`\n  - `domain:`\n  - `keyword:`\n  - `regexp:`\n  - 无前缀域名（按 `full:` 精确匹配处理）\n- 使用说明：`redirect` 本身不解析目标域名，通常需要在 `sequence` 中放在 `forward` 之前使用，由 `forward` 生成目标域名的真实响应。",

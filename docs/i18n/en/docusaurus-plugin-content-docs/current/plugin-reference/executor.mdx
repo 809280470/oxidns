@@ -805,6 +805,79 @@ Injects arbitrary DNS records from zone-style rule strings.
 
 ---
 
+## `response`
+
+### Purpose
+
+Unconditionally builds and replaces the current DNS response. Use an outer `sequence` matcher to decide when it runs; the plugin is suited to fixed answers, SOA-backed NODATA, and responses that need explicit Answer, Authority, and Additional sections.
+
+### Example Configuration
+
+```yaml
+- tag: suppress_https
+  type: response
+  args:
+    rcode: NOERROR
+    # Invoke from a sequence rule matched on qtype HTTPS/SVCB.
+    answers: []
+    authorities:
+      - "{qname} 300 {qclass} SOA fake-ns.oxidns.fake.root. fake-mbox.oxidns.fake.root. 2021110400 1800 900 604800 300"
+    additionals: []
+    short_circuit: true
+```
+
+An answer with a related additional record:
+
+```yaml
+args:
+  rcode: NOERROR
+  answers:
+    - "{qname} 60 {qclass} CNAME target.example.com."
+  additionals:
+    - "target.example.com. 60 IN A 192.0.2.10"
+  authoritative: true
+```
+
+### Configuration Details
+
+#### `rcode`
+
+- Type: `string` or `number`; Required: no; Default: `NOERROR`
+- Accepts base DNS RCODEs `0..15` and case-insensitive mnemonic names such as `NXDOMAIN`.
+- Extended RCODEs that require EDNS are not supported.
+
+#### `answers` / `authorities` / `additionals`
+
+- Type: `array`; Required: no; Default: empty array
+- Every item must parse to exactly one zone-style RR in the form `<owner> <ttl> <class> <type> <rdata>`.
+- `{qname}` is valid only as the owner and resolves to the first request question name. `{qclass}` is valid only as the class and resolves to that question class.
+- Put SOA records in `authorities`. The SOA TTL and its RDATA minimum together determine negative-cache lifetime.
+
+#### `authoritative` / `authentic_data`
+
+- Type: `bool`; Required: no; Default: `false`
+- Control the AA and AD response flags. The server handles RA, while RD/CD and the Question section are inherited from the request.
+
+#### `short_circuit`
+
+- Type: `bool`; Required: no; Default: `true`
+- Stops the current executor chain after setting the response. Set it to `false` to continue.
+
+### Behavior
+
+- Every execution creates a fresh response from the request and replaces any existing response; records are neither qtype-filtered nor merged.
+- Records are parsed at startup. The request path only clones records and resolves placeholders.
+- A request with no Question fails only when a dynamic placeholder is used.
+- No quick setup or file loading is provided. Use `arbitrary` for static records matched by `qname + qtype + qclass`.
+
+### Typical Uses
+
+- Return SOA-backed NODATA for selected qtypes.
+- Return policy-controlled fixed A, AAAA, TXT, CNAME, or MX answers.
+- Build local test responses containing Answer, Authority, and Additional records.
+
+---
+
 ## `redirect`
 
 ### Purpose

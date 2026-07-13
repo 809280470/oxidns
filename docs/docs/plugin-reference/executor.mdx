@@ -869,6 +869,79 @@ import Admonition from "@theme/Admonition";
 
 ---
 
+## `response`
+
+### 作用
+
+无条件构造并覆盖当前 DNS 响应。它适合策略性返回固定答案、带 SOA 的 NODATA、或需要同时控制 Answer、Authority 和 Additional 的响应；调用条件由外层 `sequence` 的 matcher 决定。
+
+### 配置示例
+
+```yaml
+- tag: suppress_https
+  type: response
+  args:
+    rcode: NOERROR
+    # HTTPS/SVCB 查询可由 sequence 的 qtype matcher 调用此插件
+    answers: []
+    authorities:
+      - "{qname} 300 {qclass} SOA fake-ns.oxidns.fake.root. fake-mbox.oxidns.fake.root. 2021110400 1800 900 604800 300"
+    additionals: []
+    short_circuit: true
+```
+
+带 Answer 和 Additional 的例子：
+
+```yaml
+args:
+  rcode: NOERROR
+  answers:
+    - "{qname} 60 {qclass} CNAME target.example.com."
+  additionals:
+    - "target.example.com. 60 IN A 192.0.2.10"
+  authoritative: true
+```
+
+### 配置项
+
+#### `rcode`
+
+- 类型：`string` 或 `number`；必填：否；默认值：`NOERROR`
+- 支持十进制基础 RCODE `0..15` 和大小写不敏感的助记名，例如 `NXDOMAIN`。
+- 不支持需要 EDNS 表达的扩展 RCODE。
+
+#### `answers` / `authorities` / `additionals`
+
+- 类型：`array`；必填：否；默认值：空数组
+- 每项必须恰好是一条 zone 风格资源记录，格式为 `<owner> <ttl> <class> <type> <rdata>`。
+- `{qname}` 只能作为 owner，替换为首个 request question 的名称；`{qclass}` 只能作为 class，替换为该 question 的类别。
+- SOA 应放在 `authorities`。SOA TTL 和 RDATA 中的 minimum 共同决定负缓存时间。
+
+#### `authoritative` / `authentic_data`
+
+- 类型：`bool`；必填：否；默认值：`false`
+- 分别控制 AA 和 AD 响应标志。RA 由 server 统一处理，RD/CD 和 Question 从 request 继承。
+
+#### `short_circuit`
+
+- 类型：`bool`；必填：否；默认值：`true`
+- 为 `true` 时设置响应后停止当前 executor 链；关闭后继续执行后续规则。
+
+### 行为说明
+
+- 每次执行都会从当前 request 构建新响应，覆盖已有 response，不会按 qtype 筛选或合并已有记录。
+- 配置中的记录在启动时解析；请求路径只克隆记录并解析占位符。
+- 没有 Question 的请求若使用 `{qname}` 或 `{qclass}` 会失败。
+- 不提供 quick setup 或文件加载；按 `qname + qtype + qclass` 加载静态记录的场景应使用 `arbitrary`。
+
+### 典型用途
+
+- 为选定 qtype 返回带 SOA 的 NODATA。
+- 策略性返回固定 A、AAAA、TXT、CNAME 或 MX 响应。
+- 构造含 Answer、Authority 和 Additional 的本地测试响应。
+
+---
+
 ## `redirect`
 
 ### 作用

@@ -167,6 +167,7 @@ standard = [
     "provider-protobuf",
     "provider-adguard-rule",
     "plugin-arbitrary",
+    "plugin-response",
     "plugin-cron",
     "plugin-dynamic-domain",
     "plugin-ip-selector",
@@ -273,6 +274,9 @@ plugin-script = []
 
 # `arbitrary` executor (zone-style static DNS records).
 plugin-arbitrary = ["dep:zoneparser"]
+
+# `response` executor (explicit DNS response templates).
+plugin-response = ["dep:zoneparser"]
 
 # Self-upgrade CLI sub-command + `upgrade` executor (archive download &
 # verify, then replace the binary). Needs the HTTP client to fetch
