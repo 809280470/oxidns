@@ -206,18 +206,26 @@ Sends DNS queries to upstreams.
 - Type: `string`; Required: no; Default: `balanced`
 - Values: `fastest`, `balanced`, `prefer_positive`, `consensus`
 - Purpose: Selects the winning response when concurrent upstreams return different results.
+- Scope: applies only when `upstreams` contains more than one target. A single configured upstream uses the single-upstream forwarder and bypasses response selection. With multiple upstreams and `concurrent: 1`, each request still starts only one randomly selected upstream; selection does not query additional upstreams.
+- Except in `fastest` mode, every response is classified against the original Question as:
+  - **Complete positive**: the requested type exists at the original QNAME or its CNAME-chain terminal.
+  - **Incomplete alias**: a CNAME chain exists, but neither the final requested type nor an SOA denial is present.
+  - **Definitive negative**: `NXDOMAIN`, or NODATA that establishes the requested type is absent.
+  - **Other**: for example `SERVFAIL`, `REFUSED`, a mismatched Question, unrelated Answers, a CNAME loop, or conflicting aliases.
+- If all started upstreams finish without an early winner, the common fallback order is `complete positive > incomplete alias > definitive negative > other`; the later completion wins among equal-ranked responses. Transport errors do not participate in this ranking and fail `forward` only when no upstream produced a DNS response.
 - Modes:
-  - `fastest`: the first successful DNS response wins; transport errors never win.
-  - `balanced`: default mode. A complete answer whose requested type belongs to the original QNAME or its CNAME-chain terminal wins immediately; `NXDOMAIN` or NODATA waits briefly for a positive answer.
-  - `prefer_positive`: positive answers win immediately; negative answers wait until all started concurrent upstreams finish.
-  - `consensus`: positive answers win immediately; negative answers require two upstream confirmations, falling back to `prefer_positive` when fan-out is too small.
+  - `fastest`: the first successfully returned DNS Message wins immediately, without query-aware classification. “Successful” means only that the upstream returned a DNS Message, so `NXDOMAIN`, `SERVFAIL`, `REFUSED`, or CNAME-only can win; transport errors cannot.
+  - `balanced`: default mode. A complete positive wins immediately. The first definitive negative starts a fixed 100ms grace window that still allows a complete positive to win. When the window expires, or all upstreams finish, the common fallback order is used. Incomplete aliases and other responses do not start the grace window by themselves.
+  - `prefer_positive`: a complete positive wins immediately. Otherwise, OxiDNS waits for every started upstream and then uses the common fallback order. Consequently, an incomplete alias outranks a single negative when no complete positive exists.
+  - `consensus`: one complete positive still wins immediately. `NXDOMAIN` and NODATA are counted separately; two negatives of the same kind can confirm and return a negative early, without requiring identical SOA data or identical wire messages. Fan-out below two falls back to `prefer_positive`. If every upstream finishes without negative consensus, the common fallback order still returns the best available response and may therefore return a single negative. This is a negative-confidence policy, not strict majority voting across all responses.
 
 #### CNAME response handling
 
 - For A/AAAA and other non-CNAME queries, a positive response requires the requested type at the original QNAME or the terminal name of its CNAME chain.
 - A CNAME-only response without the requested type or an SOA is an incomplete alias. It cannot win early or vote as a negative result, but is returned unchanged when no better response exists.
 - `CNAME + SOA` without the requested type is treated as NODATA. `NXDOMAIN` remains negative even when its answer section contains CNAME records.
-- `forward` does not perform hidden fallback or CNAME chasing. Raise `concurrent` for explicit racing, or compose a `fallback` policy when that behavior is required.
+- `forward` does not perform hidden fallback or CNAME chasing. Raise `concurrent` when more upstreams must participate in the race.
+- The `fallback` executor checks only whether a branch produced a response; it does not understand response dispositions. An incomplete alias or a `SERVFAIL` Message therefore counts as a successful branch result. To make those outcomes explicitly trigger another upstream, compose a sequence with matchers such as `has_wanted_ans` or `rcode` instead of relying on hidden fallback.
 
 #### `upstreams`
 
@@ -233,7 +241,7 @@ Sends DNS queries to upstreams.
 - Purpose: Stop the executor chain after a successful upstream response.
 - Notes:
   - When disabled, `forward` still populates `response`, but later executors can continue processing it.
-  - When enabled, a successful upstream result immediately ends the remaining executor chain.
+  - When enabled, any DNS Message selected as the best available result ends the remaining executor chain, including an incomplete alias, `SERVFAIL`, or `REFUSED`.
 
 #### `upstreams[].addr`
 

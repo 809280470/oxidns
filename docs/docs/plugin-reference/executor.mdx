@@ -215,18 +215,26 @@ import Admonition from "@theme/Admonition";
 - 类型：`string`；必填：否；默认值：`balanced`
 - 取值：`fastest`、`balanced`、`prefer_positive`、`consensus`
 - 作用：定义多上游并发返回不一致时的结果选择策略。
+- 生效范围：仅用于 `upstreams` 多于一个的竞争式查询。只有一个上游时直接使用单上游转发器，不执行 response selection；多上游配置使用 `concurrent: 1` 时，每次也只随机启动其中一个上游，不会为了 selection 再查询其他上游。
+- 除 `fastest` 外，响应会按原始 Question 分类为：
+  - **完整正响应（complete positive）**：请求类型位于原始 QNAME 或其 CNAME 链终点。
+  - **不完整别名（incomplete alias）**：存在 CNAME 链，但没有最终请求类型，也没有 SOA 否定证明。
+  - **确定负响应（definitive negative）**：`NXDOMAIN`，或者确认请求类型不存在的 NODATA。
+  - **其他响应（other）**：例如 `SERVFAIL`、`REFUSED`、Question 不匹配、无关 Answer、CNAME 环或冲突。
+- 当策略等待到所有已启动上游结束、且没有触发提前返回时，统一按 `完整正响应 > 不完整别名 > 确定负响应 > 其他响应` 选择；同等级响应以后完成者为准。传输错误不参与响应排名，只有所有上游均未产生 DNS 响应时才导致 `forward` 失败。
 - 模式说明：
-  - `fastest`：第一个成功返回的 DNS 响应胜出，传输错误不会胜出。
-  - `balanced`：默认模式。包含请求类型且位于原始 QNAME/CNAME 链尾的完整答案立即胜出；`NXDOMAIN` 或 NODATA 会短暂等待是否有正向答案。
-  - `prefer_positive`：正向答案立即胜出；负向答案等待已发起的并发上游全部结束后再返回。
-  - `consensus`：正向答案立即胜出；负向答案需要两个上游确认，若并发数不足则退化为 `prefer_positive`。
+  - `fastest`：第一个成功返回的 DNS Message 立即胜出，不执行 query-aware 分类。这里的“成功”只表示上游返回了 DNS Message，因此 `NXDOMAIN`、`SERVFAIL`、`REFUSED` 或 CNAME-only 都可能胜出；传输错误不会胜出。
+  - `balanced`：默认模式。完整正响应立即胜出。第一个确定负响应会启动固定 100ms 的 grace window，窗口内仍等待完整正响应；窗口到期或全部上游完成后按上述统一排名选择。不完整别名和其他响应本身不会启动 grace window。
+  - `prefer_positive`：完整正响应立即胜出；否则等待所有已启动上游完成，再按统一排名选择。因此在没有完整正响应时，不完整别名会优先于单个负响应。
+  - `consensus`：完整正响应仍由一票立即胜出。`NXDOMAIN` 与 NODATA 分开计票，两个同类负响应可提前确认并返回对应负响应；不要求两个负响应的 SOA 或完整报文完全相同。若并发数小于 2，则退化为 `prefer_positive`。如果所有上游结束仍没有负共识，则按统一排名返回最佳可用响应，此时仍可能返回单个负响应；因此该模式是“负向谨慎”，不是严格的全响应多数决。
 
 #### CNAME 响应处理
 
 - 对 A/AAAA 等非 CNAME 查询，只有最终请求类型位于原始 QNAME 的 CNAME 链尾时，才视为完整正向答案。
 - 仅含 CNAME、且没有最终请求类型和 SOA 的响应属于 incomplete alias：不会提前胜出、不会计入负响应共识，但当没有更好结果时仍会原样返回。
 - `CNAME + SOA` 且没有最终请求类型会识别为 NODATA；`NXDOMAIN` 即使带有 CNAME 也仍是负响应。
-- `forward` 不执行隐藏式 fallback 或 CNAME chase；需要更多上游竞争时请显式提高 `concurrent`，或在策略中配置 `fallback`。
+- `forward` 不执行隐藏式 fallback 或 CNAME chase；需要更多上游竞争时请显式提高 `concurrent`。
+- `fallback` executor 只判断分支是否产生了 response，不理解 response disposition；incomplete alias 或 `SERVFAIL` Message 也会被视为成功响应。若希望这些结果显式触发另一个上游，应使用 `has_wanted_ans`、`rcode` 等 matcher 组合 sequence，而不是依赖隐藏式 fallback。
 
 #### `upstreams`
 
@@ -242,7 +250,7 @@ import Admonition from "@theme/Admonition";
 - 作用：控制在拿到成功上游响应后，是否立即停止后续 executor 链。
 - 说明：
   - 关闭时，`forward` 仍会写入 `response`，但后续 executor 还能继续处理这份响应。
-  - 开启时，成功返回后会直接结束后续 executor 链。
+  - 开启时，只要 selection 选出了 DNS Message 就会直接结束后续 executor 链；这也包括作为最佳可用结果返回的 incomplete alias、`SERVFAIL` 或 `REFUSED`。
 
 #### `upstreams[].addr`
 
