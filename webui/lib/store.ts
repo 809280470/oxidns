@@ -56,7 +56,11 @@ import {
   type ConfigSnapshot,
 } from "./config-history";
 import { WEBUI, tClient } from "./i18n";
-import { isReservedPluginTag, isValidPluginTag } from "./plugin-tags";
+import {
+  isReservedPluginTag,
+  pluginTagValidationMessageKey,
+  validatePluginTag,
+} from "./plugin-tags";
 import {
   createProcessInstanceBaseline,
   hasProcessIdentityBaseline,
@@ -775,10 +779,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         message: tClient(WEBUI.storeErrors.pluginNameRequired),
       };
     }
-    if (!isValidPluginTag(nextName)) {
+    const tagValidationError = validatePluginTag(nextName);
+    if (tagValidationError) {
       return {
         status: "invalid",
-        message: tClient(WEBUI.storeErrors.pluginNameInvalid),
+        message: tClient(pluginTagValidationMessageKey(tagValidationError)),
       };
     }
     if (isReservedPluginTag(nextName)) {

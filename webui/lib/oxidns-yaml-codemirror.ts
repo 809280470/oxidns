@@ -44,6 +44,10 @@ import {
 import type { PluginInstance, PluginType } from "@/lib/types";
 import { DEFAULT_LOCALE, WEBUI, t as translate, type Locale } from "@/lib/i18n";
 import { pluginTypeLabel } from "@/lib/i18n/plugin-defined";
+import {
+  pluginTagValidationMessageKey,
+  validatePluginTag,
+} from "@/lib/plugin-tags";
 
 export type OxiDnsYamlEditorVariant =
   | "config"
@@ -728,6 +732,35 @@ function buildLocalDiagnostics(
       }
     }
 
+    if (context.variant === "config") {
+      const path = getYamlPath(state, lineNumber);
+      const tagMatch = checkText.match(
+        /^(\s*)(?:-\s*)?tag\s*:\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/,
+      );
+      const tag = tagMatch?.[2] ?? tagMatch?.[3] ?? tagMatch?.[4];
+      if (
+        tag &&
+        path[0] === "plugins" &&
+        path[path.length - 1] === "tag" &&
+        !path.includes("args")
+      ) {
+        const validationError = validatePluginTag(tag);
+        if (validationError) {
+          const start = line.from + (tagMatch?.[0].lastIndexOf(tag) ?? 0);
+          diagnostics.push({
+            severity: "error",
+            message: translate(
+              locale,
+              pluginTagValidationMessageKey(validationError),
+            ),
+            from: start,
+            to: start + tag.length,
+            source: "OxiDNS",
+          });
+        }
+      }
+    }
+
     const jumpGotoMatch = checkText.match(/\b(jump|goto)\s+([A-Za-z0-9_.-]+)/);
     if (jumpGotoMatch) {
       const tag = jumpGotoMatch[2];
@@ -761,12 +794,20 @@ function diagnosticFromBackend(
       ? Math.min(diagnostic.line, state.doc.lines)
       : 1;
   const line = state.doc.line(lineNumber);
+  const from = Math.min(
+    line.to,
+    line.from + Math.max(0, (diagnostic.column ?? 1) - 1),
+  );
+  const to = Math.max(
+    Math.min(line.to, line.from + Math.max(0, (diagnostic.end_column ?? 2) - 1)),
+    Math.min(line.to, from + 1),
+  );
   return [
     {
       severity: diagnosticSeverity(diagnostic.severity),
       message,
-      from: line.from,
-      to: Math.max(line.from + 1, line.to),
+      from,
+      to,
       source: "OxiDNS",
     },
   ];

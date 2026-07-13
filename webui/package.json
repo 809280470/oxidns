@@ -9,7 +9,8 @@
     "format": "prettier --write \"**/*.{ts,tsx}\"",
     "lint": "eslint",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",
@@ -52,6 +53,7 @@
     "prettier": "^3.8.3",
     "prettier-plugin-tailwindcss": "^0.7.4",
     "tailwindcss": "^4.2.4",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }

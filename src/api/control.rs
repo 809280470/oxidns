@@ -826,6 +826,42 @@ plugins:
     }
 
     #[tokio::test]
+    async fn config_validate_reports_invalid_plugin_tag_at_its_value() {
+        let validate = ConfigValidateHandler;
+        let response = validate
+            .handle(test_request(
+                Method::POST,
+                "/config/validate",
+                Bytes::from_static(
+                    b"
+plugins:
+  - tag: cache..cn
+    type: cache
+",
+                ),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should collect")
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
+        assert!(
+            value["diagnostic_details"][0]["message"]
+                .as_str()
+                .expect("diagnostic message")
+                .contains("Invalid plugin tag 'cache..cn'")
+        );
+        assert_eq!(value["diagnostic_details"][0]["line"], 3);
+        assert_eq!(value["diagnostic_details"][0]["column"], 10);
+        assert_eq!(value["diagnostic_details"][0]["end_column"], 19);
+    }
+
+    #[tokio::test]
     async fn config_get_and_save_handlers_round_trip_file_content() {
         AppClock::start();
         let temp = NamedTempFile::new().expect("temp file");

@@ -10,7 +10,25 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-06
 
 <div className="release-stack">
-   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24" defaultOpen>
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-10" defaultOpen>
+       **Release Scope**
+
+       - Minor Release. Plugin `tag` is now a safe, readable machine identifier in management API paths, removing ambiguity caused by special path characters across browsers, reverse proxies, and HTTP implementations.
+
+       **Changes**
+
+       - `fix(config)` / `fix(api)`: constrain `plugins[].tag` to 1 through 64 ASCII characters; allow letters, digits, `_`, `-`, and dot-separated segments; reject empty segments, `.`, `..`, boundary separators, and path-special characters. The API remains `/api/plugins/{tag}/...`.
+       - `fix(webui)`: plugin creation, rename, and the YAML editor report precise tag errors and locate the affected value; the WebUI gains tag-rule tests.
+       - `test(ci)`: add Rust/API/WebUI boundary coverage and run WebUI lint, test, typecheck, and build in CI.
+
+       **Compatibility and Upgrade Notes**
+
+       - This is a breaking configuration change. Before upgrading, run `oxidns check -c config.yaml` with the new binary.
+       - Historical tags containing whitespace, non-ASCII text, slashes, percent signs, leading/trailing dots, consecutive dots, or leading/trailing `_` / `-` must be renamed. Update every `$tag`, `jump/goto`, and plugin reference at the same time.
+       - `qs.exec.`, `qs.match.`, and `qs.cron.` are reserved Quick Setup prefixes and cannot be used in user configuration.
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24">
        **Release Scope**
 
        - Minor Release. v1.4.0 focuses on egress control, upstream diagnostics, and concurrent upstream decision making for complex network environments. It introduces `network.outbound` as a unified egress layer, adds the `oxidns probe upstream` diagnostics command, extends `forward` with configurable concurrent response selection, and improves cache behavior, DoH serving, WebUI upgrade flow, and query recorder read performance.
