@@ -222,14 +222,30 @@ pub enum PluginTagValidationError {
     InvalidSegmentBoundary(String),
 }
 
-/// Validate a plugin tag used as a configuration identifier and API path
-/// segment.
+/// Validate a user-configured plugin tag.
+///
+/// The length limit is a product-level constraint for stable configuration
+/// identifiers. Runtime-generated quick-setup tags may be longer and should
+/// use [`validate_plugin_tag_path_segment`] when registering API routes.
 pub fn validate_plugin_tag(tag: &str) -> Result<(), PluginTagValidationError> {
     if tag.is_empty() {
         return Err(PluginTagValidationError::Empty);
     }
     if tag.len() > MAX_PLUGIN_TAG_LENGTH {
         return Err(PluginTagValidationError::TooLong);
+    }
+
+    validate_plugin_tag_path_segment(tag)
+}
+
+/// Validate only the syntax required for a safe, readable API path segment.
+///
+/// This intentionally does not apply [`MAX_PLUGIN_TAG_LENGTH`], because
+/// deterministic `qs.*` runtime tags include their validated parent tag plus
+/// quick-setup metadata and can therefore exceed the user-configured limit.
+pub(crate) fn validate_plugin_tag_path_segment(tag: &str) -> Result<(), PluginTagValidationError> {
+    if tag.is_empty() {
+        return Err(PluginTagValidationError::Empty);
     }
     if !tag.is_ascii() {
         return Err(PluginTagValidationError::NonAscii);

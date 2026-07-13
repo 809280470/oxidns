@@ -16,7 +16,7 @@ use crate::api::route::{PrefixRoute, RouteKey, build_plugin_route_path, normaliz
 use crate::api::server::{ApiServerContext, build_tls_acceptor, run_api_server};
 #[cfg(feature = "webui")]
 use crate::api::static_files::StaticFileServer;
-use crate::config::types::{ApiConfig, ResolvedApiHttpConfig, validate_plugin_tag};
+use crate::config::types::{ApiConfig, ResolvedApiHttpConfig, validate_plugin_tag_path_segment};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::network::listen::parse_listen_addr;
 
@@ -475,7 +475,7 @@ impl ApiHub {
 }
 
 fn normalize_plugin_tag(plugin_tag: &str) -> Result<String> {
-    if let Err(reason) = validate_plugin_tag(plugin_tag) {
+    if let Err(reason) = validate_plugin_tag_path_segment(plugin_tag) {
         return Err(DnsError::plugin(format!(
             "api route plugin tag '{}' is invalid: {}",
             plugin_tag, reason
