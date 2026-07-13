@@ -2318,6 +2318,65 @@ export const enUSPluginDefined = {
         paramPlaceholder: "0.1",
       },
     },
+    time: {
+      name: "Time",
+      description: "Match by timezone, time window, weekday, and day of month",
+      fields: {
+        timezone: {
+          label: "Timezone",
+          description:
+            "Leave empty to use the system timezone, or enter a valid IANA timezone to make policy evaluation explicit.",
+          placeholder: "Asia/Shanghai",
+        },
+        periods: {
+          label: "Time windows",
+          description:
+            "Any matching window returns true; time, weekday, and day-of-month conditions in one window must all match.",
+          placeholder:
+            '[{"start":"09:00","end":"18:00","weekdays":["mon","tue","wed","thu","fri"]}]',
+        },
+        "periods[]": {
+          label: "Time window",
+        },
+        "periods[].start": {
+          label: "Start time",
+          description: "Use HH:MM and set it together with the end time.",
+          placeholder: "09:00",
+        },
+        "periods[].end": {
+          label: "End time",
+          description: "Use HH:MM; an earlier value than start crosses midnight.",
+          placeholder: "18:00",
+        },
+        "periods[].weekdays": {
+          label: "Weekdays",
+          description: "Leave empty to allow every weekday.",
+          placeholder: "mon\ntue\nwed\nthu\nfri",
+        },
+        "periods[].weekdays[]": {
+          options: {
+            mon: "Monday",
+            tue: "Tuesday",
+            wed: "Wednesday",
+            thu: "Thursday",
+            fri: "Friday",
+            sat: "Saturday",
+            sun: "Sunday",
+          },
+        },
+        "periods[].monthdays": {
+          label: "Days of month",
+          description: "Enter values from 1 to 31; leave empty to allow every day.",
+          placeholder: "1\n15",
+        },
+        "periods[].monthdays[]": {
+          placeholder: "1",
+        },
+      },
+      quickSetup: {
+        paramPlaceholder: "09:00-18:00",
+      },
+    },
     rate_limiter: {
       name: "Rate Limiter",
       description: "Token bucket current limit based on client IP",

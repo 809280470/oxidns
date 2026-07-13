@@ -294,6 +294,85 @@ export const matcherPluginDefinitions: PluginKindDefinition[] = [
     },
   },
   {
+    kind: "time",
+    type: "matcher",
+    name: "Time",
+    description: "按时区、时间段、星期和每月日期匹配",
+    icon: "Clock",
+    configSchema: [
+      {
+        key: "timezone",
+        label: "时区",
+        type: "text",
+        placeholder: "Asia/Shanghai",
+        description: "留空时使用系统时区；填写有效 IANA 时区可固定策略判断时区。",
+      },
+      {
+        key: "periods",
+        label: "时间周期",
+        type: "array",
+        required: true,
+        placeholder:
+          '[{"start":"09:00","end":"18:00","weekdays":["mon","tue","wed","thu","fri"]}]',
+        description: "任一周期命中即返回 true；同一周期内的时间、星期和月日条件需要同时满足。",
+        item: {
+          type: "object",
+          label: "时间周期",
+          summaryFields: ["start", "end", "weekdays", "monthdays"],
+          fields: [
+            {
+              key: "start",
+              label: "开始时间",
+              type: "text",
+              placeholder: "09:00",
+              description: "使用 HH:MM；与结束时间同时填写。",
+            },
+            {
+              key: "end",
+              label: "结束时间",
+              type: "text",
+              placeholder: "18:00",
+              description: "使用 HH:MM；早于开始时间时表示跨午夜。",
+            },
+            {
+              key: "weekdays",
+              label: "星期",
+              type: "array",
+              placeholder: "mon\ntue\nwed\nthu\nfri",
+              description: "留空则不限制星期。",
+              item: {
+                type: "select",
+                options: [
+                  { label: "周一", value: "mon" },
+                  { label: "周二", value: "tue" },
+                  { label: "周三", value: "wed" },
+                  { label: "周四", value: "thu" },
+                  { label: "周五", value: "fri" },
+                  { label: "周六", value: "sat" },
+                  { label: "周日", value: "sun" },
+                ],
+              },
+            },
+            {
+              key: "monthdays",
+              label: "每月日期",
+              type: "array",
+              placeholder: "1\n15",
+              description: "填写 1 到 31；留空则不限制每月日期。",
+              item: {
+                type: "number",
+                placeholder: "1",
+              },
+            },
+          ],
+        },
+      },
+    ],
+    quickSetup: {
+      paramPlaceholder: "09:00-18:00",
+    },
+  },
+  {
     kind: "rate_limiter",
     type: "matcher",
     name: "Rate Limiter",

@@ -297,6 +297,7 @@ export const pluginKinds: Record<string, string[]> = {
     "mark",
     "env",
     "random",
+    "time",
     "rate_limiter",
     "string_exp",
     "_true",
