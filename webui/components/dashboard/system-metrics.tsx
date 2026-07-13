@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { Activity, HardDrive, HeartPulse, Puzzle } from "lucide-react";
+import { Activity, Cpu, HardDrive, HeartPulse, Puzzle } from "lucide-react";
 import { useAppStore } from "@/lib/store";
 import { WEBUI } from "@/lib/i18n";
 import type { TranslationParams } from "@/lib/i18n";
@@ -141,6 +141,7 @@ export function SystemMetrics() {
 
   const serverCount = health?.plugins.servers;
   const pluginTotal = health?.plugins.total ?? plugins.length;
+  const showCpuFallback = trafficMetrics.status === "unavailable";
 
   return (
     <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
@@ -191,19 +192,47 @@ export function SystemMetrics() {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
           <CardTitle className="text-sm font-medium">
-            {t(WEBUI.dashboard.dnsQps)}
+            {t(
+              showCpuFallback
+                ? WEBUI.dashboard.cpuUsage
+                : WEBUI.dashboard.dnsQps,
+            )}
           </CardTitle>
-          <Activity className="h-4 w-4 text-muted-foreground" />
+          {showCpuFallback ? (
+            <Cpu className="h-4 w-4 text-muted-foreground" />
+          ) : (
+            <Activity className="h-4 w-4 text-muted-foreground" />
+          )}
         </CardHeader>
-        <CardContent className="space-y-2">
-          <div>
-            <div className="text-2xl font-bold font-mono">
-              {formatQps(trafficMetrics.qps, formatNumber)}
+        {showCpuFallback ? (
+          <CardContent className="space-y-2">
+            <div>
+              <div
+                className={cn(
+                  "text-2xl font-bold font-mono",
+                  usageColor(cpuPct),
+                )}
+              >
+                {system ? formatCpu(cpuPct, formatNumber) : "-"}
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {t(WEBUI.dashboard.cpuUsageDesc)}
+              </p>
             </div>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {trafficMetrics.status === "unavailable"
-                ? t(WEBUI.dashboard.trafficMetricsUnavailable)
-                : trafficMetrics.sampleWindowSeconds === null
+            <Progress
+              value={cpuPct}
+              className="h-1.5"
+              indicatorClassName={usageBarColor(cpuPct)}
+            />
+          </CardContent>
+        ) : (
+          <CardContent className="space-y-2">
+            <div>
+              <div className="text-2xl font-bold font-mono">
+                {formatQps(trafficMetrics.qps, formatNumber)}
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {trafficMetrics.sampleWindowSeconds === null
                   ? t(WEBUI.dashboard.waitingData)
                   : t(WEBUI.dashboard.qpsWindow, {
                       seconds: formatNumber(
@@ -213,26 +242,27 @@ export function SystemMetrics() {
                         },
                       ),
                     })}
-            </p>
-          </div>
-          <div className="border-t border-border/50 pt-2 flex items-center gap-3 text-xs text-muted-foreground">
-            <span className={cn(usageColor(cpuPct))}>
-              {t(WEBUI.dashboard.processCpu, {
-                value: system ? formatCpu(cpuPct, formatNumber) : "-",
-              })}
-            </span>
-            {trafficMetrics.status === "available" && (
-              <span>
-                {t(WEBUI.dashboard.requestTotal, {
-                  value: formatRequestTotal(
-                    trafficMetrics.requestTotal,
-                    formatNumber,
-                  ),
+              </p>
+            </div>
+            <div className="border-t border-border/50 pt-2 flex items-center gap-3 text-xs text-muted-foreground">
+              <span className={cn(usageColor(cpuPct))}>
+                {t(WEBUI.dashboard.processCpu, {
+                  value: system ? formatCpu(cpuPct, formatNumber) : "-",
                 })}
               </span>
-            )}
-          </div>
-        </CardContent>
+              {trafficMetrics.status === "available" && (
+                <span>
+                  {t(WEBUI.dashboard.requestTotal, {
+                    value: formatRequestTotal(
+                      trafficMetrics.requestTotal,
+                      formatNumber,
+                    ),
+                  })}
+                </span>
+              )}
+            </div>
+          </CardContent>
+        )}
       </Card>
 
       <Card>
