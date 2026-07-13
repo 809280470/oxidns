@@ -38,6 +38,8 @@ const COMMENT_FIELD_DOMAIN: &str = "dm";
 const COMMENT_FIELD_EXP: &str = "exp";
 const COMMENT_FIELD_SEEN: &str = "seen";
 const COMMENT_FIELD_KIND: &str = "kind";
+const COMMENT_KIND_DYNAMIC: &str = "dynamic";
+const COMMENT_KIND_PERSISTENT: &str = "persistent";
 const COMMENT_KIND_GATEWAY_CHECK: &str = "gateway-check";
 const MAX_COMMENT_REFRESH_INTERVAL_SECS: u64 = 300;
 
@@ -211,9 +213,33 @@ pub(super) struct RouteEntry {
 pub(super) struct RouteCommentMeta {
     pub(super) family: RouteFamily,
     pub(super) ip: IpAddr,
+    pub(super) kind: RouteCommentKind,
     pub(super) comment_domain: String,
     pub(super) expires_at_unix: u64,
     pub(super) last_refresh_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum RouteCommentKind {
+    Dynamic,
+    Persistent,
+}
+
+impl RouteCommentKind {
+    fn for_route(route: &RouteEntry) -> Self {
+        if route.domains.contains(PERSISTENT_ANCHOR_DOMAIN) {
+            Self::Persistent
+        } else {
+            Self::Dynamic
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dynamic => COMMENT_KIND_DYNAMIC,
+            Self::Persistent => COMMENT_KIND_PERSISTENT,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -230,6 +256,10 @@ impl RouteCommentCodec {
         out.push_str(COMMENT_FIELD_PLUGIN);
         out.push('=');
         out.push_str(plugin_tag);
+        out.push(';');
+        out.push_str(COMMENT_FIELD_KIND);
+        out.push('=');
+        out.push_str(RouteCommentKind::for_route(route).as_str());
         out.push(';');
         out.push_str(COMMENT_FIELD_DOMAIN);
         out.push('=');
@@ -277,6 +307,21 @@ impl RouteCommentCodec {
             return Ok(None);
         }
 
+        let kind = match kv.get(COMMENT_FIELD_KIND).map(String::as_str) {
+            Some(COMMENT_KIND_DYNAMIC) => RouteCommentKind::Dynamic,
+            Some(COMMENT_KIND_PERSISTENT) => RouteCommentKind::Persistent,
+            Some(value) => {
+                return Err(DnsError::plugin(format!(
+                    "ros_route comment decode failed: unsupported kind '{value}'"
+                )));
+            }
+            None => {
+                return Err(DnsError::plugin(
+                    "ros_route comment decode failed: missing kind field",
+                ));
+            }
+        };
+
         let (ip, _prefix) = parse_dst_address(dst_address).ok_or_else(|| {
             DnsError::plugin(format!(
                 "ros_route comment decode failed: invalid dst-address '{dst_address}'"
@@ -314,6 +359,7 @@ impl RouteCommentCodec {
         Ok(Some(RouteCommentMeta {
             family,
             ip,
+            kind,
             comment_domain,
             expires_at_unix,
             last_refresh_unix,
@@ -1081,6 +1127,7 @@ impl RouteManager {
 
         let preserve_recovered_route = entry.recovered_ownership_incomplete
             && entry.ref_count == 1
+            && entry.expires_at_unix != u64::MAX
             && entry.expires_at_unix > now;
         entry.domain_expiries.remove(domain);
         entry.ref_count = entry.ref_count.saturating_sub(1);
@@ -1400,6 +1447,7 @@ impl RouteManager {
                 continue;
             }
             seen_keys.insert(key.clone());
+            let persistent_residue = meta.kind == RouteCommentKind::Persistent;
 
             if let Some(existing) = self.routes.get_mut(&key) {
                 existing.router_id = Some(route.id.clone());
@@ -1414,11 +1462,14 @@ impl RouteManager {
                     existing.comment_domain = meta.comment_domain.clone();
                     existing.expires_at_unix = meta.expires_at_unix;
                     existing.last_refresh_unix = meta.last_refresh_unix;
-                    existing.sync_state = if meta.expires_at_unix <= now {
+                    existing.sync_state = if meta.expires_at_unix <= now || persistent_residue {
                         SyncState::PendingDelete
                     } else {
                         SyncState::Synced
                     };
+                    if matches!(existing.sync_state, SyncState::PendingDelete) {
+                        continue;
+                    }
                     let gateway_drift = route.gateway.as_deref() != Some(existing.gateway.as_str());
                     let distance_drift = route.distance != Some(existing.distance);
                     let expected_comment = RouteCommentCodec::encode(
@@ -1454,7 +1505,6 @@ impl RouteManager {
                 continue;
             };
             let expired = meta.expires_at_unix <= now;
-            let persistent_residue = meta.comment_domain == PERSISTENT_COMMENT_DOMAIN;
             let recover_dynamic_binding = !expired
                 && !persistent_residue
                 && !meta.comment_domain.is_empty()
@@ -1543,14 +1593,20 @@ impl RouteManager {
         domain: String,
         scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
+        wait_for_sync: bool,
     ) -> Result<()> {
         let now = unix_now();
         let touched = self.apply_observation(domain, scope, addrs, now);
         // Keep observations while background initialization is retrying. The
         // first successful reconcile will synchronize all still-live routes.
+        // Synchronous mode must attempt that initialization before acknowledging
+        // the observation so its result reflects the RouterOS write outcome.
         if !self.initialized {
             self.prune_expired_local_state(now);
-            return Ok(());
+            if !wait_for_sync {
+                return Ok(());
+            }
+            self.ensure_initialized().await?;
         }
         self.sync_route_keys(touched, now).await
     }
@@ -1689,7 +1745,10 @@ async fn run_manager_worker(
                 addrs,
                 wait,
             } => {
-                let result = manager.observe_domain(domain, scope, addrs).await;
+                let wait_for_sync = wait.is_some();
+                let result = manager
+                    .observe_domain(domain, scope, addrs, wait_for_sync)
+                    .await;
                 match (wait, result) {
                     (Some(ch), outcome) => {
                         let _ = ch.send(outcome);
@@ -1986,6 +2045,7 @@ mod tests {
         )
         .expect("decode comment")
         .expect("owned comment");
+        assert_eq!(decoded.kind, RouteCommentKind::Dynamic);
         assert_eq!(decoded.comment_domain, domain);
     }
 
@@ -2156,6 +2216,43 @@ mod tests {
         assert_eq!(manager.persistent_ips, desired);
     }
 
+    #[tokio::test]
+    async fn synchronous_observation_retries_failed_initialization() {
+        let domain = "sync.example.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21));
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            fail_healthcheck: true,
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+        let observed = || {
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }]
+        };
+
+        assert!(
+            manager
+                .observe_domain(domain.clone(), ObservationScope::Ipv4, observed(), true)
+                .await
+                .is_err()
+        );
+        assert!(!manager.initialized);
+
+        api.state.lock().expect("mock lock").fail_healthcheck = false;
+        manager
+            .observe_domain(domain, ObservationScope::Ipv4, observed(), true)
+            .await
+            .expect("synchronous retry should initialize and sync");
+
+        assert!(manager.initialized);
+        assert_eq!(
+            api.state.lock().expect("mock lock").upsert_attempts,
+            vec![ip]
+        );
+    }
+
     #[test]
     fn removing_persistent_anchor_preserves_dynamic_route_ownership() {
         let domain = "example.com.".to_string();
@@ -2217,6 +2314,8 @@ mod tests {
         assert!(route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
         assert_eq!(route.expires_at_unix, PERSISTENT_EXPIRES_AT_UNIX);
         assert_ne!(route.sync_state, SyncState::PendingDelete);
+        let comment = RouteCommentCodec::encode("fdns", "route-test", route);
+        assert!(comment.contains(";kind=persistent;"));
     }
 
     #[tokio::test]
@@ -2251,7 +2350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_recovers_timeless_domain_binding_conservatively() {
+    async fn recovered_timeless_domain_binding_can_be_withdrawn() {
         AppClock::start();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 13));
         let api = Arc::new(MockApi::with_state(MockApiState {
@@ -2263,29 +2362,69 @@ mod tests {
                 gateway: Some("192.0.2.1".to_string()),
                 distance: Some(100),
                 comment: Some(format!(
-                    "fdns;pg=route-test;dm=example.com.;exp={};seen=100",
+                    "fdns;pg=route-test;kind=dynamic;dm=example.com.;exp={};seen=100",
                     u64::MAX
                 )),
             }],
             ..MockApiState::default()
         }));
-        let mut manager = RouteManager::new(api, manager_config(Some(0)));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));
 
-        manager.reconcile_from_router().await.expect("reconcile");
+        manager
+            .ensure_initialized()
+            .await
+            .expect("initialize manager");
         assert!(manager.domain_bindings.contains_key("example.com."));
-        manager.apply_observation(
-            "example.com.".to_string(),
-            ObservationScope::Ipv4,
-            Vec::new(),
-            101,
-        );
+        manager
+            .observe_domain(
+                "example.com.".to_string(),
+                ObservationScope::Ipv4,
+                Vec::new(),
+                true,
+            )
+            .await
+            .expect("withdraw recovered timeless route");
         let key = RouteKey::new(ip, "via_proxy".to_string());
+        assert!(!manager.routes.contains_key(&key));
         assert_eq!(
-            manager.routes.get(&key).map(|route| route.sync_state),
-            Some(SyncState::Synced)
+            api.state.lock().expect("mock lock").deleted_ids,
+            vec!["*13".to_string()]
         );
-        assert_eq!(manager.routes[&key].ref_count, 0);
-        assert_eq!(manager.routes[&key].expires_at_unix, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn dynamic_domain_named_persistent_is_not_treated_as_route_residue() {
+        AppClock::start();
+        let now = unix_now();
+        let expires_at = now + 300;
+        let domain = PERSISTENT_COMMENT_DOMAIN;
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*dynamic-persistent".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: format!("{ip}/32"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(format!(
+                    "fdns;pg=route-test;kind=dynamic;dm={domain};exp={expires_at};seen={now}"
+                )),
+            }],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager
+            .reconcile_from_router()
+            .await
+            .expect("recover dynamic route");
+
+        assert!(manager.domain_bindings.contains_key(domain));
+        assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
+        assert_eq!(manager.routes[&key].ref_count, 1);
+        assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
     }
 
     #[tokio::test]
@@ -2304,7 +2443,7 @@ mod tests {
                 gateway: Some("192.0.2.1".to_string()),
                 distance: Some(100),
                 comment: Some(format!(
-                    "fdns;pg=route-test;dm=first.example.;exp={expires_at};seen={now}"
+                    "fdns;pg=route-test;kind=dynamic;dm=first.example.;exp={expires_at};seen={now}"
                 )),
             }],
             ..MockApiState::default()
@@ -2431,7 +2570,7 @@ mod tests {
                 gateway: Some("2001:db8::1".to_string()),
                 distance: Some(100),
                 comment: Some(format!(
-                    "fdns;pg=route-test;dm=example.com.;exp={};seen=100",
+                    "fdns;pg=route-test;kind=dynamic;dm=example.com.;exp={};seen=100",
                     u64::MAX
                 )),
             }],
