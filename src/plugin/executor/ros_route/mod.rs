@@ -274,7 +274,25 @@ struct RosRouteMetrics {
 #[derive(Debug)]
 struct ActiveRouteInstance {
     instance_id: u64,
+    namespace: RouteOwnershipNamespace,
     metrics: Arc<RosRouteMetrics>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct RouteOwnershipNamespace {
+    address: String,
+    routing_table: String,
+    comment_prefix: String,
+}
+
+impl RouteOwnershipNamespace {
+    fn from_config(config: &MikrotikConfig) -> Self {
+        Self {
+            address: config.address.clone(),
+            routing_table: config.routing_table.clone(),
+            comment_prefix: config.comment_prefix.clone(),
+        }
+    }
 }
 
 static NEXT_ROUTE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -287,6 +305,7 @@ fn active_route_instances() -> &'static Mutex<AHashMap<String, Vec<ActiveRouteIn
 fn register_active_route_instance(
     tag: &str,
     instance_id: u64,
+    namespace: RouteOwnershipNamespace,
     metrics: Arc<RosRouteMetrics>,
 ) -> Result<()> {
     register_metric_source(metrics.clone())?;
@@ -298,19 +317,23 @@ fn register_active_route_instance(
         .or_default()
         .push(ActiveRouteInstance {
             instance_id,
+            namespace,
             metrics,
         });
     Ok(())
 }
 
-/// Unregister one runtime and return whether it is the last instance for tag.
+/// Unregister one runtime and return whether its ownership namespace may be
+/// cleaned up.
 ///
 /// Candidate runtimes are initialized before the previous runtime is
 /// destroyed. Tracking all active instances prevents the old runtime from
-/// cleaning RouterOS state that the replacement owns. It also restores the
+/// cleaning RouterOS state that a compatible replacement owns. A replacement
+/// using a different RouterOS address, routing table, or comment prefix does
+/// not suppress cleanup of the old namespace. The stack also restores the
 /// previous metric source when candidate initialization later rolls back.
 fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
-    let (is_last, metric_replacement, remove_metric) = {
+    let (cleanup_allowed, metric_replacement, remove_metric) = {
         let mut active = active_route_instances()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -324,8 +347,11 @@ fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
             return false;
         };
         let was_metric_owner = index + 1 == instances.len();
-        instances.remove(index);
+        let removed = instances.remove(index);
         let is_last = instances.is_empty();
+        let cleanup_allowed = !instances
+            .iter()
+            .any(|instance| instance.namespace == removed.namespace);
         let metric_replacement = was_metric_owner
             .then(|| instances.last().map(|instance| instance.metrics.clone()))
             .flatten();
@@ -333,7 +359,7 @@ fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
         if is_last {
             active.remove(tag);
         }
-        (is_last, metric_replacement, remove_metric)
+        (cleanup_allowed, metric_replacement, remove_metric)
     };
 
     if let Some(metrics) = metric_replacement {
@@ -341,7 +367,7 @@ fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
     } else if remove_metric {
         unregister_metric_source(tag);
     }
-    is_last
+    cleanup_allowed
 }
 
 impl RosRouteMetrics {
@@ -421,7 +447,12 @@ impl Plugin for MikrotikExecutor {
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = Some(runtime);
         }
-        register_active_route_instance(&self.tag, self.instance_id, self.metrics.clone())?;
+        register_active_route_instance(
+            &self.tag,
+            self.instance_id,
+            RouteOwnershipNamespace::from_config(&self.config),
+            self.metrics.clone(),
+        )?;
         self.active_registered.store(true, Ordering::Release);
         Ok(())
     }
@@ -621,7 +652,6 @@ fn extract_observation(
     let scope = match question.qtype() {
         RecordType::A => ObservationScope::Ipv4,
         RecordType::AAAA => ObservationScope::Ipv6,
-        RecordType::ANY => ObservationScope::Both,
         _ => return None,
     };
 
@@ -1070,6 +1100,8 @@ routing_table: "policy"
         let config = observation_config();
         let mut txt_context = context_with_nodata(RecordType::TXT);
         assert!(extract_observation(&mut txt_context, &config).is_none());
+        let mut any_context = context_with_nodata(RecordType::ANY);
+        assert!(extract_observation(&mut any_context, &config).is_none());
 
         let mut a_context = context_with_nodata(RecordType::A);
         let (_, scope, addrs) =
@@ -1092,13 +1124,19 @@ routing_table: "policy"
     }
 
     #[test]
-    fn same_tag_runtime_replacement_only_allows_last_instance_cleanup() {
-        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(4, Ordering::Relaxed);
+    fn same_tag_runtime_coordinates_cleanup_by_ownership_namespace() {
+        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(6, Ordering::Relaxed);
+        let namespace = RouteOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            routing_table: "policy".to_string(),
+            comment_prefix: "fdns".to_string(),
+        };
         let success_tag = format!("route-reload-success-{sequence}");
         let old_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
         let new_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
-        register_active_route_instance(&success_tag, sequence, old_metrics).expect("old runtime");
-        register_active_route_instance(&success_tag, sequence + 1, new_metrics)
+        register_active_route_instance(&success_tag, sequence, namespace.clone(), old_metrics)
+            .expect("old runtime");
+        register_active_route_instance(&success_tag, sequence + 1, namespace.clone(), new_metrics)
             .expect("replacement runtime");
         assert!(!release_active_route_instance(&success_tag, sequence));
         assert!(release_active_route_instance(&success_tag, sequence + 1));
@@ -1106,11 +1144,39 @@ routing_table: "policy"
         let rollback_tag = format!("route-reload-rollback-{sequence}");
         let old_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
         let candidate_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
-        register_active_route_instance(&rollback_tag, sequence + 2, old_metrics)
+        register_active_route_instance(&rollback_tag, sequence + 2, namespace.clone(), old_metrics)
             .expect("old runtime");
-        register_active_route_instance(&rollback_tag, sequence + 3, candidate_metrics)
+        register_active_route_instance(&rollback_tag, sequence + 3, namespace, candidate_metrics)
             .expect("candidate runtime");
         assert!(!release_active_route_instance(&rollback_tag, sequence + 3));
         assert!(release_active_route_instance(&rollback_tag, sequence + 2));
+
+        let migration_tag = format!("route-reload-migration-{sequence}");
+        let old_namespace = RouteOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            routing_table: "old-policy".to_string(),
+            comment_prefix: "old-fdns".to_string(),
+        };
+        let new_namespace = RouteOwnershipNamespace {
+            address: "192.0.2.11:8728".to_string(),
+            routing_table: "new-policy".to_string(),
+            comment_prefix: "new-fdns".to_string(),
+        };
+        register_active_route_instance(
+            &migration_tag,
+            sequence + 4,
+            old_namespace,
+            Arc::new(RosRouteMetrics::new(migration_tag.clone())),
+        )
+        .expect("old namespace");
+        register_active_route_instance(
+            &migration_tag,
+            sequence + 5,
+            new_namespace,
+            Arc::new(RosRouteMetrics::new(migration_tag.clone())),
+        )
+        .expect("new namespace");
+        assert!(release_active_route_instance(&migration_tag, sequence + 4));
+        assert!(release_active_route_instance(&migration_tag, sequence + 5));
     }
 }

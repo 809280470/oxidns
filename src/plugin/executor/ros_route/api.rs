@@ -310,28 +310,27 @@ impl MikrotikRsClient {
         Ok(None)
     }
 
-    async fn has_foreign_route(
+    async fn inspect_exact_routes(
         &self,
         key: &RouteKey,
         comment_prefix: &str,
         plugin_tag: &str,
-    ) -> Result<bool> {
+    ) -> Result<ExactRouteOwnership> {
         let print = CommandBuilder::new()
             .command(route_command(key.family(), RouteOp::Print))
             .query_equal(ROUTE_TABLE_FIELD, &key.table)
             .query_equal(ROUTE_DST_FIELD, &key.dst_address())
             .build();
+        let mut routes = Vec::new();
         for row in self.send_rows("find exact routes", print).await? {
             let mut route =
                 parse_router_route_from_reply("find exact route parse", key.family(), &row)?;
             if route.routing_table.is_empty() {
                 route.routing_table = key.table.clone();
             }
-            if !route_owned_by_plugin(&route, comment_prefix, plugin_tag) {
-                return Ok(true);
-            }
+            routes.push(route);
         }
-        Ok(false)
+        Ok(classify_exact_routes(routes, comment_prefix, plugin_tag))
     }
 
     async fn list_routes_for_family(
@@ -455,6 +454,28 @@ fn route_owned_by_plugin(route: &RouterRoute, comment_prefix: &str, plugin_tag: 
     comment_field(comment, COMMENT_FIELD_PLUGIN) == Some(plugin_tag)
 }
 
+#[derive(Debug, Default)]
+struct ExactRouteOwnership {
+    owned: Option<RouterRoute>,
+    has_foreign: bool,
+}
+
+fn classify_exact_routes(
+    routes: impl IntoIterator<Item = RouterRoute>,
+    comment_prefix: &str,
+    plugin_tag: &str,
+) -> ExactRouteOwnership {
+    let mut inspection = ExactRouteOwnership::default();
+    for route in routes {
+        if route_owned_by_plugin(&route, comment_prefix, plugin_tag) {
+            inspection.owned.get_or_insert(route);
+        } else {
+            inspection.has_foreign = true;
+        }
+    }
+    inspection
+}
+
 #[async_trait]
 impl MikrotikApi for MikrotikRsClient {
     async fn list_managed_routes(
@@ -494,22 +515,10 @@ impl MikrotikApi for MikrotikRsClient {
         comment_prefix: &str,
         plugin_tag: &str,
     ) -> Result<Option<RouterRoute>> {
-        let print = CommandBuilder::new()
-            .command(route_command(key.family(), RouteOp::Print))
-            .query_equal(ROUTE_TABLE_FIELD, &key.table)
-            .query_equal(ROUTE_DST_FIELD, &key.dst_address())
-            .build();
-        let rows = self.send_rows("find route", print).await?;
-        for row in rows {
-            let mut route = parse_router_route_from_reply("find route parse", key.family(), &row)?;
-            if route.routing_table.is_empty() {
-                route.routing_table = key.table.clone();
-            }
-            if route_owned_by_plugin(&route, comment_prefix, plugin_tag) {
-                return Ok(Some(route));
-            }
-        }
-        Ok(None)
+        Ok(self
+            .inspect_exact_routes(key, comment_prefix, plugin_tag)
+            .await?
+            .owned)
     }
 
     async fn upsert_host_route(
@@ -522,10 +531,20 @@ impl MikrotikApi for MikrotikRsClient {
         plugin_tag: &str,
     ) -> Result<String> {
         // Upsert strategy:
-        // 1) find existing by key
-        // 2) update only changed fields (gateway/distance/comment)
-        // 3) otherwise add and then resolve id by re-query
-        if let Some(existing) = self.find_route(key, comment_prefix, plugin_tag).await? {
+        // 1) inspect every exact-prefix row for owned and foreign routes
+        // 2) reject any foreign duplicate before refreshing an owned row
+        // 3) update only changed fields, or add when no row exists
+        let inspection = self
+            .inspect_exact_routes(key, comment_prefix, plugin_tag)
+            .await?;
+        if inspection.has_foreign {
+            return Err(DnsError::plugin(format!(
+                "ros_route conflicts with a foreign route for {} in table '{}'",
+                key.dst_address(),
+                key.table
+            )));
+        }
+        if let Some(existing) = inspection.owned {
             let gateway_changed = existing.gateway.as_deref() != Some(gateway);
             let distance_changed = existing.distance != Some(distance);
             let comment_changed = existing.comment.as_deref() != Some(comment);
@@ -549,19 +568,6 @@ impl MikrotikApi for MikrotikRsClient {
                     .await?;
             }
             return Ok(existing.id);
-        }
-
-        // Do not add a second route beside a foreign same-prefix route: RouterOS
-        // can turn that into ECMP, which is unsafe for a side-effect plugin.
-        if self
-            .has_foreign_route(key, comment_prefix, plugin_tag)
-            .await?
-        {
-            return Err(DnsError::plugin(format!(
-                "ros_route conflicts with a foreign route for {} in table '{}'",
-                key.dst_address(),
-                key.table
-            )));
         }
 
         let distance_str = distance.to_string();
@@ -669,4 +675,39 @@ fn is_not_found_error(err: &DnsError) -> bool {
     lower.contains("no such item")
         || lower.contains("not found")
         || lower.contains("does not exist")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(id: &str, comment: Option<&str>) -> RouterRoute {
+        RouterRoute {
+            id: id.to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: "203.0.113.20/32".to_string(),
+            routing_table: "policy".to_string(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: comment.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn exact_route_inspection_reports_owned_and_foreign_duplicates() {
+        let inspection = classify_exact_routes(
+            [
+                route("*owned", Some("fdns;pg=route-test;dm=example.com")),
+                route("*foreign", Some("operator-managed")),
+            ],
+            "fdns",
+            "route-test",
+        );
+
+        assert_eq!(
+            inspection.owned.as_ref().map(|route| route.id.as_str()),
+            Some("*owned")
+        );
+        assert!(inspection.has_foreign);
+    }
 }

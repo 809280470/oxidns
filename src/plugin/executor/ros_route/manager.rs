@@ -358,7 +358,6 @@ pub(super) struct ObservedAddr {
 pub(super) enum ObservationScope {
     Ipv4,
     Ipv6,
-    Both,
 }
 
 impl ObservationScope {
@@ -366,7 +365,7 @@ impl ObservationScope {
     pub(super) fn contains(self, ip: IpAddr) -> bool {
         matches!(
             (self, ip),
-            (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_)) | (Self::Both, _)
+            (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_))
         )
     }
 }
