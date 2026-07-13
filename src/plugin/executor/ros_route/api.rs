@@ -575,15 +575,39 @@ impl MikrotikApi for MikrotikRsClient {
             .build();
         let _ = self.send_rows("validate route config", add).await?;
 
-        let route = self
-            .find_route_by_exact_comment(key, comment)
-            .await?
-            .ok_or_else(|| {
-                DnsError::plugin(
-                    "ros_route validate route config succeeded but temporary route id not found",
-                )
-            })?;
-        self.delete_route_by_id(&route.id, route.family).await?;
+        let validation_result = async {
+            let route = self
+                .find_route_by_exact_comment(key, comment)
+                .await?
+                .ok_or_else(|| {
+                    DnsError::plugin(
+                        "ros_route validate route config succeeded but temporary route id not found",
+                    )
+                })?;
+            self.delete_route_by_id(&route.id, route.family).await
+        }
+        .await;
+
+        if let Err(validation_error) = validation_result {
+            // The add may have reached RouterOS even when the follow-up query or
+            // delete failed. Retry cleanup on a fresh connection before returning
+            // the validation error; reconciliation also recognizes this comment
+            // kind and removes any residue left by a prolonged outage.
+            let cleanup_result = async {
+                if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
+                    self.delete_route_by_id(&route.id, route.family).await?;
+                }
+                Result::<()>::Ok(())
+            }
+            .await;
+            return match cleanup_result {
+                Ok(()) => Err(validation_error),
+                Err(cleanup_error) => Err(DnsError::plugin(format!(
+                    "{validation_error}; temporary validation-route cleanup also failed: {cleanup_error}"
+                ))),
+            };
+        }
+
         Ok(())
     }
 
