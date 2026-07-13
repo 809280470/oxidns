@@ -658,10 +658,10 @@ fn extract_observation(
     let response = context.response()?;
     match response.rcode() {
         Rcode::NoError => {}
-        // NXDOMAIN is authoritative for the queried name and therefore
-        // withdraws the observed address family. This is essential when
+        // NXDOMAIN is authoritative for the name, not only the queried record
+        // type, so withdraw both address families. This is essential when
         // fixed_ttl=0 because no time-based cleanup will happen later.
-        Rcode::NXDomain => return Some((domain, scope, Vec::new())),
+        Rcode::NXDomain => return Some((domain, ObservationScope::Both, Vec::new())),
         _ => return None,
     }
 
@@ -1111,7 +1111,7 @@ routing_table: "policy"
     }
 
     #[test]
-    fn nxdomain_withdraws_only_the_queried_address_family() {
+    fn nxdomain_withdraws_both_address_families() {
         let config = observation_config();
         let mut context = context_with_rcode(RecordType::AAAA, Rcode::NXDomain);
 
@@ -1119,7 +1119,7 @@ routing_table: "policy"
             extract_observation(&mut context, &config).expect("AAAA NXDOMAIN observation");
 
         assert_eq!(domain, "example.com");
-        assert_eq!(scope, ObservationScope::Ipv6);
+        assert_eq!(scope, ObservationScope::Both);
         assert!(addrs.is_empty());
     }
 

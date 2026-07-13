@@ -459,10 +459,11 @@ pub(super) struct ObservedAddr {
     pub(super) ttl_secs: u32,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) enum ObservationScope {
     Ipv4,
     Ipv6,
+    Both,
 }
 
 impl ObservationScope {
@@ -470,9 +471,24 @@ impl ObservationScope {
     pub(super) fn contains(self, ip: IpAddr) -> bool {
         matches!(
             (self, ip),
-            (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_))
+            (Self::Ipv4 | Self::Both, IpAddr::V4(_)) | (Self::Ipv6 | Self::Both, IpAddr::V6(_))
         )
     }
+
+    #[inline]
+    fn family_scopes(self) -> &'static [Self] {
+        match self {
+            Self::Ipv4 => &[Self::Ipv4],
+            Self::Ipv6 => &[Self::Ipv6],
+            Self::Both => &[Self::Ipv4, Self::Ipv6],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingObservation {
+    addrs: Vec<ObservedAddr>,
+    observed_at_unix: u64,
 }
 
 #[derive(Debug)]
@@ -701,6 +717,7 @@ pub(super) struct RouteManager {
     persistent_ips: AHashSet<String>,
     pub(super) domain_bindings: AHashMap<String, DomainBinding>,
     pub(super) routes: AHashMap<RouteKey, RouteEntry>,
+    pending_observations: AHashMap<(String, ObservationScope), PendingObservation>,
     initialized: bool,
 }
 
@@ -712,6 +729,7 @@ impl RouteManager {
             cfg,
             domain_bindings: AHashMap::new(),
             routes: AHashMap::new(),
+            pending_observations: AHashMap::new(),
             initialized: false,
         }
     }
@@ -721,9 +739,8 @@ impl RouteManager {
             return Ok(());
         }
 
-        // Observations are accepted while RouterOS is unavailable. Prune their
-        // local TTL state before every initialization attempt so stale answers
-        // are never replayed when connectivity returns.
+        // Local state may contain a partially replayed observation from a
+        // previous failed initialization attempt. Prune it before retrying.
         let now = unix_now();
         self.prune_expired_local_state(now);
 
@@ -736,6 +753,13 @@ impl RouteManager {
         self.validate_gateways().await?;
         self.ensure_persistent_routes(now);
         self.reconcile_from_router().await?;
+        if !self.pending_observations.is_empty() {
+            self.replay_pending_observations();
+            let replay_now = unix_now();
+            self.prune_expired_local_state(replay_now);
+            self.sync_routes(replay_now).await?;
+            self.pending_observations.clear();
+        }
         self.initialized = true;
         Ok(())
     }
@@ -1043,6 +1067,53 @@ impl RouteManager {
         }
 
         touched_keys.into_iter().collect()
+    }
+
+    fn queue_pending_observation(
+        &mut self,
+        domain: String,
+        scope: ObservationScope,
+        addrs: Vec<ObservedAddr>,
+        observed_at_unix: u64,
+    ) {
+        for &family_scope in scope.family_scopes() {
+            let family = match family_scope {
+                ObservationScope::Ipv4 => RouteFamily::Ipv4,
+                ObservationScope::Ipv6 => RouteFamily::Ipv6,
+                ObservationScope::Both => unreachable!("family scopes are concrete"),
+            };
+            if self.gateway_for(family).is_none() {
+                continue;
+            }
+            let family_addrs = addrs
+                .iter()
+                .copied()
+                .filter(|observed| family_scope.contains(observed.addr))
+                .collect();
+            self.pending_observations.insert(
+                (domain.clone(), family_scope),
+                PendingObservation {
+                    addrs: family_addrs,
+                    observed_at_unix,
+                },
+            );
+        }
+    }
+
+    fn replay_pending_observations(&mut self) {
+        let pending = self
+            .pending_observations
+            .iter()
+            .map(|((domain, scope), observation)| (domain.clone(), *scope, observation.clone()))
+            .collect::<Vec<_>>();
+        for (domain, scope, observation) in pending {
+            self.apply_observation(
+                domain,
+                scope,
+                observation.addrs,
+                observation.observed_at_unix,
+            );
+        }
     }
 
     fn attach_or_refresh_route(
@@ -1612,18 +1683,18 @@ impl RouteManager {
         wait_for_sync: bool,
     ) -> Result<()> {
         let now = unix_now();
-        let touched = self.apply_observation(domain, scope, addrs, now);
-        // Keep observations while background initialization is retrying. The
-        // first successful reconcile will synchronize all still-live routes.
-        // Synchronous mode must attempt that initialization before acknowledging
-        // the observation so its result reflects the RouterOS write outcome.
         if !self.initialized {
-            self.prune_expired_local_state(now);
+            // Preserve only the latest complete observation per domain and
+            // address family. Initialization first recovers retained RouterOS
+            // comments, then replays these replacements with their original
+            // timestamps so retries cannot resurrect old IPs or extend TTLs.
+            self.queue_pending_observation(domain, scope, addrs, now);
             if !wait_for_sync {
                 return Ok(());
             }
-            self.ensure_initialized().await?;
+            return self.ensure_initialized().await;
         }
+        let touched = self.apply_observation(domain, scope, addrs, now);
         self.sync_route_keys(touched, now).await
     }
 
@@ -2152,6 +2223,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn name_level_withdrawal_removes_both_address_families() {
+        let domain = "nxdomain.example.".to_string();
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 25));
+        let ipv6 = "2001:db8::25".parse::<IpAddr>().expect("IPv6 address");
+        let ipv4_key = RouteKey::new(ipv4, "via_proxy".to_string());
+        let ipv6_key = RouteKey::new(ipv6, "via_proxy".to_string());
+        let mut config = manager_config(Some(0));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Both,
+            vec![
+                ObservedAddr {
+                    addr: ipv4,
+                    ttl_secs: 60,
+                },
+                ObservedAddr {
+                    addr: ipv6,
+                    ttl_secs: 60,
+                },
+            ],
+            100,
+        );
+        manager.apply_observation(domain.clone(), ObservationScope::Both, Vec::new(), 101);
+
+        assert!(!manager.domain_bindings.contains_key(&domain));
+        assert_eq!(
+            manager.routes[&ipv4_key].sync_state,
+            SyncState::PendingDelete
+        );
+        assert_eq!(
+            manager.routes[&ipv6_key].sync_state,
+            SyncState::PendingDelete
+        );
+    }
+
     #[tokio::test]
     async fn sync_continues_after_one_route_fails() {
         let failing_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
@@ -2269,6 +2379,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn initialization_replays_withdrawal_after_recovering_router_state() {
+        AppClock::start();
+        let domain = "withdraw.example.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 26));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*retained".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: format!("{ip}/32"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(format!(
+                    "fdns;pg=route-test;kind=dynamic;dm={domain};exp={};seen=100",
+                    u64::MAX
+                )),
+                disabled: false,
+            }],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));
+
+        manager
+            .observe_domain(domain.clone(), ObservationScope::Ipv4, Vec::new(), false)
+            .await
+            .expect("queue withdrawal before initialization");
+        assert!(!manager.initialized);
+        assert!(!manager.routes.contains_key(&key));
+
+        manager
+            .sweep()
+            .await
+            .expect("initialize and replay withdrawal");
+
+        assert!(manager.initialized);
+        assert!(!manager.routes.contains_key(&key));
+        assert!(!manager.domain_bindings.contains_key(&domain));
+        assert_eq!(
+            api.state.lock().expect("mock lock").deleted_ids,
+            vec!["*retained".to_string()]
+        );
+    }
+
     #[test]
     fn removing_persistent_anchor_preserves_dynamic_route_ownership() {
         let domain = "example.com.".to_string();
@@ -2342,7 +2497,7 @@ mod tests {
         let key = RouteKey::new(ip, "via_proxy".to_string());
         let api = Arc::new(MockApi::default());
         let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
-        manager.apply_observation(
+        manager.queue_pending_observation(
             domain.clone(),
             ObservationScope::Ipv4,
             vec![ObservedAddr {
@@ -2351,6 +2506,7 @@ mod tests {
             }],
             1,
         );
+        assert!(!manager.routes.contains_key(&key));
 
         manager.reconcile().await.expect("initial reconcile");
 
