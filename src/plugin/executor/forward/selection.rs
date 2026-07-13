@@ -9,7 +9,7 @@ use tracing::warn;
 
 use super::is_timeout_error;
 use crate::infra::error::{DnsError, Result};
-use crate::proto::{Message, Rcode};
+use crate::proto::{Message, Rcode, RecordType};
 
 const BALANCED_NEGATIVE_GRACE: Duration = Duration::from_millis(100);
 const CONSENSUS_NEGATIVE_VOTES: usize = 2;
@@ -51,6 +51,7 @@ struct NegativeVote {
 
 #[derive(Debug)]
 struct SelectionState {
+    requested_qtype: Option<RecordType>,
     completed: usize,
     last_error: Option<String>,
     last_timeout: bool,
@@ -60,8 +61,9 @@ struct SelectionState {
 }
 
 impl SelectionState {
-    fn new() -> Self {
+    fn new(requested_qtype: Option<RecordType>) -> Self {
         Self {
+            requested_qtype,
             completed: 0,
             last_error: None,
             last_timeout: false,
@@ -72,14 +74,14 @@ impl SelectionState {
     }
 
     fn record_response(&mut self, response: Message) -> ResponseClass {
-        let class = classify_response(&response);
+        let class = classify_response(&response, self.requested_qtype);
         if class == ResponseClass::Negative {
             self.negative_votes += 1;
             if let Some(key) = negative_response_key(&response) {
                 self.record_negative_vote(key);
             }
         }
-        if should_replace_best(self.best_response.as_ref(), &response) {
+        if should_replace_best(self.best_response.as_ref(), &response, self.requested_qtype) {
             self.best_response = Some(response);
         }
         class
@@ -122,22 +124,27 @@ impl SelectionState {
 pub(super) async fn select_response(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
+    requested_qtype: Option<RecordType>,
     mode: ResponseSelectionMode,
 ) -> (Option<Message>, Option<String>, bool) {
     match mode {
         ResponseSelectionMode::Fastest => select_fastest(join_set).await,
-        ResponseSelectionMode::Balanced => select_balanced(join_set, active_concurrent).await,
-        ResponseSelectionMode::PreferPositive => {
-            select_prefer_positive(join_set, active_concurrent).await
+        ResponseSelectionMode::Balanced => {
+            select_balanced(join_set, active_concurrent, requested_qtype).await
         }
-        ResponseSelectionMode::Consensus => select_consensus(join_set, active_concurrent).await,
+        ResponseSelectionMode::PreferPositive => {
+            select_prefer_positive(join_set, active_concurrent, requested_qtype).await
+        }
+        ResponseSelectionMode::Consensus => {
+            select_consensus(join_set, active_concurrent, requested_qtype).await
+        }
     }
 }
 
 async fn select_fastest(
     join_set: &mut JoinSet<Result<Message>>,
 ) -> (Option<Message>, Option<String>, bool) {
-    let mut state = SelectionState::new();
+    let mut state = SelectionState::new(None);
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok(Ok(response)) => {
@@ -154,8 +161,9 @@ async fn select_fastest(
 async fn select_prefer_positive(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
+    requested_qtype: Option<RecordType>,
 ) -> (Option<Message>, Option<String>, bool) {
-    let mut state = SelectionState::new();
+    let mut state = SelectionState::new(requested_qtype);
     while let Some(class) = next_response_class(join_set, &mut state).await {
         if class == ResponseClass::Positive {
             join_set.abort_all();
@@ -171,8 +179,9 @@ async fn select_prefer_positive(
 async fn select_balanced(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
+    requested_qtype: Option<RecordType>,
 ) -> (Option<Message>, Option<String>, bool) {
-    let mut state = SelectionState::new();
+    let mut state = SelectionState::new(requested_qtype);
     let mut negative_grace =
         std::pin::Pin::from(Box::new(tokio::time::sleep(BALANCED_NEGATIVE_GRACE)));
 
@@ -219,12 +228,13 @@ async fn select_balanced(
 async fn select_consensus(
     join_set: &mut JoinSet<Result<Message>>,
     active_concurrent: usize,
+    requested_qtype: Option<RecordType>,
 ) -> (Option<Message>, Option<String>, bool) {
     if active_concurrent < CONSENSUS_NEGATIVE_VOTES {
-        return select_prefer_positive(join_set, active_concurrent).await;
+        return select_prefer_positive(join_set, active_concurrent, requested_qtype).await;
     }
 
-    let mut state = SelectionState::new();
+    let mut state = SelectionState::new(requested_qtype);
     while let Some(class) = next_response_class(join_set, &mut state).await {
         match class {
             ResponseClass::Positive => {
@@ -276,11 +286,26 @@ fn handle_joined_response(
 }
 
 #[inline]
-fn classify_response(response: &Message) -> ResponseClass {
+fn classify_response(response: &Message, requested_qtype: Option<RecordType>) -> ResponseClass {
     match response.rcode() {
-        Rcode::NoError if !response.answers().is_empty() => ResponseClass::Positive,
-        Rcode::NoError | Rcode::NXDomain => ResponseClass::Negative,
+        Rcode::NoError if is_complete_positive_response(response, requested_qtype) => {
+            ResponseClass::Positive
+        }
+        Rcode::NoError if response.answers().is_empty() => ResponseClass::Negative,
+        Rcode::NXDomain => ResponseClass::Negative,
         _ => ResponseClass::Other,
+    }
+}
+
+#[inline]
+fn is_complete_positive_response(response: &Message, requested_qtype: Option<RecordType>) -> bool {
+    if response.answers().is_empty() {
+        return false;
+    }
+
+    match requested_qtype {
+        Some(RecordType::ANY) | None => true,
+        Some(qtype) => response.has_answer_type(qtype),
     }
 }
 
@@ -292,17 +317,32 @@ fn negative_response_key(response: &Message) -> Option<NegativeResponseKey> {
     }
 }
 
-fn should_replace_best(current: Option<&Message>, candidate: &Message) -> bool {
+fn should_replace_best(
+    current: Option<&Message>,
+    candidate: &Message,
+    requested_qtype: Option<RecordType>,
+) -> bool {
     let Some(current) = current else {
         return true;
     };
-    response_rank(candidate) >= response_rank(current)
+    response_rank(candidate, requested_qtype) >= response_rank(current, requested_qtype)
 }
 
-fn response_rank(response: &Message) -> u8 {
-    match classify_response(response) {
-        ResponseClass::Positive => 3,
+fn response_rank(response: &Message, requested_qtype: Option<RecordType>) -> u8 {
+    if is_incomplete_noerror_answer(response, requested_qtype) {
+        return 3;
+    }
+
+    match classify_response(response, requested_qtype) {
+        ResponseClass::Positive => 4,
         ResponseClass::Negative => 2,
         ResponseClass::Other => 1,
     }
+}
+
+#[inline]
+fn is_incomplete_noerror_answer(response: &Message, requested_qtype: Option<RecordType>) -> bool {
+    response.rcode() == Rcode::NoError
+        && !response.answers().is_empty()
+        && !is_complete_positive_response(response, requested_qtype)
 }

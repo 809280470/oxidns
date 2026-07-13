@@ -90,7 +90,7 @@ export const zhCNWebui = {
     tryAdjustSearch: "尝试调整搜索条件或",
     configureTitle: "配置 {name}",
     instanceName: "实例名称",
-    instanceNameHint: "建议使用小写字母、数字和下划线",
+    instanceNameHint: "只能使用英文字母、数字、下划线（_）、横线（-）和点（.）",
     instanceNamePlaceholder: "例如: {kind}_main",
     configTitle: "插件配置",
     pin: "固定",
@@ -669,6 +669,10 @@ export const zhCNWebui = {
     replacementIncompatible: "替换目标类型不兼容",
     unsafeReferences: "存在无法安全移除的引用，请改用替换或编辑器手动修复",
     pluginNameRequired: "插件名称不能为空",
+    pluginNameInvalid:
+      "插件名称只能包含英文字母、数字、下划线（_）、横线（-）和点（.）",
+    pluginNameReserved:
+      "插件名称不能以 qs.exec.、qs.match. 或 qs.cron. 开头",
     pluginNameUnchanged: "插件名称没有变化",
     pluginNameExists: "插件名称已存在",
     configHasErrorsBeforeRename: "当前配置有错误，请先在编辑器中修复后再重命名",
