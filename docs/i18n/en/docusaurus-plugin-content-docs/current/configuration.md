@@ -66,6 +66,19 @@ In the Debian default layout, the config file lives at `/etc/oxidns/config.yaml`
 
 When the plugin composition is still undecided, start from [Common Scenarios](scenarios.md), then return to this page for field details.
 
+## Plugin tag rules
+
+`plugins[].tag` is the globally unique machine identifier for a plugin instance and is used directly in management API paths: `/api/plugins/{tag}/...`. A tag must meet all of these rules:
+
+- It is 1 to 64 ASCII characters long.
+- It uses only ASCII letters, digits, `_`, `-`, and `.`.
+- A `.` may only separate non-empty name segments; every segment starts and ends with a letter or digit.
+- `qs.exec.`, `qs.match.`, and `qs.cron.` are reserved Quick Setup prefixes and cannot be used in user configuration.
+
+For example, `cache_main`, `cache.cn`, and `prod.cache-01` are valid. `.`, `..`, `cache..cn`, `_cache`, `cache-`, `国内缓存`, and `cache/main` are invalid.
+
+Before upgrading from an older version, run `oxidns check -c config.yaml` with the new binary. When renaming a historical tag, update every `$tag`, `jump/goto`, plugin dependency, and other reference to it. OxiDNS does not rename tags automatically because that could silently change request-processing behavior.
+
 ## Environment Variable Substitution
 
 During startup, `oxidns check`, management API validation, and validation before saving a config, OxiDNS first **parses the YAML into a data structure** and then expands `${VAR}` placeholders inside string scalars. The `config.yaml` file itself is not rewritten, so the WebUI still reads and saves the original placeholders.

@@ -670,7 +670,14 @@ export const zhCNWebui = {
     unsafeReferences: "存在无法安全移除的引用，请改用替换或编辑器手动修复",
     pluginNameRequired: "插件名称不能为空",
     pluginNameInvalid:
+      "插件名称必须是可安全用于路径的插件标签",
+    pluginNameTooLong: "插件名称最多 64 个 ASCII 字符",
+    pluginNameNonAscii: "插件名称只能包含 ASCII 字符",
+    pluginNameInvalidCharacter:
       "插件名称只能包含英文字母、数字、下划线（_）、横线（-）和点（.）",
+    pluginNameEmptySegment: "插件名称不能以点开头或结尾，也不能包含连续的点",
+    pluginNameInvalidSegmentBoundary:
+      "每个点分插件名称段必须以字母或数字开头和结尾",
     pluginNameReserved:
       "插件名称不能以 qs.exec.、qs.match. 或 qs.cron. 开头",
     pluginNameUnchanged: "插件名称没有变化",
