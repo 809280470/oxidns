@@ -1546,6 +1546,7 @@ fn clamp_persisted_cache_ttl(
     disposition: ResponseDisposition,
     ttl: u32,
     remaining_ttl_ms: u64,
+    cache_age_ms: u64,
 ) -> (u32, u64) {
     if !matches!(disposition, ResponseDisposition::DefinitiveNegative(_)) {
         return (ttl, remaining_ttl_ms);
@@ -1559,7 +1560,11 @@ fn clamp_persisted_cache_ttl(
     .flatten()
     .min();
     let ttl = protocol_cap.map_or(ttl, |cap| ttl.min(cap));
-    let remaining_ttl_ms = remaining_ttl_ms.min(u64::from(ttl) * 1000);
+    let remaining_ttl_ms = remaining_ttl_ms.min(
+        u64::from(ttl)
+            .saturating_mul(1000)
+            .saturating_sub(cache_age_ms),
+    );
     (ttl, remaining_ttl_ms)
 }
 

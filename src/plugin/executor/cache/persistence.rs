@@ -240,8 +240,14 @@ pub(super) fn load_cache_from_bytes(
             continue;
         }
 
-        let (ttl, remaining_ttl_ms) =
-            clamp_persisted_cache_ttl(&resp, &key, disposition, entry.ttl, entry.remaining_ttl_ms);
+        let (ttl, remaining_ttl_ms) = clamp_persisted_cache_ttl(
+            &resp,
+            &key,
+            disposition,
+            entry.ttl,
+            entry.remaining_ttl_ms,
+            entry.cache_age_ms,
+        );
         if ttl == 0 || remaining_ttl_ms == 0 {
             continue;
         }
@@ -469,6 +475,7 @@ mod tests {
         entry.ecs_network = None;
         entry.ttl = 30;
         entry.remaining_ttl_ms = 30_000;
+        entry.cache_age_ms = 2_000;
         entry.resp_bytes = cname_nodata_response_bytes_with_ttls(5, 30);
 
         let data = wincode::serialize(&vec![entry]).expect("entry should serialize");
@@ -487,7 +494,31 @@ mod tests {
             stored
                 .expire_at_ms
                 .saturating_sub(AppClock::elapsed_millis())
-                <= 5_000
+                <= 3_000
         );
+    }
+
+    #[test]
+    fn test_load_cache_skips_negative_entry_expired_by_clamped_ttl() {
+        AppClock::start();
+        let cache_map = CacheMap::with_capacity(1);
+        let mut entry = make_entry();
+        entry.domain = "example.com.".to_string();
+        entry.record_type = u16::from(RecordType::A);
+        entry.ecs_family = None;
+        entry.ecs_source_prefix = None;
+        entry.ecs_scope_prefix = None;
+        entry.ecs_network = None;
+        entry.ttl = 30;
+        entry.remaining_ttl_ms = 10_000;
+        entry.cache_age_ms = 20_000;
+        entry.resp_bytes = cname_nodata_response_bytes_with_ttls(5, 30);
+
+        let data = wincode::serialize(&vec![entry]).expect("entry should serialize");
+        let loaded =
+            load_cache_from_bytes(&cache_map, &data, false, false).expect("load should succeed");
+
+        assert_eq!(loaded, 0);
+        assert_eq!(cache_map.len(), 0);
     }
 }

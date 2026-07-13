@@ -16,6 +16,7 @@ use crate::proto::{Message, Question};
 
 const BALANCED_NEGATIVE_GRACE: Duration = Duration::from_millis(100);
 const CONSENSUS_NEGATIVE_VOTES: usize = 2;
+const NEGATIVE_RESPONSE_RANK: u8 = 2;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +68,8 @@ struct SelectionState<'a> {
     best_response: Option<Message>,
     best_response_rank: Option<u8>,
     best_response_disposition: Option<ResponseDisposition>,
+    best_negative_response: Option<Message>,
+    best_negative_disposition: Option<ResponseDisposition>,
     negative_votes: usize,
     negative_vote_buckets: Vec<NegativeVote>,
 }
@@ -81,6 +84,8 @@ impl<'a> SelectionState<'a> {
             best_response: None,
             best_response_rank: None,
             best_response_disposition: None,
+            best_negative_response: None,
+            best_negative_disposition: None,
             negative_votes: 0,
             negative_vote_buckets: Vec::new(),
         }
@@ -94,6 +99,9 @@ impl<'a> SelectionState<'a> {
             if let Some(key) = negative_response_key(disposition) {
                 self.record_negative_vote(key);
             }
+            self.best_negative_response = Some(response);
+            self.best_negative_disposition = Some(disposition);
+            return class;
         }
         let response_rank = response_rank(disposition);
         if self
@@ -118,10 +126,27 @@ impl<'a> SelectionState<'a> {
     }
 
     fn take_selected_response(&mut self) -> Option<SelectedResponse> {
+        if self
+            .best_response_rank
+            .is_none_or(|rank| rank < NEGATIVE_RESPONSE_RANK)
+            && let Some(selected) = self.take_negative_response()
+        {
+            return Some(selected);
+        }
+
         self.best_response.take().map(|message| SelectedResponse {
             message,
             disposition: self.best_response_disposition.take(),
         })
+    }
+
+    fn take_negative_response(&mut self) -> Option<SelectedResponse> {
+        self.best_negative_response
+            .take()
+            .map(|message| SelectedResponse {
+                message,
+                disposition: self.best_negative_disposition.take(),
+            })
     }
 
     fn finish(mut self) -> (Option<SelectedResponse>, Option<String>, bool) {
@@ -131,6 +156,10 @@ impl<'a> SelectionState<'a> {
 
     fn finish_success(mut self) -> (Option<SelectedResponse>, Option<String>, bool) {
         (self.take_selected_response(), None, false)
+    }
+
+    fn finish_negative_success(mut self) -> (Option<SelectedResponse>, Option<String>, bool) {
+        (self.take_negative_response(), None, false)
     }
 
     fn record_negative_vote(&mut self, key: NegativeResponseKey) {
@@ -282,7 +311,7 @@ async fn select_consensus(
             }
             ResponseClass::Negative if state.has_negative_consensus(CONSENSUS_NEGATIVE_VOTES) => {
                 join_set.abort_all();
-                return state.finish_success();
+                return state.finish_negative_success();
             }
             ResponseClass::Negative | ResponseClass::Other => {
                 if state.completed >= active_concurrent {
@@ -345,7 +374,7 @@ fn response_rank(disposition: ResponseDisposition) -> u8 {
     match disposition {
         ResponseDisposition::CompletePositive => 4,
         ResponseDisposition::IncompleteAlias => 3,
-        ResponseDisposition::DefinitiveNegative(_) => 2,
+        ResponseDisposition::DefinitiveNegative(_) => NEGATIVE_RESPONSE_RANK,
         ResponseDisposition::Other => 1,
     }
 }
