@@ -112,9 +112,10 @@ export default function ConsoleLayout({
   // not just on the dashboard's runtime-state poll.
   useEffect(() => {
     if (!isConnected) return;
+    void refreshMetrics();
     const id = setInterval(() => {
       void refreshMetrics();
-    }, 5_000);
+    }, 3_000);
     return () => clearInterval(id);
   }, [isConnected, refreshMetrics]);
 

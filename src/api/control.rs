@@ -22,7 +22,9 @@ use crate::api::{ApiHandler, ApiRegister, json_error, json_ok, json_response};
 use crate::config;
 use crate::infra::VERSION;
 use crate::infra::build_info::BuildInfo;
-use crate::infra::control::{AppController, ControlRequestError, ReloadSnapshot, config_version};
+use crate::infra::control::{
+    AppController, ControlRequestError, ProcessMemoryKind, ReloadSnapshot, config_version,
+};
 use crate::infra::error::Result;
 
 #[derive(Debug, Serialize)]
@@ -87,6 +89,7 @@ struct SystemResponse {
     reload: ReloadSnapshot,
     process_cpu_percent: f32,
     process_memory_mb: u64,
+    process_memory_kind: ProcessMemoryKind,
     system_memory_total_mb: u64,
 }
 
@@ -250,6 +253,7 @@ impl ApiHandler for SystemHandler {
                 reload: snapshot.reload,
                 process_cpu_percent: metrics.cpu_percent,
                 process_memory_mb: metrics.memory_mb,
+                process_memory_kind: metrics.memory_kind,
                 system_memory_total_mb: metrics.system_memory_total_mb,
             },
         )
@@ -727,6 +731,10 @@ plugins:
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let value: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
         assert_eq!(value["version"], VERSION);
+        assert!(matches!(
+            value["process_memory_kind"].as_str(),
+            Some("rss" | "private_working_set" | "private_commit" | "working_set")
+        ));
         assert_eq!(value["build"]["version"], VERSION);
         assert_eq!(
             value["build"]["bundle"],

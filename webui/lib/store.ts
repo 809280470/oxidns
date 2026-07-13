@@ -39,6 +39,12 @@ import {
   type PluginMetricsMap,
 } from "./metrics";
 import {
+  calculateDnsTrafficMetrics,
+  sumServerRequestTotal,
+  type DnsTrafficMetrics,
+  type RequestCounterSample,
+} from "./dashboard-traffic";
+import {
   getIncomingPluginReferences,
   getReplacementCandidates,
   removeSafePluginReferences,
@@ -106,6 +112,7 @@ interface AppState {
   reloadStatus: ReloadSnapshot | null;
   pluginMetrics: PluginMetricsMap;
   outboundMetrics: OutboundMetricsMap;
+  trafficMetrics: DnsTrafficMetrics;
   dependencyGraph: DependencyGraphReport | null;
   configDiagnostics: string[];
   configHistory: ConfigSnapshot[];
@@ -174,6 +181,8 @@ interface AppState {
 
 let queuedConfigSave: Promise<void> = Promise.resolve();
 let pendingConfigSaveCount = 0;
+let metricsRefreshInFlight: Promise<void> | null = null;
+let requestRateBaseline: RequestCounterSample | null = null;
 
 function enqueueConfigSave(
   set: StoreSet,
@@ -204,6 +213,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   reloadStatus: null,
   pluginMetrics: {},
   outboundMetrics: {},
+  trafficMetrics: {
+    status: "pending",
+    qps: null,
+    requestTotal: 0,
+    sampleWindowSeconds: null,
+  },
   dependencyGraph: null,
   configDiagnostics: [],
   configHistory: [],
@@ -350,18 +365,47 @@ export const useAppStore = create<AppState>((set, get) => ({
         ? { runningVersion: nextReload.running_version }
         : {}),
     });
-    await get().refreshMetrics();
   },
 
-  refreshMetrics: async () => {
-    try {
-      const text = await fetchPrometheusMetrics();
-      const metrics = parsePrometheusMetrics(text);
-      set({ pluginMetrics: metrics.byTag, outboundMetrics: metrics.outbound });
-    } catch {
-      // Metrics are best-effort observability; keep the last snapshot on
-      // transient errors (e.g. API hub torn down during reload).
-    }
+  refreshMetrics: () => {
+    if (metricsRefreshInFlight) return metricsRefreshInFlight;
+
+    const refresh = (async () => {
+      try {
+        const text = await fetchPrometheusMetrics();
+        const metrics = parsePrometheusMetrics(text);
+        const currentSample = {
+          requestTotal: sumServerRequestTotal(metrics.byTag),
+          sampledAtMs: Date.now(),
+        };
+        const trafficMetrics = calculateDnsTrafficMetrics(
+          requestRateBaseline,
+          currentSample,
+        );
+        requestRateBaseline = currentSample;
+        set({
+          pluginMetrics: metrics.byTag,
+          outboundMetrics: metrics.outbound,
+          trafficMetrics,
+        });
+      } catch {
+        // Do not keep showing a stale rate after a metrics fetch failure.
+        // The next successful response establishes a fresh baseline.
+        requestRateBaseline = null;
+        set((state) => ({
+          trafficMetrics: {
+            ...state.trafficMetrics,
+            status: "unavailable",
+            qps: null,
+            sampleWindowSeconds: null,
+          },
+        }));
+      }
+    })();
+    metricsRefreshInFlight = refresh.finally(() => {
+      metricsRefreshInFlight = null;
+    });
+    return metricsRefreshInFlight;
   },
 
   validateCurrentConfig: async () => {

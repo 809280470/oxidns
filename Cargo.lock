@@ -1938,6 +1938,7 @@ dependencies = [
  "url",
  "webpki-roots",
  "wincode",
+ "windows",
  "windows-service",
  "zip",
 ]
