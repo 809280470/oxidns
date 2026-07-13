@@ -214,6 +214,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   pluginMetrics: {},
   outboundMetrics: {},
   trafficMetrics: {
+    status: "pending",
     qps: null,
     requestTotal: 0,
     sampleWindowSeconds: null,
@@ -394,6 +395,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         set((state) => ({
           trafficMetrics: {
             ...state.trafficMetrics,
+            status: "unavailable",
             qps: null,
             sampleWindowSeconds: null,
           },

@@ -704,6 +704,7 @@ export const zhCNWebui = {
     checkServer: "服务器",
     dnsQps: "DNS QPS",
     qpsWindow: "最近 {seconds} 秒平均",
+    trafficMetricsUnavailable: "流量指标不可用",
     processCpu: "CPU {value}",
     requestTotal: "累计 {value} 次请求",
     memUsage: "内存占用",

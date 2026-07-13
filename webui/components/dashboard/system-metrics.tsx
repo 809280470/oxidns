@@ -201,13 +201,18 @@ export function SystemMetrics() {
               {formatQps(trafficMetrics.qps, formatNumber)}
             </div>
             <p className="text-xs text-muted-foreground mt-0.5">
-              {trafficMetrics.sampleWindowSeconds === null
-                ? t(WEBUI.dashboard.waitingData)
-                : t(WEBUI.dashboard.qpsWindow, {
-                    seconds: formatNumber(trafficMetrics.sampleWindowSeconds, {
-                      maximumFractionDigits: 1,
-                    }),
-                  })}
+              {trafficMetrics.status === "unavailable"
+                ? t(WEBUI.dashboard.trafficMetricsUnavailable)
+                : trafficMetrics.sampleWindowSeconds === null
+                  ? t(WEBUI.dashboard.waitingData)
+                  : t(WEBUI.dashboard.qpsWindow, {
+                      seconds: formatNumber(
+                        trafficMetrics.sampleWindowSeconds,
+                        {
+                          maximumFractionDigits: 1,
+                        },
+                      ),
+                    })}
             </p>
           </div>
           <div className="border-t border-border/50 pt-2 flex items-center gap-3 text-xs text-muted-foreground">
@@ -216,14 +221,16 @@ export function SystemMetrics() {
                 value: system ? formatCpu(cpuPct, formatNumber) : "-",
               })}
             </span>
-            <span>
-              {t(WEBUI.dashboard.requestTotal, {
-                value: formatRequestTotal(
-                  trafficMetrics.requestTotal,
-                  formatNumber,
-                ),
-              })}
-            </span>
+            {trafficMetrics.status === "available" && (
+              <span>
+                {t(WEBUI.dashboard.requestTotal, {
+                  value: formatRequestTotal(
+                    trafficMetrics.requestTotal,
+                    formatNumber,
+                  ),
+                })}
+              </span>
+            )}
           </div>
         </CardContent>
       </Card>

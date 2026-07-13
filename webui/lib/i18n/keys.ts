@@ -185,6 +185,7 @@ export const WEBUI = {
     checkServer: "webui.dashboard.checkServer",
     dnsQps: "webui.dashboard.dnsQps",
     qpsWindow: "webui.dashboard.qpsWindow",
+    trafficMetricsUnavailable: "webui.dashboard.trafficMetricsUnavailable",
     processCpu: "webui.dashboard.processCpu",
     requestTotal: "webui.dashboard.requestTotal",
     memUsage: "webui.dashboard.memUsage",

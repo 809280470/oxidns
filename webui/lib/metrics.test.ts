@@ -26,7 +26,12 @@ describe("dashboard DNS traffic metrics", () => {
         { requestTotal: 100, sampledAtMs: 1_000 },
         { requestTotal: 145, sampledAtMs: 4_000 },
       ),
-    ).toEqual({ qps: 15, requestTotal: 145, sampleWindowSeconds: 3 });
+    ).toEqual({
+      status: "available",
+      qps: 15,
+      requestTotal: 145,
+      sampleWindowSeconds: 3,
+    });
   });
 
   it("reports zero QPS when the request counter did not change", () => {
@@ -35,7 +40,12 @@ describe("dashboard DNS traffic metrics", () => {
         { requestTotal: 145, sampledAtMs: 1_000 },
         { requestTotal: 145, sampledAtMs: 4_000 },
       ),
-    ).toEqual({ qps: 0, requestTotal: 145, sampleWindowSeconds: 3 });
+    ).toEqual({
+      status: "available",
+      qps: 0,
+      requestTotal: 145,
+      sampleWindowSeconds: 3,
+    });
   });
 
   it("does not invent a QPS value without a valid monotonic baseline", () => {
@@ -44,12 +54,22 @@ describe("dashboard DNS traffic metrics", () => {
         requestTotal: 145,
         sampledAtMs: 4_000,
       }),
-    ).toEqual({ qps: null, requestTotal: 145, sampleWindowSeconds: null });
+    ).toEqual({
+      status: "available",
+      qps: null,
+      requestTotal: 145,
+      sampleWindowSeconds: null,
+    });
     expect(
       calculateDnsTrafficMetrics(
         { requestTotal: 145, sampledAtMs: 1_000 },
         { requestTotal: 4, sampledAtMs: 4_000 },
       ),
-    ).toEqual({ qps: null, requestTotal: 4, sampleWindowSeconds: null });
+    ).toEqual({
+      status: "available",
+      qps: null,
+      requestTotal: 4,
+      sampleWindowSeconds: null,
+    });
   });
 });

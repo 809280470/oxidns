@@ -732,6 +732,7 @@ export const enUSWebui = {
     checkServer: "Server",
     dnsQps: "DNS QPS",
     qpsWindow: "Average over {seconds}s",
+    trafficMetricsUnavailable: "Traffic metrics unavailable",
     processCpu: "CPU {value}",
     requestTotal: "{value} total requests",
     memUsage: "Memory Usage",

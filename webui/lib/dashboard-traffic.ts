@@ -6,6 +6,7 @@ export interface RequestCounterSample {
 }
 
 export interface DnsTrafficMetrics {
+  status: "pending" | "available" | "unavailable";
   qps: number | null;
   requestTotal: number;
   sampleWindowSeconds: number | null;
@@ -42,6 +43,7 @@ export function calculateDnsTrafficMetrics(
     current.requestTotal < previous.requestTotal
   ) {
     return {
+      status: "available",
       qps: null,
       requestTotal: current.requestTotal,
       sampleWindowSeconds: null,
@@ -51,6 +53,7 @@ export function calculateDnsTrafficMetrics(
   const sampleWindowSeconds =
     (current.sampledAtMs - previous.sampledAtMs) / 1_000;
   return {
+    status: "available",
     qps: (current.requestTotal - previous.requestTotal) / sampleWindowSeconds,
     requestTotal: current.requestTotal,
     sampleWindowSeconds,
