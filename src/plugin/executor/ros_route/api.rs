@@ -248,43 +248,16 @@ impl MikrotikRsClient {
             }
         };
 
-        let mut rows = Vec::new();
-        loop {
-            let recv_result = tokio::time::timeout(self.timeouts.receive, rx.recv()).await;
-            let Some(item) = (match recv_result {
-                Ok(item) => item,
-                Err(_) => {
-                    self.invalidate_connection().await;
-                    return Err(DnsError::plugin(format!(
-                        "ros_route {action} receive timeout after {}s",
-                        self.timeouts.receive.as_secs()
-                    )));
-                }
-            }) else {
-                break;
-            };
-
-            match item {
-                Event::Reply { response, .. } => rows.push(RouterReply {
-                    attributes: response.attributes,
-                }),
-                Event::Done { .. } | Event::Empty { .. } => {}
-                Event::Trap { response, .. } => {
-                    return Err(DnsError::plugin(format!(
-                        "ros_route {action} trap: {}",
-                        response.message
-                    )));
-                }
-                Event::Fatal { reason } => {
-                    self.invalidate_connection().await;
-                    return Err(DnsError::plugin(format!(
-                        "ros_route {action} fatal: {reason}"
-                    )));
-                }
-            };
+        match receive_rows(action, self.timeouts.receive, &mut rx).await {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                // A prematurely closed command channel can indicate that the
+                // connection actor dropped replies after its bounded queue
+                // filled. Never reuse that connection or accept partial data.
+                self.invalidate_connection().await;
+                Err(error)
+            }
         }
-
-        Ok(rows)
     }
 
     async fn find_route_by_exact_comment(
@@ -360,6 +333,48 @@ impl MikrotikRsClient {
                 Ok(route)
             })
             .collect()
+    }
+}
+
+async fn receive_rows(
+    action: &str,
+    receive_timeout: Duration,
+    rx: &mut tokio::sync::mpsc::Receiver<Event>,
+) -> Result<Vec<RouterReply>> {
+    let mut rows = Vec::new();
+    loop {
+        let recv_result = tokio::time::timeout(receive_timeout, rx.recv()).await;
+        let Some(item) = (match recv_result {
+            Ok(item) => item,
+            Err(_) => {
+                return Err(DnsError::plugin(format!(
+                    "ros_route {action} receive timeout after {}s",
+                    receive_timeout.as_secs()
+                )));
+            }
+        }) else {
+            return Err(DnsError::plugin(format!(
+                "ros_route {action} response channel closed before a terminal event"
+            )));
+        };
+
+        match item {
+            Event::Reply { response, .. } => rows.push(RouterReply {
+                attributes: response.attributes,
+            }),
+            Event::Done { .. } | Event::Empty { .. } => return Ok(rows),
+            Event::Trap { response, .. } => {
+                return Err(DnsError::plugin(format!(
+                    "ros_route {action} trap: {}",
+                    response.message
+                )));
+            }
+            Event::Fatal { reason } => {
+                return Err(DnsError::plugin(format!(
+                    "ros_route {action} fatal: {reason}"
+                )));
+            }
+        }
     }
 }
 
@@ -709,5 +724,34 @@ mod tests {
             Some("*owned")
         );
         assert!(inspection.has_foreign);
+    }
+
+    #[tokio::test]
+    async fn response_channel_must_deliver_a_terminal_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+
+        let error = receive_rows("test command", Duration::from_secs(1), &mut rx)
+            .await
+            .expect_err("closed channel must not return a partial success");
+
+        assert!(error.to_string().contains("closed before a terminal event"));
+    }
+
+    #[tokio::test]
+    async fn done_event_completes_the_response_without_waiting_for_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Event::Done {
+            tag: Default::default(),
+        })
+        .await
+        .expect("send done event");
+
+        let rows = receive_rows("test command", Duration::from_secs(1), &mut rx)
+            .await
+            .expect("done event should complete response");
+
+        assert!(rows.is_empty());
+        assert!(!tx.is_closed());
     }
 }

@@ -233,7 +233,7 @@ impl RouteCommentCodec {
         out.push(';');
         out.push_str(COMMENT_FIELD_DOMAIN);
         out.push('=');
-        out.push_str(&route.comment_domain);
+        out.push_str(&encode_comment_value(&route.comment_domain));
         out.push(';');
         out.push_str(COMMENT_FIELD_EXP);
         out.push('=');
@@ -290,10 +290,10 @@ impl RouteCommentCodec {
             )));
         }
 
-        let comment_domain = kv
+        let encoded_comment_domain = kv
             .get(COMMENT_FIELD_DOMAIN)
-            .ok_or_else(|| DnsError::plugin("ros_route comment decode failed: missing dm field"))?
-            .to_string();
+            .ok_or_else(|| DnsError::plugin("ros_route comment decode failed: missing dm field"))?;
+        let comment_domain = decode_comment_value(encoded_comment_domain)?;
         let expires_at_unix = kv
             .get(COMMENT_FIELD_EXP)
             .ok_or_else(|| DnsError::plugin("ros_route comment decode failed: missing exp field"))?
@@ -318,6 +318,65 @@ impl RouteCommentCodec {
             expires_at_unix,
             last_refresh_unix,
         }))
+    }
+}
+
+fn encode_comment_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
+}
+
+fn decode_comment_value(value: &str) -> Result<String> {
+    let input = value.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] != b'%' {
+            decoded.push(input[index]);
+            index += 1;
+            continue;
+        }
+
+        let Some(encoded_byte) = input.get(index + 1..index + 3) else {
+            return Err(DnsError::plugin(
+                "ros_route comment decode failed: truncated percent escape in dm field",
+            ));
+        };
+        let high = decode_hex_digit(encoded_byte[0]).ok_or_else(|| {
+            DnsError::plugin("ros_route comment decode failed: invalid percent escape in dm field")
+        })?;
+        let low = decode_hex_digit(encoded_byte[1]).ok_or_else(|| {
+            DnsError::plugin("ros_route comment decode failed: invalid percent escape in dm field")
+        })?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+
+    String::from_utf8(decoded).map_err(|error| {
+        DnsError::plugin(format!(
+            "ros_route comment decode failed: dm field is not valid UTF-8: {error}"
+        ))
+    })
+}
+
+#[inline]
+fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1606,7 +1665,13 @@ fn select_comment_domain(domains: &AHashSet<String>) -> String {
         .filter(|domain| domain.as_str() != PERSISTENT_ANCHOR_DOMAIN)
         .min()
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_else(|| {
+            if domains.contains(PERSISTENT_ANCHOR_DOMAIN) {
+                PERSISTENT_COMMENT_DOMAIN.to_string()
+            } else {
+                String::new()
+            }
+        })
 }
 
 async fn run_manager_worker(
@@ -1888,6 +1953,43 @@ mod tests {
     }
 
     #[test]
+    fn comment_codec_escapes_domain_field_delimiters() {
+        let domain = r"escaped\;pg=foreign.example.";
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 19));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let route = RouteEntry {
+            key,
+            gateway: "192.0.2.1".to_string(),
+            distance: 100,
+            domains: AHashSet::from_iter([domain.to_string()]),
+            comment_domain: domain.to_string(),
+            domain_expiries: AHashMap::from_iter([(domain.to_string(), 400)]),
+            ref_count: 1,
+            expires_at_unix: 400,
+            last_refresh_unix: 100,
+            synced_expires_at_unix: None,
+            router_id: None,
+            recovered_ownership_incomplete: false,
+            sync_state: SyncState::PendingCreate,
+        };
+
+        let comment = RouteCommentCodec::encode("fdns", "route-test", &route);
+        assert!(comment.contains("dm=escaped%5C%3Bpg%3Dforeign.example."));
+        assert_eq!(comment.matches(";pg=").count(), 1);
+
+        let decoded = RouteCommentCodec::decode(
+            "fdns",
+            "route-test",
+            RouteFamily::Ipv4,
+            "203.0.113.19/32",
+            &comment,
+        )
+        .expect("decode comment")
+        .expect("owned comment");
+        assert_eq!(decoded.comment_domain, domain);
+    }
+
+    #[test]
     fn timeless_route_is_withdrawn_when_the_domain_stops_returning_it() {
         let mut manager = manager_with_timeless_dynamic_routes();
         let domain = "example.com.".to_string();
@@ -2085,6 +2187,35 @@ mod tests {
         assert_eq!(route.comment_domain, domain);
         assert_eq!(route.expires_at_unix, 401);
         assert!(!route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
+        assert_ne!(route.sync_state, SyncState::PendingDelete);
+    }
+
+    #[test]
+    fn withdrawing_last_dynamic_ref_restores_persistent_comment_marker() {
+        let domain = "example.com.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let mut config = manager_config(Some(300));
+        config.persistent_ips = AHashSet::from_iter([format!("{ip}/32")]);
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+
+        manager.ensure_persistent_routes(100);
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            101,
+        );
+        manager.apply_observation(domain, ObservationScope::Ipv4, Vec::new(), 102);
+
+        let route = manager.routes.get(&key).expect("persistent route remains");
+        assert_eq!(route.ref_count, 1);
+        assert_eq!(route.comment_domain, PERSISTENT_COMMENT_DOMAIN);
+        assert!(route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
+        assert_eq!(route.expires_at_unix, PERSISTENT_EXPIRES_AT_UNIX);
         assert_ne!(route.sync_state, SyncState::PendingDelete);
     }
 
