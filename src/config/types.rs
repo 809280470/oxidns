@@ -21,6 +21,12 @@ pub enum ConfigError {
     #[error("Plugin tag cannot be empty")]
     EmptyPluginTag,
 
+    #[error("Invalid plugin tag '{0}': only ASCII letters, digits, '_', '-', and '.' are allowed")]
+    InvalidPluginTag(String),
+
+    #[error("Plugin tag '{0}' uses a reserved quick-setup prefix")]
+    ReservedPluginTagPrefix(String),
+
     #[error("Invalid log level: {0}")]
     InvalidLogLevel(String),
 
@@ -154,6 +160,12 @@ impl Config {
             if plugin.tag.is_empty() {
                 return Err(ConfigError::EmptyPluginTag);
             }
+            if !is_valid_plugin_tag(&plugin.tag) {
+                return Err(ConfigError::InvalidPluginTag(plugin.tag.clone()));
+            }
+            if is_reserved_plugin_tag(&plugin.tag) {
+                return Err(ConfigError::ReservedPluginTagPrefix(plugin.tag.clone()));
+            }
             if let Some(prev_idx) = seen_tags.insert(plugin.tag.as_str(), idx) {
                 return Err(ConfigError::DuplicatePluginTag {
                     tag: plugin.tag.clone(),
@@ -170,6 +182,17 @@ impl Config {
 
         Ok(())
     }
+}
+
+pub fn is_valid_plugin_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+pub fn is_reserved_plugin_tag(tag: &str) -> bool {
+    tag.starts_with("qs.exec.") || tag.starts_with("qs.match.") || tag.starts_with("qs.cron.")
 }
 
 /// Shared network configuration.
@@ -781,6 +804,48 @@ mod tests {
             .validate()
             .expect_err("should reject empty plugin type");
         assert!(matches!(err, ConfigError::EmptyPluginType));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_plugin_tags() {
+        for tag in ["has space", "中文", "tag/slash", "tag:colon", "tag%20"] {
+            let config = Config {
+                include: Vec::new(),
+                runtime: RuntimeConfig::default(),
+                api: ApiConfig::default(),
+                log: LogConfig::default(),
+                network: NetworkConfig::default(),
+                plugins: vec![plugin(tag, "debug_print")],
+            };
+
+            let err = config
+                .validate()
+                .expect_err("should reject invalid plugin tag");
+            assert!(matches!(err, ConfigError::InvalidPluginTag(_)));
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_reserved_quick_setup_plugin_tags() {
+        for tag in [
+            "qs.exec.seq.0.cache",
+            "qs.match.seq.0.0.qname",
+            "qs.cron.cron.0.0.cache",
+        ] {
+            let config = Config {
+                include: Vec::new(),
+                runtime: RuntimeConfig::default(),
+                api: ApiConfig::default(),
+                log: LogConfig::default(),
+                network: NetworkConfig::default(),
+                plugins: vec![plugin(tag, "debug_print")],
+            };
+
+            let err = config
+                .validate()
+                .expect_err("should reject reserved quick-setup tag prefix");
+            assert!(matches!(err, ConfigError::ReservedPluginTagPrefix(_)));
+        }
     }
 
     #[test]

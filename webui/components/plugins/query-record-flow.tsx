@@ -1025,7 +1025,7 @@ function matcherRuntimeTag(
 ) {
   if (expression.target_tag) return expression.target_tag;
   if (expression.kind === "quick_setup" && expression.plugin_type) {
-    return `@qs:match:${sequenceTag}:${ruleIndex}:${matchIndex}:${expression.plugin_type}`;
+    return `qs.match.${sequenceTag}.${ruleIndex}.${matchIndex}.${expression.plugin_type}`;
   }
   return undefined;
 }
@@ -1045,7 +1045,7 @@ function actionRuntimeTarget(
   if (expression.kind === "quick_setup" && expression.plugin_type) {
     return {
       kind: "executor",
-      tag: `@qs:exec:${sequenceTag}:${ruleIndex}:${expression.plugin_type}`,
+      tag: `qs.exec.${sequenceTag}.${ruleIndex}.${expression.plugin_type}`,
     };
   }
   return undefined;

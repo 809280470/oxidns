@@ -95,6 +95,7 @@ impl ConcurrentForwarder {
             return (None, Some("no upstream configured".to_string()), false);
         }
 
+        let requested_qtype = request.first_qtype();
         let mut join_set = JoinSet::new();
         let start_idx = rand::rng().random_range(0..total_upstreams);
 
@@ -126,6 +127,7 @@ impl ConcurrentForwarder {
         select_response(
             &mut join_set,
             self.active_concurrent,
+            requested_qtype,
             self.response_selection,
         )
         .await

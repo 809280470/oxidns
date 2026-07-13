@@ -286,6 +286,7 @@ Linux x86_64 / ARM64 musl 额外提供 `minimal` 和 `standard` slim 压缩包�
 - `oxidns-aarch64-unknown-linux-musl.tar.gz`
 - `oxidns-i686-unknown-linux-musl.tar.gz`
 - `oxidns-arm-unknown-linux-musleabihf.tar.gz`
+- `oxidns-armv7-unknown-linux-musleabihf.tar.gz`
 - `oxidns-x86_64-apple-darwin.tar.gz`
 - `oxidns-aarch64-apple-darwin.tar.gz`
 - `oxidns-x86_64-unknown-freebsd.tar.gz`
@@ -317,7 +318,8 @@ Windows 平台使用 `.zip`：
 | Alpine Linux x86_64 | `oxidns-x86_64-unknown-linux-musl.tar.gz` | Alpine 建议优先选 musl |
 | Alpine Linux ARM64 | `oxidns-aarch64-unknown-linux-musl.tar.gz` | 静态链接更省心 |
 | 明确是 glibc Linux 且需要动态链接版本 | `oxidns-x86_64-unknown-linux-gnu.tar.gz` / `oxidns-aarch64-unknown-linux-gnu.tar.gz` | 仅在明确环境匹配时选择 |
-| 32 位 ARM Linux | `oxidns-arm-unknown-linux-musleabihf.tar.gz` | 适合部分树莓派和老 ARM 板子 |
+| Linux ARMv7 / armv7l | `oxidns-armv7-unknown-linux-musleabihf.tar.gz` | 适合 ARMv7 设备 |
+| 通用 32 位 ARM Linux | `oxidns-arm-unknown-linux-musleabihf.tar.gz` | 适合较老 ARM 板子 |
 | macOS Intel | `oxidns-x86_64-apple-darwin.tar.gz` | Intel Mac |
 | macOS Apple Silicon | `oxidns-aarch64-apple-darwin.tar.gz` | M1 / M2 / M3 / M4 |
 | Windows x64 | `oxidns-x86_64-pc-windows-msvc.zip` | 常见 PC |
@@ -336,7 +338,7 @@ uname -m
 
 - `Linux` + `x86_64`：默认选 `x86_64-unknown-linux-musl`，只有明确需要 glibc 动态链接版本时再选 `x86_64-unknown-linux-gnu`
 - `Linux` + `aarch64`：默认选 `aarch64-unknown-linux-musl`，只有明确需要 glibc 动态链接版本时再选 `aarch64-unknown-linux-gnu`
-- `Linux` + `armv7l`：选 `arm-unknown-linux-musleabihf`
+- `Linux` + `armv7l`：选 `armv7-unknown-linux-musleabihf`
 - `Darwin` + `x86_64`：选 `x86_64-apple-darwin`
 - `Darwin` + `arm64`：选 `aarch64-apple-darwin`
 

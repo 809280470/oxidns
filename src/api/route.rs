@@ -9,6 +9,7 @@ use ahash::AHashMap;
 use http::Method;
 
 use crate::api::ApiHandler;
+use crate::config::types::is_valid_plugin_tag;
 use crate::infra::error::{DnsError, Result};
 
 #[derive(Clone, Debug)]
@@ -56,9 +57,9 @@ impl PrefixRoute {
 }
 
 pub(crate) fn build_plugin_route_path(plugin_tag: &str, subpath: &str) -> Result<String> {
-    if plugin_tag.bytes().any(|b| matches!(b, b'/' | b'?' | b'#')) {
+    if !is_valid_plugin_tag(plugin_tag) {
         return Err(DnsError::plugin(format!(
-            "plugin tag '{}' is not valid for API route paths",
+            "plugin tag '{}' is not valid for API route paths; only ASCII letters, digits, '_', '-', and '.' are allowed",
             plugin_tag
         )));
     }

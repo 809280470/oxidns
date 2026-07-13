@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type React from "react";
 import { SheetTitle } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { AlertTriangle, Pencil, Pin, PinOff, Rocket, Save } from "lucide-react";
 import { useAppStore } from "@/lib/store";
+import { extractOutboundProfileNames } from "@/lib/oxidns-config-schema";
 import { isPluginKindSupported } from "@/lib/build-capabilities";
 import { cn } from "@/lib/utils";
 import { Spinner } from "@/components/ui/spinner";
@@ -28,6 +29,7 @@ import { usePluginAppliedStatus } from "@/hooks/use-plugin-applied";
 import { WEBUI } from "@/lib/i18n";
 import { pluginTypeLabel } from "@/lib/i18n/plugin-defined";
 import { useI18n } from "@/lib/i18n/provider";
+import { isReservedPluginTag, isValidPluginTag } from "@/lib/plugin-tags";
 import type { PluginDetailTemplateProps, PluginSummaryItem } from "./types";
 import { pluginTypeColors, pluginTypeIcons } from "./display";
 import { getPluginCatalogItem, renderPluginKindIcon } from "./catalog";
@@ -57,9 +59,14 @@ export function PluginDetailTemplate({
     isRestarting,
     configError,
     plugins,
+    configModel,
     dependencyGraph,
     buildInfo,
   } = useAppStore();
+  const outboundProfileNames = useMemo(
+    () => extractOutboundProfileNames(configModel),
+    [configModel],
+  );
   const appliedStatus = usePluginAppliedStatus(plugin.name);
   const hasMetricSeries = useAppStore(
     (s) => (s.pluginMetrics[plugin.name]?.length ?? 0) > 0,
@@ -92,6 +99,19 @@ export function PluginDetailTemplate({
   } | null>(null);
 
   const configBusy = isConfigSaving || isApplying || isRestarting;
+  const normalizedNewName = newName.trim();
+  const nameValidationError =
+    normalizedNewName && !isValidPluginTag(normalizedNewName)
+      ? t(WEBUI.storeErrors.pluginNameInvalid)
+      : normalizedNewName && isReservedPluginTag(normalizedNewName)
+        ? t(WEBUI.storeErrors.pluginNameReserved)
+      : null;
+  const displayedNameError = nameError ?? nameValidationError;
+  const nameSaveDisabled =
+    configBusy ||
+    Boolean(configError) ||
+    !normalizedNewName ||
+    Boolean(nameValidationError);
 
   const handleSaveConfig = async () => {
     if (!configValid) return;
@@ -124,15 +144,23 @@ export function PluginDetailTemplate({
 
   const handleSaveName = async () => {
     setNameError(null);
+    if (!normalizedNewName) {
+      setNameError(t(WEBUI.storeErrors.pluginNameRequired));
+      return;
+    }
+    if (nameValidationError) {
+      setNameError(nameValidationError);
+      return;
+    }
     try {
-      const result = await renamePlugin(plugin.id, newName.trim());
+      const result = await renamePlugin(plugin.id, normalizedNewName);
       if (result.status === "invalid") {
         setNameError(result.message);
         return;
       }
       if (result.status === "needs-confirmation") {
         setPendingRename({
-          name: newName.trim(),
+          name: normalizedNewName,
           references: result.references,
         });
         return;
@@ -197,8 +225,9 @@ export function PluginDetailTemplate({
                       }}
                       disabled={configBusy || Boolean(configError)}
                       className="h-9 max-w-md font-mono text-lg"
+                      aria-invalid={Boolean(displayedNameError)}
                       onKeyDown={(e) => {
-                        if (e.key === "Enter" && !configBusy) {
+                        if (e.key === "Enter" && !nameSaveDisabled) {
                           void handleSaveName();
                         }
                         if (e.key === "Escape") {
@@ -210,14 +239,16 @@ export function PluginDetailTemplate({
                     />
                     <Button
                       size="icon-sm"
-                      disabled={configBusy || Boolean(configError)}
+                      disabled={nameSaveDisabled}
                       onClick={() => void handleSaveName()}
                     >
                       <Save className="h-4 w-4" />
                     </Button>
                   </div>
-                  {nameError && (
-                    <p className="text-xs text-destructive">{nameError}</p>
+                  {displayedNameError && (
+                    <p className="text-xs text-destructive">
+                      {displayedNameError}
+                    </p>
                   )}
                 </div>
               ) : (
@@ -365,6 +396,7 @@ export function PluginDetailTemplate({
                     readOnly={!editingConfig}
                     pluginKind={plugin.pluginKind}
                     currentPluginName={plugin.name}
+                    outboundProfileNames={outboundProfileNames}
                   />
                 ) : (
                   <Textarea
