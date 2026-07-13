@@ -25,6 +25,7 @@ const ROUTE_DEFAULT_V6: &str = "::/0";
 const ROUTE_PREFIX_V4: u8 = 32;
 const ROUTE_PREFIX_V6: u8 = 128;
 const PERSISTENT_ANCHOR_DOMAIN: &str = "__forgedns_persistent__";
+const PERSISTENT_COMMENT_DOMAIN: &str = "persistent";
 const PERSISTENT_EXPIRES_AT_UNIX: u64 = u64::MAX;
 const MANAGER_QUEUE_SIZE: usize = 1024;
 const SWEEP_INTERVAL_SECS: u64 = 30;
@@ -353,10 +354,28 @@ pub(super) struct ObservedAddr {
     pub(super) ttl_secs: u32,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum ObservationScope {
+    Ipv4,
+    Ipv6,
+    Both,
+}
+
+impl ObservationScope {
+    #[inline]
+    pub(super) fn contains(self, ip: IpAddr) -> bool {
+        matches!(
+            (self, ip),
+            (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_)) | (Self::Both, _)
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum ManagerCommand {
     ObserveDomain {
         domain: String,
+        scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
         wait: Option<oneshot::Sender<Result<()>>>,
     },
@@ -598,6 +617,12 @@ impl RouteManager {
             return Ok(());
         }
 
+        // Observations are accepted while RouterOS is unavailable. Prune their
+        // local TTL state before every initialization attempt so stale answers
+        // are never replayed when connectivity returns.
+        let now = unix_now();
+        self.prune_expired_local_state(now);
+
         // One-time bootstrap:
         // 1) transport healthcheck
         // 2) validate configured gateways against RouterOS
@@ -605,7 +630,7 @@ impl RouteManager {
         // 4) reconcile local state from RouterOS
         self.api.healthcheck().await?;
         self.validate_gateways().await?;
-        self.ensure_persistent_routes(unix_now());
+        self.ensure_persistent_routes(now);
         self.reconcile_from_router().await?;
         self.initialized = true;
         Ok(())
@@ -793,7 +818,7 @@ impl RouteManager {
                     gateway,
                     distance: self.cfg.distance,
                     domains,
-                    comment_domain: "persistent".to_string(),
+                    comment_domain: PERSISTENT_COMMENT_DOMAIN.to_string(),
                     domain_expiries,
                     ref_count: 1,
                     expires_at_unix: PERSISTENT_EXPIRES_AT_UNIX,
@@ -832,6 +857,9 @@ impl RouteManager {
             entry.domain_expiries.remove(PERSISTENT_ANCHOR_DOMAIN);
             entry.ref_count = entry.ref_count.saturating_sub(1);
             entry.last_refresh_unix = now;
+            if entry.comment_domain == PERSISTENT_COMMENT_DOMAIN {
+                entry.comment_domain = select_comment_domain(&entry.domains);
+            }
 
             if entry.ref_count == 0 {
                 entry.expires_at_unix = now;
@@ -849,6 +877,7 @@ impl RouteManager {
     fn apply_observation(
         &mut self,
         domain: String,
+        scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
         now: u64,
     ) -> Vec<RouteKey> {
@@ -856,6 +885,9 @@ impl RouteManager {
         // Deduplicate answer IPs and keep max ttl per IP for this observation.
         let mut dedup_expiries = AHashMap::<IpAddr, u64>::new();
         for observed in addrs {
+            if !scope.contains(observed.addr) {
+                continue;
+            }
             let family = RouteFamily::from_ip(observed.addr);
             if self.gateway_for(family).is_none() {
                 continue;
@@ -866,46 +898,44 @@ impl RouteManager {
                 .and_modify(|existing| *existing = (*existing).max(expires_at_unix))
                 .or_insert(expires_at_unix);
         }
-        let removed_ips = self
+        let mut binding = self
             .domain_bindings
-            .get(&domain)
-            .map(|binding| {
-                binding
-                    .ips
-                    .iter()
-                    .filter(|ip| !dedup_expiries.contains_key(ip))
-                    .copied()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .remove(&domain)
+            .unwrap_or_else(|| DomainBinding {
+                domain: domain.clone(),
+                ips: AHashSet::new(),
+                ip_expiries: AHashMap::new(),
+                expires_at_unix: 0,
+                last_refresh_unix: now,
+            });
+        let removed_ips = binding
+            .ips
+            .iter()
+            .filter(|ip| scope.contains(**ip) && !dedup_expiries.contains_key(ip))
+            .copied()
+            .collect::<Vec<_>>();
+        for ip in &removed_ips {
+            binding.ips.remove(ip);
+            binding.ip_expiries.remove(ip);
+        }
         for ip in removed_ips {
             if let Some(key) = self.detach_domain_from_route(&domain, ip, now) {
                 touched_keys.insert(key);
             }
         }
 
-        let mut new_ips = AHashSet::with_capacity(dedup_expiries.len());
         for (ip, expiry) in &dedup_expiries {
-            new_ips.insert(*ip);
+            binding.ips.insert(*ip);
+            binding.ip_expiries.insert(*ip, *expiry);
             if let Some(key) = self.attach_or_refresh_route(&domain, *ip, *expiry, now) {
                 touched_keys.insert(key);
             }
         }
 
-        if dedup_expiries.is_empty() {
-            self.domain_bindings.remove(&domain);
-        } else {
-            let expires_at_unix = dedup_expiries.values().copied().max().unwrap_or(now);
-            self.domain_bindings.insert(
-                domain.clone(),
-                DomainBinding {
-                    domain,
-                    ips: new_ips,
-                    ip_expiries: dedup_expiries,
-                    expires_at_unix,
-                    last_refresh_unix: now,
-                },
-            );
+        if !binding.ips.is_empty() {
+            binding.expires_at_unix = binding.ip_expiries.values().copied().max().unwrap_or(now);
+            binding.last_refresh_unix = now;
+            self.domain_bindings.insert(domain, binding);
         }
 
         touched_keys.into_iter().collect()
@@ -1060,6 +1090,11 @@ impl RouteManager {
         }
     }
 
+    fn prune_expired_local_state(&mut self, now: u64) {
+        self.expire_domain_bindings(now);
+        self.update_route_expiration(now);
+    }
+
     fn recover_domain_binding(
         &mut self,
         domain: String,
@@ -1194,6 +1229,7 @@ impl RouteManager {
             .list_managed_routes(&self.cfg.routing_table)
             .await?;
         let mut seen_keys = AHashSet::new();
+        let mut first_error = None;
 
         for route in rows {
             if is_default_route_dst(&route.dst_address) {
@@ -1224,6 +1260,7 @@ impl RouteManager {
                         err = %error,
                         "ros_route failed to remove stale gateway validation route"
                     );
+                    first_error.get_or_insert(error);
                 }
                 continue;
             }
@@ -1260,6 +1297,23 @@ impl RouteManager {
             else {
                 continue;
             };
+
+            // A route owned by this plugin must not survive after its address
+            // family is disabled in the new configuration. It cannot be
+            // refreshed safely because there is no configured gateway.
+            if self.gateway_for(family).is_none() {
+                if let Err(error) = self.api.delete_route_by_id(&route.id, route.family).await {
+                    warn!(
+                        plugin = %self.cfg.plugin_tag,
+                        route_id = %route.id,
+                        err = %error,
+                        "ros_route failed to remove owned route for disabled address family"
+                    );
+                    first_error.get_or_insert(error);
+                }
+                self.routes.remove(&key);
+                continue;
+            }
             seen_keys.insert(key.clone());
 
             if let Some(existing) = self.routes.get_mut(&key) {
@@ -1315,7 +1369,7 @@ impl RouteManager {
                 continue;
             };
             let expired = meta.expires_at_unix <= now;
-            let persistent_residue = meta.comment_domain == "persistent";
+            let persistent_residue = meta.comment_domain == PERSISTENT_COMMENT_DOMAIN;
             let recover_dynamic_binding = !expired
                 && !persistent_residue
                 && !meta.comment_domain.is_empty()
@@ -1371,6 +1425,10 @@ impl RouteManager {
 
         let keys = self.routes.keys().cloned().collect::<Vec<_>>();
         for key in keys {
+            if self.gateway_for(key.family()).is_none() {
+                self.routes.remove(&key);
+                continue;
+            }
             if seen_keys.contains(&key) {
                 continue;
             }
@@ -1386,31 +1444,37 @@ impl RouteManager {
             }
         }
 
-        self.sync_routes(now).await?;
-        Ok(())
+        if let Err(error) = self.sync_routes(now).await {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(super) async fn observe_domain(
         &mut self,
         domain: String,
+        scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
     ) -> Result<()> {
         let now = unix_now();
-        let touched = self.apply_observation(domain, addrs, now);
+        let touched = self.apply_observation(domain, scope, addrs, now);
         // Keep observations while background initialization is retrying. The
         // first successful reconcile will synchronize all still-live routes.
         if !self.initialized {
+            self.prune_expired_local_state(now);
             return Ok(());
         }
         self.sync_route_keys(touched, now).await
     }
 
     pub(super) async fn sweep(&mut self) -> Result<()> {
-        self.ensure_initialized().await?;
         let now = unix_now();
+        self.prune_expired_local_state(now);
+        self.ensure_initialized().await?;
         self.ensure_persistent_routes(now);
-        self.expire_domain_bindings(now);
-        self.update_route_expiration(now);
         self.sync_routes(now).await
     }
 
@@ -1427,6 +1491,7 @@ impl RouteManager {
     }
 
     pub(super) async fn reconcile(&mut self) -> Result<()> {
+        self.prune_expired_local_state(unix_now());
         self.ensure_initialized().await?;
         self.ensure_persistent_routes(unix_now());
         self.reconcile_from_router().await?;
@@ -1525,10 +1590,11 @@ async fn run_manager_worker(
         match command {
             ManagerCommand::ObserveDomain {
                 domain,
+                scope,
                 addrs,
                 wait,
             } => {
-                let result = manager.observe_domain(domain, addrs).await;
+                let result = manager.observe_domain(domain, scope, addrs).await;
                 match (wait, result) {
                     (Some(ch), outcome) => {
                         let _ = ch.send(outcome);
@@ -1785,6 +1851,7 @@ mod tests {
 
         manager.apply_observation(
             domain.clone(),
+            ObservationScope::Ipv4,
             vec![ObservedAddr {
                 addr: ip,
                 ttl_secs: 60,
@@ -1795,7 +1862,7 @@ mod tests {
         assert_eq!(entry.expires_at_unix, u64::MAX);
         assert_eq!(entry.ref_count, 1);
 
-        manager.apply_observation(domain.clone(), Vec::new(), 101);
+        manager.apply_observation(domain.clone(), ObservationScope::Ipv4, Vec::new(), 101);
         assert!(!manager.domain_bindings.contains_key(&domain));
         let entry = manager
             .routes
@@ -1803,6 +1870,63 @@ mod tests {
             .expect("route state should remain for deletion");
         assert_eq!(entry.ref_count, 0);
         assert_eq!(entry.sync_state, SyncState::PendingDelete);
+    }
+
+    #[test]
+    fn address_family_observations_do_not_withdraw_each_other() {
+        let domain = "example.com.".to_string();
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
+        let ipv6 = "2001:db8::2".parse::<IpAddr>().expect("IPv6 address");
+        let ipv4_key = RouteKey::new(ipv4, "via_proxy".to_string());
+        let ipv6_key = RouteKey::new(ipv6, "via_proxy".to_string());
+        let mut config = manager_config(Some(300));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ipv4,
+                ttl_secs: 60,
+            }],
+            100,
+        );
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv6,
+            vec![ObservedAddr {
+                addr: ipv6,
+                ttl_secs: 60,
+            }],
+            101,
+        );
+
+        let binding = manager
+            .domain_bindings
+            .get(&domain)
+            .expect("dual-stack binding");
+        assert_eq!(binding.ips, AHashSet::from_iter([ipv4, ipv6]));
+        assert_eq!(manager.routes[&ipv4_key].ref_count, 1);
+        assert_eq!(manager.routes[&ipv6_key].ref_count, 1);
+
+        manager.apply_observation(domain.clone(), ObservationScope::Ipv4, Vec::new(), 102);
+
+        let binding = manager
+            .domain_bindings
+            .get(&domain)
+            .expect("IPv6 binding remains");
+        assert_eq!(binding.ips, AHashSet::from_iter([ipv6]));
+        assert_eq!(manager.routes[&ipv4_key].ref_count, 0);
+        assert_eq!(
+            manager.routes[&ipv4_key].sync_state,
+            SyncState::PendingDelete
+        );
+        assert_eq!(manager.routes[&ipv6_key].ref_count, 1);
+        assert_ne!(
+            manager.routes[&ipv6_key].sync_state,
+            SyncState::PendingDelete
+        );
     }
 
     #[tokio::test]
@@ -1816,6 +1940,7 @@ mod tests {
         let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
         manager.apply_observation(
             "example.com.".to_string(),
+            ObservationScope::Ipv4,
             vec![
                 ObservedAddr {
                     addr: failing_ip,
@@ -1849,6 +1974,7 @@ mod tests {
         let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
         manager.apply_observation(
             "example.com.".to_string(),
+            ObservationScope::Ipv4,
             vec![ObservedAddr {
                 addr: ip,
                 ttl_secs: 60,
@@ -1883,6 +2009,71 @@ mod tests {
         assert_eq!(manager.persistent_ips, desired);
     }
 
+    #[test]
+    fn removing_persistent_anchor_preserves_dynamic_route_ownership() {
+        let domain = "example.com.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 15));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let mut config = manager_config(Some(300));
+        config.persistent_ips = AHashSet::from_iter([format!("{ip}/32")]);
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+
+        manager.ensure_persistent_routes(100);
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            101,
+        );
+        assert_eq!(
+            manager.routes[&key].comment_domain,
+            PERSISTENT_COMMENT_DOMAIN
+        );
+        manager.persistent_ips.clear();
+        manager.ensure_persistent_routes(102);
+
+        let route = manager.routes.get(&key).expect("dynamic route remains");
+        assert_eq!(route.ref_count, 1);
+        assert_eq!(route.comment_domain, domain);
+        assert_eq!(route.expires_at_unix, 401);
+        assert!(!route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
+        assert_ne!(route.sync_state, SyncState::PendingDelete);
+    }
+
+    #[tokio::test]
+    async fn initialization_prunes_expired_queued_observations() {
+        AppClock::start();
+        let domain = "expired.example.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 16));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            1,
+        );
+
+        manager.reconcile().await.expect("initial reconcile");
+
+        assert!(!manager.domain_bindings.contains_key(&domain));
+        assert!(!manager.routes.contains_key(&key));
+        assert!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .upsert_attempts
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_recovers_timeless_domain_binding() {
         AppClock::start();
@@ -1906,7 +2097,12 @@ mod tests {
 
         manager.reconcile_from_router().await.expect("reconcile");
         assert!(manager.domain_bindings.contains_key("example.com."));
-        manager.apply_observation("example.com.".to_string(), Vec::new(), 101);
+        manager.apply_observation(
+            "example.com.".to_string(),
+            ObservationScope::Ipv4,
+            Vec::new(),
+            101,
+        );
         let key = RouteKey::new(ip, "via_proxy".to_string());
         assert_eq!(
             manager.routes.get(&key).map(|route| route.sync_state),
@@ -1926,17 +2122,32 @@ mod tests {
             }]
         };
 
-        manager.apply_observation("example.com.".to_string(), observation(), 100);
+        manager.apply_observation(
+            "example.com.".to_string(),
+            ObservationScope::Ipv4,
+            observation(),
+            100,
+        );
         let entry = manager.routes.get_mut(&key).expect("route");
         entry.router_id = Some("*14".to_string());
         entry.sync_state = SyncState::Synced;
         entry.synced_expires_at_unix = Some(400);
         entry.last_refresh_unix = 100;
 
-        manager.apply_observation("example.com.".to_string(), observation(), 101);
+        manager.apply_observation(
+            "example.com.".to_string(),
+            ObservationScope::Ipv4,
+            observation(),
+            101,
+        );
         assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
 
-        manager.apply_observation("example.com.".to_string(), observation(), 251);
+        manager.apply_observation(
+            "example.com.".to_string(),
+            ObservationScope::Ipv4,
+            observation(),
+            251,
+        );
         assert_eq!(manager.routes[&key].sync_state, SyncState::Dirty);
     }
 
@@ -1970,5 +2181,33 @@ mod tests {
             api.state.lock().expect("mock lock").deleted_ids,
             vec!["*validation".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_removes_owned_route_for_disabled_address_family() {
+        AppClock::start();
+        let ip = "2001:db8::17".parse::<IpAddr>().expect("IPv6 address");
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*disabled-v6".to_string(),
+                family: RouteFamily::Ipv6,
+                dst_address: format!("{ip}/128"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("2001:db8::1".to_string()),
+                distance: Some(100),
+                comment: Some(format!(
+                    "fdns;pg=route-test;dm=example.com.;exp={};seen=100",
+                    u64::MAX
+                )),
+            }],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        let state = api.state.lock().expect("mock lock");
+        assert_eq!(state.deleted_ids, vec!["*disabled-v6".to_string()]);
+        assert!(state.routes.is_empty());
     }
 }

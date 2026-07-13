@@ -52,7 +52,7 @@ use crate::infra::observability::metrics::{
 };
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
-use crate::proto::Rcode;
+use crate::proto::{Rcode, RecordType};
 use crate::{continue_next, plugin_factory};
 
 const DEFAULT_MIN_TTL: u32 = 60;
@@ -246,8 +246,8 @@ use self::api::{
     MikrotikApi, MikrotikApiTimeouts, MikrotikRsClient,
 };
 use self::manager::{
-    ManagerCommand, ObservedAddr, PersistentReloadConfig, RouteManager, RouteManagerConfig,
-    RouteManagerRuntime,
+    ManagerCommand, ObservationScope, ObservedAddr, PersistentReloadConfig, RouteManager,
+    RouteManagerConfig, RouteManagerRuntime,
 };
 
 #[derive(Debug)]
@@ -379,7 +379,7 @@ impl Executor for MikrotikExecutor {
             return Ok(step);
         };
 
-        let Some((domain, addrs)) = extract_observation(context, &self.config) else {
+        let Some((domain, scope, addrs)) = extract_observation(context, &self.config) else {
             return Ok(step);
         };
         self.metrics.observe_total.fetch_add(1, Ordering::Relaxed);
@@ -387,6 +387,7 @@ impl Executor for MikrotikExecutor {
         if self.config.async_mode {
             match tx.try_send(ManagerCommand::ObserveDomain {
                 domain,
+                scope,
                 addrs,
                 wait: None,
             }) {
@@ -412,6 +413,7 @@ impl Executor for MikrotikExecutor {
         let (wait_tx, wait_rx) = oneshot::channel::<Result<()>>();
         let send_cmd = ManagerCommand::ObserveDomain {
             domain,
+            scope,
             addrs,
             wait: Some(wait_tx),
         };
@@ -532,11 +534,15 @@ impl PluginFactory for MikrotikFactory {
 fn extract_observation(
     context: &mut DnsContext,
     config: &MikrotikConfig,
-) -> Option<(String, Vec<ObservedAddr>)> {
-    let domain = context
-        .request
-        .first_question()
-        .map(|question| question.name().normalized().to_string())?;
+) -> Option<(String, ObservationScope, Vec<ObservedAddr>)> {
+    let question = context.request.first_question()?;
+    let domain = question.name().normalized().to_string();
+    let scope = match question.qtype() {
+        RecordType::A => ObservationScope::Ipv4,
+        RecordType::AAAA => ObservationScope::Ipv6,
+        RecordType::ANY => ObservationScope::Both,
+        _ => return None,
+    };
 
     let response = context.response()?;
     if response.rcode() != Rcode::NoError {
@@ -549,6 +555,9 @@ fn extract_observation(
         let Some(ip) = answer.ip_addr() else {
             continue;
         };
+        if !scope.contains(ip) {
+            continue;
+        }
         let ttl_secs = answer.ttl();
         match ip {
             IpAddr::V4(_) if config.gateway4.is_none() => continue,
@@ -566,7 +575,7 @@ fn extract_observation(
         .into_iter()
         .map(|(addr, ttl_secs)| ObservedAddr { addr, ttl_secs })
         .collect::<Vec<_>>();
-    Some((domain, addrs))
+    Some((domain, scope, addrs))
 }
 
 fn parse_plugin_config(args: Option<Value>, emit_warnings: bool) -> Result<MikrotikConfig> {
@@ -899,7 +908,41 @@ fn is_persistent_ip_family_enabled(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
+    use crate::proto::{DNSClass, Message, Name, Question};
+
+    fn observation_config() -> MikrotikConfig {
+        let args = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "127.0.0.1:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+gateway6: "2001:db8::1"
+"#,
+        )
+        .expect("yaml");
+        parse_plugin_config(Some(args), false).expect("config")
+    }
+
+    fn context_with_nodata(qtype: RecordType) -> DnsContext {
+        let mut request = Message::new();
+        request.add_question(Question::new(
+            Name::from_ascii("example.com.").expect("domain"),
+            qtype,
+            DNSClass::IN,
+        ));
+        let response = request.response(Rcode::NoError);
+        let mut context = DnsContext::new(
+            "127.0.0.1:5353".parse::<SocketAddr>().expect("client"),
+            request,
+        );
+        context.set_response(response);
+        context
+    }
 
     #[test]
     fn fixed_ttl_zero_is_accepted() {
@@ -930,5 +973,18 @@ routing_table: "policy"
         )
         .expect("yaml");
         assert!(parse_plugin_config(Some(args), false).is_err());
+    }
+
+    #[test]
+    fn observation_ignores_non_address_queries_and_scopes_nodata() {
+        let config = observation_config();
+        let mut txt_context = context_with_nodata(RecordType::TXT);
+        assert!(extract_observation(&mut txt_context, &config).is_none());
+
+        let mut a_context = context_with_nodata(RecordType::A);
+        let (_, scope, addrs) =
+            extract_observation(&mut a_context, &config).expect("A NODATA observation");
+        assert_eq!(scope, ObservationScope::Ipv4);
+        assert!(addrs.is_empty());
     }
 }
