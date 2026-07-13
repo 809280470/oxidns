@@ -144,6 +144,22 @@ export const enUSDocs = {
     short_circuit:
       "- Type: `bool`; required: no; default value: `false`\n- Function: After hitting and generating a local response, whether to stop the subsequent executor chain immediately.\n- Note: By default, only response is set and execution continues; when explicitly enabled, `Stop` is returned.",
   },
+  response: {
+    rcode:
+      "- Type: `string` or `number`; Required: No; Default: `NOERROR`\n- Function: Set a base DNS RCODE; only `0..15` is supported.",
+    answers:
+      "- Type: `array`; Required: No; Default: empty array\n- Every item must be one zone-style RR: `<owner> <ttl> <class> <type> <rdata>`.",
+    authorities:
+      "- Type: `array`; Required: No; Default: empty array\n- Every item must be one zone-style RR. Put SOA here for NODATA negative caching.",
+    additionals:
+      "- Type: `array`; Required: No; Default: empty array\n- Every item must be one zone-style RR.",
+    authoritative:
+      "- Type: `bool`; Required: No; Default: `false`\n- Function: Set the AA flag.",
+    authentic_data:
+      "- Type: `bool`; Required: No; Default: `false`\n- Function: Set the AD flag.",
+    short_circuit:
+      "- Type: `bool`; Required: No; Default: `true`\n- Function: Stop the current executor chain after setting the response.",
+  },
   redirect: {
     rules:
       "- Type: `array`; Required: No; Default: empty array\n- Function: Define inline redirection rules.\n- Rule format:\n  - `<domain name rule> <target domain name>`\n- `<Domain Name Rules>` supports:\n  - `full:`\n  - `domain:`\n  - `keyword:`\n  - `regexp:`\n  - Unprefixed domain name (processed by `full:` exact match)\n- Instructions for use: `redirect` itself does not resolve the target domain name. It usually needs to be used before `forward` in `sequence`, and `forward` generates the real response of the target domain name.",

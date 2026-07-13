@@ -636,6 +636,58 @@ export const zhCNPluginDefined = {
         },
       },
     },
+    response: {
+      name: "Response",
+      description: "构造并覆盖完整 DNS 响应，可分别配置三个记录区段",
+      fields: {
+        rcode: {
+          label: "响应码",
+          description: "基础 DNS RCODE，支持十进制数字或大小写不敏感的助记名。",
+          placeholder: "NOERROR / NXDOMAIN / 3",
+        },
+        authoritative: {
+          label: "权威应答 (AA)",
+          description: "设置 DNS 响应的 Authoritative Answer 标志。",
+        },
+        authentic_data: {
+          label: "已验证数据 (AD)",
+          description: "设置 DNS 响应的 Authentic Data 标志。",
+        },
+        answers: {
+          label: "Answer 记录",
+          description: "每项一条 zone 风格 RR；{qname} 和 {qclass} 分别引用首个查询名称和类别。",
+          placeholder: "{qname} 300 {qclass} A 192.0.2.10",
+        },
+        "answers[]": {
+          label: "输入值",
+          placeholder: "{qname} 300 {qclass} A 192.0.2.10",
+        },
+        authorities: {
+          label: "Authority 记录",
+          description: "每项一条 zone 风格 RR；NODATA 负缓存通常在此处配置 SOA。",
+          placeholder:
+            "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300",
+        },
+        "authorities[]": {
+          label: "输入值",
+          placeholder:
+            "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300",
+        },
+        additionals: {
+          label: "Additional 记录",
+          description: "每项一条 zone 风格 RR。",
+          placeholder: "mail.example.com. 300 IN A 192.0.2.25",
+        },
+        "additionals[]": {
+          label: "输入值",
+          placeholder: "mail.example.com. 300 IN A 192.0.2.25",
+        },
+        short_circuit: {
+          label: "生成后停止后续执行",
+          description: "默认立即终止当前 executor 链；关闭后继续执行后续规则。",
+        },
+      },
+    },
     redirect: {
       name: "Redirect",
       description: "改写请求域名，配合 forward 生成目标响应",

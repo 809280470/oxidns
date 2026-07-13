@@ -66,6 +66,8 @@ pub(crate) mod rdata_json;
 pub mod redirect;
 pub mod reload;
 pub mod reload_provider;
+#[cfg(feature = "plugin-response")]
+pub mod response;
 #[cfg(feature = "plugin-reverse-lookup")]
 pub mod reverse_lookup;
 #[cfg(feature = "plugin-mikrotik")]

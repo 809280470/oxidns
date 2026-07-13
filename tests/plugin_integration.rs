@@ -36,11 +36,13 @@ use oxidns::infra::network::transport::udp::UdpTransport;
 use oxidns::plugin;
 use oxidns::plugin::executor::ExecStep;
 use oxidns::plugin::{PluginRegistry, PluginType};
+#[cfg(any(feature = "plugin-dynamic-domain", feature = "plugin-response"))]
+use oxidns::proto::RData;
+#[cfg(feature = "plugin-dynamic-domain")]
+use oxidns::proto::Record;
 #[cfg(feature = "plugin-dynamic-domain")]
 use oxidns::proto::rdata::A;
 use oxidns::proto::{DNSClass, Message, Name, Question, Rcode, RecordType};
-#[cfg(feature = "plugin-dynamic-domain")]
-use oxidns::proto::{RData, Record};
 use tempfile::TempDir;
 #[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1155,6 +1157,59 @@ plugins:
     assert_eq!(response.rcode(), Rcode::NoError);
     assert!(response.answers().is_empty());
     assert!(response.authorities().is_empty());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-response")]
+#[tokio::test]
+async fn test_response_plugin_builds_soa_backed_nodata() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: suppress_https
+    type: response
+    args:
+      rcode: NOERROR
+      authorities:
+        - "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300"
+  - tag: seq
+    type: sequence
+    args:
+      - matches: qtype HTTPS
+        exec: $suppress_https
+      - exec: reject SERVFAIL
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "apple.com.", RecordType::HTTPS);
+
+    assert!(matches!(
+        sequence.execute(&mut context).await?,
+        ExecStep::Stop
+    ));
+    let response = context
+        .response()
+        .expect("response plugin should set a response");
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.answers().is_empty());
+    assert_eq!(response.authorities().len(), 1);
+    let soa = &response.authorities()[0];
+    assert_eq!(soa.name(), &Name::from_ascii("apple.com.")?);
+    assert_eq!(soa.class(), DNSClass::IN);
+    assert_eq!(soa.rr_type(), RecordType::SOA);
+    assert_eq!(soa.ttl(), 300);
+    let RData::SOA(soa_rdata) = soa.data() else {
+        panic!("authority record should carry SOA data");
+    };
+    assert_eq!(soa_rdata.minimum(), 300);
 
     registry.destroy().await;
     Ok(())
