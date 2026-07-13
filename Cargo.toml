@@ -186,6 +186,7 @@ full = [
     "resolver-doh3",
     "upstream-doh3",
     "plugin-mikrotik",
+    "plugin-ros-route",
     "plugin-ipset",
 ]
 
@@ -251,6 +252,9 @@ upstream-doh3 = ["upstream-doh", "_dns-client-doh3"]
 
 # `ros_address_list` executor (MikroTik RouterOS API integration).
 plugin-mikrotik = ["dep:mikrotik-rs"]
+
+# `ros_route` executor (MikroTik RouterOS dynamic-route integration).
+plugin-ros-route = ["dep:mikrotik-rs"]
 
 # `query_recorder` executor backed by bundled SQLite. Its management API
 # surface is part of the build, hence the `api` requirement.

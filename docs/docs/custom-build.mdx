@@ -82,7 +82,7 @@ hyper / rustls / quinn / h2 / h3 / sqlite / zoneparser,是体积最小的组合�
 **额外包含**
 
 - 入站 / 上游:DoH HTTP/3
-- Executor:`ros_address_list`(MikroTik)、`ipset`、`nftset`
+- Executor:`ros_address_list` / `ros_route` (MikroTik)、`ipset`、`nftset`
 
 ### 官方发布物对照
 
@@ -141,6 +141,7 @@ upstream-dot`,而不是直接崩溃。
 | Feature | 插件 | 主要依赖 |
 |---|---|---|
 | `plugin-mikrotik` | `ros_address_list` | `mikrotik-rs` |
+| `plugin-ros-route` | `ros_route` | `mikrotik-rs` |
 | `plugin-query-recorder` | `query_recorder` | `rusqlite`(bundled SQLite) |
 | `plugin-ipset` | `ipset` + `nftset` | `ripset`(Linux only) |
 | `plugin-cron` | `cron` | `cronexpr` |

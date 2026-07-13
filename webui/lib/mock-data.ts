@@ -275,6 +275,7 @@ export const pluginKinds: Record<string, string[]> = {
     "ipset",
     "nftset",
     "ros_address_list",
+    "ros_route",
     "upgrade",
     "download",
     "reload_provider",
