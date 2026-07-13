@@ -7,27 +7,38 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 
 # Release Notes
 
-## 2026-06
+## 2026-07
 
 <div className="release-stack">
    <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-10" defaultOpen>
        **Release Scope**
 
-       - Minor Release. Plugin `tag` is now a safe, readable machine identifier in management API paths, removing ambiguity caused by special path characters across browsers, reverse proxies, and HTTP implementations.
+       - Minor Release. v1.5.0 makes DNS response handling query-aware: `forward` and `cache` follow the original QNAME's CNAME chain before accepting a requested type, preventing incomplete alias responses from winning incorrectly or entering A/AAAA cache keys.
+       - The release also includes ARMv7 delivery support, OpenWrt LuCI lifecycle support, an Alpine Docker image, WebUI editor improvements, API path canonicalization, and safer plugin-tag validation.
 
        **Changes**
 
-       - `fix(config)` / `fix(api)`: constrain `plugins[].tag` to 1 through 64 ASCII characters; allow letters, digits, `_`, `-`, and dot-separated segments; reject empty segments, `.`, `..`, boundary separators, and path-special characters. The API remains `/api/plugins/{tag}/...`.
-       - `fix(webui)`: plugin creation, rename, and the YAML editor report precise tag errors and locate the affected value; the WebUI gains tag-rule tests.
-       - `test(ci)`: add Rust/API/WebUI boundary coverage and run WebUI lint, test, typecheck, and build in CI.
+       - `fix(dns)`: add a shared response classifier for complete positives, definitive negatives, incomplete aliases, and other responses. Requested RRs must belong to the original QNAME or its CNAME-chain terminal instead of merely appearing somewhere in Answer, with one Answer scan per CNAME hop.
+       - `fix(forward)`: `balanced`, `prefer_positive`, and `consensus` prefer complete CNAME-chain answers. Bare CNAME responses cannot win early or vote as negatives, but are preserved when no better response exists. `CNAME + SOA` is recognized as NODATA; selected dispositions are reused, while single-upstream and `fastest` paths avoid metric-only response scans.
+       - `fix(cache)`: bare CNAME responses no longer populate A/AAAA and similar address-query keys. Admission and dump/load validate QNAME/QTYPE/QCLASS, while alias-NODATA lifetime is capped by the lowest SOA, Answer (including CNAME), and configured TTL. Admission, lazy refresh, and persistence reuse one classification, and a new `incomplete_answer` cache skip reason is exported.
+       - `feat(release)`: add ARMv7 targets and normalize published target selection; switch Docker images to Alpine; add the full OpenWrt LuCI application lifecycle.
+       - `fix(config/api)`: unsafe or reserved quick-setup plugin tags are rejected. API plugin routes canonically URL-encode special characters to prevent path ambiguity.
+       - `fix(webui)`: migrate the YAML configuration editor to CodeMirror and improve editing behavior; keep frontend plugin-tag route handling aligned with backend encoding.
+       - `deps/ci`: update dependencies and GitHub Actions caching, including a nightly Clippy compatibility fix for proto chunks.
 
        **Compatibility and Upgrade Notes**
 
-       - This is a breaking configuration change. Before upgrading, run `oxidns check -c config.yaml` with the new binary.
-       - Historical tags containing whitespace, non-ASCII text, slashes, percent signs, leading/trailing dots, consecutive dots, or leading/trailing `_` / `-` must be renamed. Update every `$tag`, `jump/goto`, and plugin reference at the same time.
-       - `qs.exec.`, `qs.match.`, and `qs.cron.` are reserved Quick Setup prefixes and cannot be used in user configuration.
+       - The root crate version is `1.5.0`; `oxidns-proto` is updated to `0.1.4`; the release tag should be `v1.5.0`.
+       - No required YAML fields are added. `forward.concurrent` still means the number of upstreams started for the current request: `concurrent: 1` does not retry unstarted upstreams. An incomplete CNAME response can still be returned when no better result exists, but is never cached as an address answer.
+       - **Compatibility note**: unsafe plugin tags and reserved quick-setup tags now fail configuration validation. Run `oxidns check` before upgrading and rename affected plugin tags if needed.
+       - Deployments using cache dumps can upgrade directly. Legacy CNAME-only address entries are discarded while loading or validating cache entries so they cannot continue serving incomplete address answers.
+       - Container and ARM deployments should validate the new Alpine or ARMv7 release artifacts before replacing a production binary.
    </ReleaseCard>
+</div>
 
+## 2026-06
+
+<div className="release-stack">
    <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24">
        **Release Scope**
 

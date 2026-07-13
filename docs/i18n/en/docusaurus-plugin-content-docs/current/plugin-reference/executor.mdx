@@ -198,6 +198,7 @@ Sends DNS queries to upstreams.
 - Type: `integer`; Required: no; Default: `1`
 - Runtime range is clamped to `1..=32` and never exceeds the upstream count.
 - Purpose: Number of concurrent upstream fan-out requests.
+- This is the number of upstreams actually started for one request. OxiDNS does not sequentially retry unstarted upstreams after a CNAME-only response, so `concurrent: 1` retains single-attempt selection semantics.
 - Recommendation: use `2..=8` for routine racing; higher values are intended for short-term observation or explicit multi-protocol racing.
 
 #### `response_selection`
@@ -207,9 +208,16 @@ Sends DNS queries to upstreams.
 - Purpose: Selects the winning response when concurrent upstreams return different results.
 - Modes:
   - `fastest`: the first successful DNS response wins; transport errors never win.
-  - `balanced`: default mode. `NOERROR` with answers wins immediately; `NXDOMAIN` or NODATA waits briefly for a positive answer.
+  - `balanced`: default mode. A complete answer whose requested type belongs to the original QNAME or its CNAME-chain terminal wins immediately; `NXDOMAIN` or NODATA waits briefly for a positive answer.
   - `prefer_positive`: positive answers win immediately; negative answers wait until all started concurrent upstreams finish.
   - `consensus`: positive answers win immediately; negative answers require two upstream confirmations, falling back to `prefer_positive` when fan-out is too small.
+
+#### CNAME response handling
+
+- For A/AAAA and other non-CNAME queries, a positive response requires the requested type at the original QNAME or the terminal name of its CNAME chain.
+- A CNAME-only response without the requested type or an SOA is an incomplete alias. It cannot win early or vote as a negative result, but is returned unchanged when no better response exists.
+- `CNAME + SOA` without the requested type is treated as NODATA. `NXDOMAIN` remains negative even when its answer section contains CNAME records.
+- `forward` does not perform hidden fallback or CNAME chasing. Raise `concurrent` for explicit racing, or compose a `fallback` policy when that behavior is required.
 
 #### `upstreams`
 
@@ -369,8 +377,11 @@ Exported through the global `GET /api/metrics` endpoint:
 - `forward_success_total`
 - `forward_error_total`
 - `forward_timeout_total`
+- `forward_incomplete_alias_selected_total`
 - `forward_latency_count`
 - `forward_latency_sum_ms`
+
+`forward_incomplete_alias_selected_total` only covers selection-aware concurrent modes (`balanced`, `prefer_positive`, and `consensus`). Single-upstream and `fastest` paths do not scan responses solely for this metric.
 
 Per-upstream series are also exported with an `upstream` label (the upstream tag, or its resolved address when no tag is configured):
 
@@ -400,6 +411,8 @@ Per-upstream series are also exported with an `upstream` label (the upstream tag
 ### Purpose
 
 Provides TTL-aware response caching with negative cache support and persistence.
+
+For A/AAAA and other non-CNAME queries, cache admission requires the requested type at the original QNAME or the terminal name of its CNAME chain, and the echoed QNAME/QTYPE/QCLASS must match the cache key. A bare CNAME response is not stored under the address-query key. `CNAME + NODATA` with an SOA is negative-cached for the minimum of the SOA negative TTL, the lowest Answer TTL (including CNAME), and the configured cap.
 
 ### Example Configuration
 
@@ -531,7 +544,7 @@ Exported through the global `GET /api/metrics` endpoint. The cache plugin does n
 - `cache_miss_total`
 - `cache_expired_total`
 - `cache_insert_total`
-- `cache_skip_total{reason="truncated|no_ttl|low_positive_ttl"}`
+- `cache_skip_total{reason="truncated|no_ttl|incomplete_answer|low_positive_ttl"}`
 - `cache_lazy_refresh_total{result="started|success|failed"}`
 - `cache_entry_count`
 

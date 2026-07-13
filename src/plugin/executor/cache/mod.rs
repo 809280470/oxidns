@@ -22,6 +22,7 @@ use self::key::{CacheKey, build_cache_key as build_cache_key_internal};
 use self::persistence::{dump_cache_to_file, load_cache_from_file};
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
+use crate::core::response::{ResponseDisposition, classify_response};
 use crate::infra::cache::ttl::{TtlCache, TtlCacheLookup};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -32,7 +33,7 @@ use crate::infra::observability::metrics::{
 use crate::infra::task as task_center;
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
-use crate::proto::{Message, Rcode, RecordType};
+use crate::proto::{Message, RData};
 use crate::{continue_next, plugin_factory};
 
 #[cfg(feature = "api")]
@@ -135,15 +136,42 @@ pub struct CacheItem {
 
     /// Deadline when the response transitions from fresh to stale.
     fresh_until_ms: u64,
+
+    /// Whether cache admission or persistence loading has already validated
+    /// this response against its query key.
+    validation: CacheEntryValidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheEntryValidation {
+    Validated,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Unknown,
 }
 
 impl CacheItem {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(resp: Message, ttl: u32, fresh_until_ms: u64) -> Self {
         Self {
             resp,
             ttl,
             fresh_until_ms,
+            validation: CacheEntryValidation::Unknown,
         }
+    }
+
+    fn new_validated(resp: Message, ttl: u32, fresh_until_ms: u64) -> Self {
+        Self {
+            resp,
+            ttl,
+            fresh_until_ms,
+            validation: CacheEntryValidation::Validated,
+        }
+    }
+
+    #[inline]
+    fn is_validated(&self) -> bool {
+        self.validation == CacheEntryValidation::Validated
     }
 }
 
@@ -156,6 +184,7 @@ enum CacheHitKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheSkipReason {
     NoTtl,
+    IncompleteAnswer,
     LowPositiveTtl,
 }
 
@@ -191,6 +220,7 @@ struct CacheMetrics {
     insert_total: AtomicU64,
     skip_truncated_total: AtomicU64,
     skip_no_ttl_total: AtomicU64,
+    skip_incomplete_answer_total: AtomicU64,
     skip_low_positive_ttl_total: AtomicU64,
     lazy_refresh_started_total: AtomicU64,
     lazy_refresh_success_total: AtomicU64,
@@ -210,6 +240,7 @@ impl CacheMetrics {
             insert_total: AtomicU64::new(0),
             skip_truncated_total: AtomicU64::new(0),
             skip_no_ttl_total: AtomicU64::new(0),
+            skip_incomplete_answer_total: AtomicU64::new(0),
             skip_low_positive_ttl_total: AtomicU64::new(0),
             lazy_refresh_started_total: AtomicU64::new(0),
             lazy_refresh_success_total: AtomicU64::new(0),
@@ -225,6 +256,10 @@ impl CacheMetrics {
         match reason {
             CacheSkipReason::NoTtl => {
                 self.skip_no_ttl_total.fetch_add(1, Ordering::Relaxed);
+            }
+            CacheSkipReason::IncompleteAnswer => {
+                self.skip_incomplete_answer_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
             CacheSkipReason::LowPositiveTtl => {
                 self.skip_low_positive_ttl_total
@@ -308,6 +343,16 @@ impl MetricSource for CacheMetrics {
             "Total responses skipped by cache write policy.",
             &skip_no_ttl,
             self.skip_no_ttl_total.load(Ordering::Relaxed),
+        ));
+        let skip_incomplete_answer = [
+            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("reason", "incomplete_answer"),
+        ];
+        sink.emit(MetricSample::counter(
+            "cache_skip_total",
+            "Total responses skipped by cache write policy.",
+            &skip_incomplete_answer,
+            self.skip_incomplete_answer_total.load(Ordering::Relaxed),
         ));
         let skip_low_positive_ttl = [
             MetricLabel::new("plugin_tag", self.tag.as_str()),
@@ -783,15 +828,6 @@ impl Cache {
     }
 
     #[inline]
-    fn can_lazy_cache_response(&self, response: &Message, record_type: RecordType) -> bool {
-        self.config.lazy_cache_ttl.is_some()
-            && matches!(
-                self.compute_positive_ttl(response, record_type),
-                CacheTtlDecision::Cache(_)
-            )
-    }
-
-    #[inline]
     fn compute_fresh_until_ms(now: u64, ttl: u32) -> u64 {
         now.saturating_add(u64::from(ttl) * 1000)
     }
@@ -815,14 +851,21 @@ impl Cache {
 
         match cache_map.get_retained_cloned_status(&key, now, touch_interval_ms) {
             Some(TtlCacheLookup::Hit(item)) => {
-                if !is_cache_entry_response_valid(&item.value.resp, key.record_type) {
+                let invalid_disposition = if item.value.is_validated() {
+                    None
+                } else {
+                    let disposition = response_disposition_for_cache(&item.value.resp, &key);
+                    (!is_cache_disposition_valid(disposition)).then_some(disposition)
+                };
+                if let Some(disposition) = invalid_disposition {
                     if cache_map.remove_if(&key, |existing| {
                         existing.cache_time_ms == item.cache_time_ms
                             && existing.expire_at_ms == item.expire_at_ms
                             && Arc::ptr_eq(&existing.value, &item.value)
                     }) {
                         self.updated_keys.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.record_skip(CacheSkipReason::NoTtl);
+                        self.metrics
+                            .record_skip(cache_skip_reason_for_disposition(disposition));
                         debug!(
                             "evicted invalid cache entry: domain={}, type={:?}, class={:?}, do={}, cd={}, ecs={}",
                             key.domain,
@@ -956,12 +999,12 @@ impl Cache {
     }
 
     #[inline]
-    fn compute_positive_ttl(
+    fn compute_positive_ttl_for_disposition(
         &self,
         response: &Message,
-        record_type: RecordType,
+        disposition: ResponseDisposition,
     ) -> CacheTtlDecision {
-        if !is_complete_positive_response(response, record_type) {
+        if !disposition.is_complete_positive() {
             return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
         }
 
@@ -988,55 +1031,82 @@ impl Cache {
     }
 
     #[inline]
-    fn compute_negative_ttl(&self, response: &Message) -> Option<u32> {
+    fn compute_negative_ttl_for_disposition(
+        &self,
+        response: &Message,
+        key: &CacheKey,
+        disposition: ResponseDisposition,
+    ) -> Option<u32> {
         if !self.cache_negative {
             return None;
         }
 
-        let rcode = response.rcode();
-        let is_nxdomain = rcode == Rcode::NXDomain;
-        let is_nodata = rcode == Rcode::NoError && response.min_answer_ttl().is_none();
+        disposition.negative_kind()?;
 
-        if !is_nxdomain && !is_nodata {
-            return None;
-        }
-
-        let mut ttl = if let Some(soa_ttl) = response.negative_ttl_from_soa() {
+        let mut ttl = if let Some(soa_ttl) = negative_ttl_from_soa_for_key(response, key) {
             soa_ttl
         } else {
             self.negative_ttl_without_soa
         };
 
+        if let Some(answer_ttl) = min_answer_ttl_for_key(response, key) {
+            ttl = ttl.min(answer_ttl);
+        }
         ttl = ttl.min(self.max_negative_ttl);
 
         if ttl == 0 { None } else { Some(ttl) }
     }
 
     #[inline]
-    fn compute_cache_ttl(&self, response: &Message, record_type: RecordType) -> CacheTtlDecision {
-        match self.compute_positive_ttl(response, record_type) {
-            CacheTtlDecision::Cache(ttl) => CacheTtlDecision::Cache(ttl),
-            CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl) => {
-                CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
+    fn compute_cache_ttl_for_disposition(
+        &self,
+        response: &Message,
+        key: &CacheKey,
+        disposition: ResponseDisposition,
+    ) -> CacheTtlDecision {
+        match disposition {
+            ResponseDisposition::CompletePositive => {
+                self.compute_positive_ttl_for_disposition(response, disposition)
             }
-            CacheTtlDecision::Skip(CacheSkipReason::NoTtl) => {
-                if let Some(ttl) = self.compute_negative_ttl(response) {
-                    CacheTtlDecision::Cache(ttl)
-                } else {
-                    CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
-                }
+            ResponseDisposition::DefinitiveNegative(_) => self
+                .compute_negative_ttl_for_disposition(response, key, disposition)
+                .map(CacheTtlDecision::Cache)
+                .unwrap_or(CacheTtlDecision::Skip(CacheSkipReason::NoTtl)),
+            ResponseDisposition::IncompleteAlias => {
+                CacheTtlDecision::Skip(CacheSkipReason::IncompleteAnswer)
             }
+            ResponseDisposition::Other => CacheTtlDecision::Skip(CacheSkipReason::NoTtl),
         }
+    }
+
+    #[cfg(test)]
+    fn compute_negative_ttl(&self, response: &Message, key: &CacheKey) -> Option<u32> {
+        let disposition = response_disposition_for_cache(response, key);
+        self.compute_negative_ttl_for_disposition(response, key, disposition)
+    }
+
+    #[cfg(test)]
+    fn compute_cache_ttl(&self, response: &Message, key: &CacheKey) -> CacheTtlDecision {
+        let disposition = response_disposition_for_cache(response, key);
+        self.compute_cache_ttl_for_disposition(response, key, disposition)
     }
 
     #[inline]
     #[hotpath::measure]
-    fn update_cache_entry(&self, cache_map: &CacheMap, key: CacheKey, response: Message, ttl: u32) {
+    fn update_cache_entry(
+        &self,
+        cache_map: &CacheMap,
+        key: CacheKey,
+        response: Message,
+        ttl: u32,
+        disposition: ResponseDisposition,
+    ) {
         let now = AppClock::elapsed_millis();
         let fresh_until_ms = Self::compute_fresh_until_ms(now, ttl);
-        let enable_lazy = self.can_lazy_cache_response(&response, key.record_type);
+        let enable_lazy =
+            self.config.lazy_cache_ttl.is_some() && disposition.is_complete_positive();
         let expire_time = self.compute_expire_time(now, ttl, enable_lazy);
-        let item = CacheItem::new(response, ttl, fresh_until_ms);
+        let item = CacheItem::new_validated(response, ttl, fresh_until_ms);
         debug!(
             "cached: domain={}, type={:?}, class={:?}, ttl={}",
             key.domain, key.record_type, key.dns_class, ttl
@@ -1096,9 +1166,9 @@ impl Cache {
 
             match refresh {
                 Ok(Ok(Some(response))) if !response.truncated() => {
-                    let ttl = compute_cache_ttl_with_policy(
+                    let (ttl, disposition) = compute_cache_ttl_with_policy(
                         &response,
-                        key.record_type,
+                        &key,
                         max_positive_ttl,
                         min_positive_ttl,
                         cache_negative,
@@ -1108,16 +1178,8 @@ impl Cache {
                     if let CacheTtlDecision::Cache(ttl) = ttl {
                         let now = AppClock::elapsed_millis();
                         let fresh_until_ms = Cache::compute_fresh_until_ms(now, ttl);
-                        let enable_lazy = lazy_cache_ttl.is_some()
-                            && matches!(
-                                compute_positive_ttl_with_policy(
-                                    &response,
-                                    key.record_type,
-                                    max_positive_ttl,
-                                    min_positive_ttl
-                                ),
-                                CacheTtlDecision::Cache(_)
-                            );
+                        let enable_lazy =
+                            lazy_cache_ttl.is_some() && disposition.is_complete_positive();
                         let expire_at_ms = if enable_lazy {
                             now.saturating_add(
                                 u64::from(ttl.max(lazy_cache_ttl.unwrap_or(ttl))) * 1000,
@@ -1127,7 +1189,7 @@ impl Cache {
                         };
                         cache_map.insert_or_update(
                             key.clone(),
-                            Arc::new(CacheItem::new(response, ttl, fresh_until_ms)),
+                            Arc::new(CacheItem::new_validated(response, ttl, fresh_until_ms)),
                             now,
                             expire_at_ms,
                         );
@@ -1330,9 +1392,10 @@ impl Executor for Cache {
                 return Ok(next_step);
             }
 
-            match self.compute_cache_ttl(response, key.record_type) {
+            let disposition = response_disposition_for_cache(response, &key);
+            match self.compute_cache_ttl_for_disposition(response, &key, disposition) {
                 CacheTtlDecision::Cache(ttl) => {
-                    self.update_cache_entry(cache_map, key, response.clone(), ttl);
+                    self.update_cache_entry(cache_map, key, response.clone(), ttl, disposition);
                 }
                 CacheTtlDecision::Skip(reason) => {
                     self.metrics.record_skip(reason);
@@ -1345,14 +1408,9 @@ impl Executor for Cache {
 
 fn compute_positive_ttl_with_policy(
     response: &Message,
-    record_type: RecordType,
     max_positive_ttl: Option<u32>,
     min_positive_ttl: Option<u32>,
 ) -> CacheTtlDecision {
-    if !is_complete_positive_response(response, record_type) {
-        return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
-    }
-
     let Some(ttl) = response.min_answer_ttl() else {
         return CacheTtlDecision::Skip(CacheSkipReason::NoTtl);
     };
@@ -1372,6 +1430,7 @@ fn compute_positive_ttl_with_policy(
 
 fn compute_negative_ttl_with_policy(
     response: &Message,
+    key: &CacheKey,
     cache_negative: bool,
     max_negative_ttl: u32,
     negative_ttl_without_soa: u32,
@@ -1380,43 +1439,33 @@ fn compute_negative_ttl_with_policy(
         return None;
     }
 
-    let rcode = response.rcode();
-    let is_nxdomain = rcode == Rcode::NXDomain;
-    let is_nodata = rcode == Rcode::NoError && response.min_answer_ttl().is_none();
-
-    if !is_nxdomain && !is_nodata {
-        return None;
-    }
-
-    let ttl = response
-        .negative_ttl_from_soa()
+    let mut ttl = negative_ttl_from_soa_for_key(response, key)
         .unwrap_or(negative_ttl_without_soa)
         .min(max_negative_ttl);
+    if let Some(answer_ttl) = min_answer_ttl_for_key(response, key) {
+        ttl = ttl.min(answer_ttl);
+    }
     if ttl == 0 { None } else { Some(ttl) }
 }
 
 fn compute_cache_ttl_with_policy(
     response: &Message,
-    record_type: RecordType,
+    key: &CacheKey,
     max_positive_ttl: Option<u32>,
     min_positive_ttl: Option<u32>,
     cache_negative: bool,
     max_negative_ttl: u32,
     negative_ttl_without_soa: u32,
-) -> CacheTtlDecision {
-    match compute_positive_ttl_with_policy(
-        response,
-        record_type,
-        max_positive_ttl,
-        min_positive_ttl,
-    ) {
-        CacheTtlDecision::Cache(ttl) => CacheTtlDecision::Cache(ttl),
-        CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl) => {
-            CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
+) -> (CacheTtlDecision, ResponseDisposition) {
+    let disposition = response_disposition_for_cache(response, key);
+    let decision = match disposition {
+        ResponseDisposition::CompletePositive => {
+            compute_positive_ttl_with_policy(response, max_positive_ttl, min_positive_ttl)
         }
-        CacheTtlDecision::Skip(CacheSkipReason::NoTtl) => {
+        ResponseDisposition::DefinitiveNegative(_) => {
             if let Some(ttl) = compute_negative_ttl_with_policy(
                 response,
+                key,
                 cache_negative,
                 max_negative_ttl,
                 negative_ttl_without_soa,
@@ -1426,23 +1475,97 @@ fn compute_cache_ttl_with_policy(
                 CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
             }
         }
+        ResponseDisposition::IncompleteAlias => {
+            CacheTtlDecision::Skip(CacheSkipReason::IncompleteAnswer)
+        }
+        ResponseDisposition::Other => CacheTtlDecision::Skip(CacheSkipReason::NoTtl),
+    };
+    (decision, disposition)
+}
+
+#[inline]
+fn response_disposition_for_cache(response: &Message, key: &CacheKey) -> ResponseDisposition {
+    if let Some(question) = response.first_question() {
+        if question.name().normalized() != key.domain
+            || question.qtype() != key.record_type
+            || question.qclass() != key.dns_class
+        {
+            return ResponseDisposition::Other;
+        }
+        return classify_response(response, Some(question));
+    }
+
+    let Some(question) = key.question() else {
+        return ResponseDisposition::Other;
+    };
+    classify_response(response, Some(&question))
+}
+
+#[inline]
+fn cache_skip_reason_for_disposition(disposition: ResponseDisposition) -> CacheSkipReason {
+    match disposition {
+        ResponseDisposition::IncompleteAlias => CacheSkipReason::IncompleteAnswer,
+        _ => CacheSkipReason::NoTtl,
     }
 }
 
 #[inline]
-fn is_complete_positive_response(response: &Message, record_type: RecordType) -> bool {
-    response.rcode() == Rcode::NoError
-        && !response.answers().is_empty()
-        && (record_type == RecordType::ANY || response.has_answer_type(record_type))
+fn is_cache_disposition_valid(disposition: ResponseDisposition) -> bool {
+    matches!(
+        disposition,
+        ResponseDisposition::CompletePositive | ResponseDisposition::DefinitiveNegative(_)
+    )
 }
 
-fn is_cache_entry_response_valid(response: &Message, record_type: RecordType) -> bool {
-    match response.rcode() {
-        Rcode::NoError if response.answers().is_empty() => true,
-        Rcode::NoError => is_complete_positive_response(response, record_type),
-        Rcode::NXDomain => true,
-        _ => false,
+#[inline]
+fn min_answer_ttl_for_key(response: &Message, key: &CacheKey) -> Option<u32> {
+    response
+        .answers()
+        .iter()
+        .filter(|record| record.class() == key.dns_class)
+        .map(|record| record.ttl())
+        .min()
+}
+
+#[inline]
+fn negative_ttl_from_soa_for_key(response: &Message, key: &CacheKey) -> Option<u32> {
+    response
+        .authorities()
+        .iter()
+        .filter(|record| record.class() == key.dns_class)
+        .filter_map(|record| match record.data() {
+            RData::SOA(soa) => Some(record.ttl().min(soa.minimum())),
+            _ => None,
+        })
+        .min()
+}
+
+fn clamp_persisted_cache_ttl(
+    response: &Message,
+    key: &CacheKey,
+    disposition: ResponseDisposition,
+    ttl: u32,
+    remaining_ttl_ms: u64,
+    cache_age_ms: u64,
+) -> (u32, u64) {
+    if !matches!(disposition, ResponseDisposition::DefinitiveNegative(_)) {
+        return (ttl, remaining_ttl_ms);
     }
+
+    let protocol_cap = [
+        negative_ttl_from_soa_for_key(response, key),
+        min_answer_ttl_for_key(response, key),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    let ttl = protocol_cap.map_or(ttl, |cap| ttl.min(cap));
+    let remaining_ttl_ms = remaining_ttl_ms.min(
+        u64::from(ttl)
+            .saturating_mul(1000)
+            .saturating_sub(cache_age_ms),
+    );
+    (ttl, remaining_ttl_ms)
 }
 
 fn parse_cache_config(args: Option<Value>) -> Result<CacheConfig> {
@@ -1647,7 +1770,7 @@ mod tests {
     use crate::plugin::executor::sequence::chain::ChainProgram;
     use crate::proto::rdata::{CNAME, SOA};
     use crate::proto::{
-        DNSClass, Edns, EdnsOption, Message, Name, Question, RData, Record, RecordType,
+        DNSClass, Edns, EdnsOption, Message, Name, Question, RData, Rcode, Record, RecordType,
     };
 
     async fn wait_until<F>(description: &str, condition: F)
@@ -1820,9 +1943,16 @@ mod tests {
     }
 
     fn cache_key_for_domain(domain: impl Into<String>) -> CacheKey {
+        cache_key_for_domain_and_type(domain, RecordType::A)
+    }
+
+    fn cache_key_for_domain_and_type(
+        domain: impl Into<String>,
+        record_type: RecordType,
+    ) -> CacheKey {
         CacheKey {
             domain: domain.into(),
-            record_type: RecordType::A,
+            record_type,
             dns_class: DNSClass::IN,
             do_bit: false,
             cd_bit: false,
@@ -1857,11 +1987,19 @@ mod tests {
     }
 
     fn cname_only_response_for_domain(domain: &str, ttl: u32) -> Message {
+        cname_only_response_for_domain_and_type(domain, ttl, RecordType::A)
+    }
+
+    fn cname_only_response_for_domain_and_type(
+        domain: &str,
+        ttl: u32,
+        record_type: RecordType,
+    ) -> Message {
         let mut response = Message::new();
         response.set_rcode(Rcode::NoError);
         response.add_question(Question::new(
             Name::from_ascii(domain).unwrap(),
-            RecordType::A,
+            record_type,
             DNSClass::IN,
         ));
         response.add_answer(Record::from_rdata(
@@ -2249,7 +2387,10 @@ mod tests {
             )),
         ));
 
-        assert_eq!(cache.compute_negative_ttl(&response), Some(20));
+        assert_eq!(
+            cache.compute_negative_ttl(&response, &cache_key_for_domain("example.com")),
+            Some(20)
+        );
     }
 
     #[test]
@@ -2261,7 +2402,10 @@ mod tests {
         let mut response = Message::new();
         response.set_rcode(Rcode::NXDomain);
 
-        assert_eq!(cache.compute_negative_ttl(&response), Some(45));
+        assert_eq!(
+            cache.compute_negative_ttl(&response, &cache_key_for_domain("example.com")),
+            Some(45)
+        );
     }
 
     #[test]
@@ -2273,7 +2417,10 @@ mod tests {
         let mut response = Message::new();
         response.set_rcode(Rcode::NXDomain);
 
-        assert_eq!(cache.compute_negative_ttl(&response), None);
+        assert_eq!(
+            cache.compute_negative_ttl(&response, &cache_key_for_domain("example.com")),
+            None
+        );
     }
 
     #[test]
@@ -2284,7 +2431,7 @@ mod tests {
         response.set_rcode(Rcode::ServFail);
 
         assert_eq!(
-            cache.compute_cache_ttl(&response, RecordType::A),
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
             CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
         );
     }
@@ -2304,7 +2451,7 @@ mod tests {
         ));
 
         assert_eq!(
-            cache.compute_cache_ttl(&response, RecordType::A),
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
             CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
         );
     }
@@ -2324,7 +2471,7 @@ mod tests {
         ));
 
         assert_eq!(
-            cache.compute_cache_ttl(&response, RecordType::A),
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
             CacheTtlDecision::Cache(4)
         );
     }
@@ -2345,7 +2492,7 @@ mod tests {
         ));
 
         assert_eq!(
-            cache.compute_cache_ttl(&response, RecordType::A),
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
             CacheTtlDecision::Skip(CacheSkipReason::LowPositiveTtl)
         );
     }
@@ -2356,10 +2503,13 @@ mod tests {
         let response = cname_only_response_for_domain("example.com.", 60);
 
         assert_eq!(
-            cache.compute_cache_ttl(&response, RecordType::A),
-            CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
+            CacheTtlDecision::Skip(CacheSkipReason::IncompleteAnswer)
         );
-        assert_eq!(cache.compute_negative_ttl(&response), None);
+        assert_eq!(
+            cache.compute_negative_ttl(&response, &cache_key_for_domain("example.com")),
+            None
+        );
     }
 
     #[test]
@@ -2368,18 +2518,80 @@ mod tests {
         let response = cname_with_a_response_for_domain("example.com.", 30, 120);
 
         assert_eq!(
-            cache.compute_cache_ttl(&response, RecordType::A),
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
             CacheTtlDecision::Cache(30)
+        );
+    }
+
+    #[test]
+    fn cname_with_soa_is_negative_cacheable_for_address_key() {
+        let cache = test_cache(default_test_config());
+        let mut response = cname_only_response_for_domain("example.com.", 60);
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            120,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns1.example.com.").unwrap(),
+                Name::from_ascii("hostmaster.example.com.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                30,
+            )),
+        ));
+
+        assert_eq!(
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
+            CacheTtlDecision::Cache(30)
+        );
+    }
+
+    #[test]
+    fn cname_nodata_ttl_does_not_exceed_cname_ttl() {
+        let cache = test_cache(default_test_config());
+        let mut response = cname_only_response_for_domain("example.com.", 5);
+        response.add_authority(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            120,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns1.example.com.").unwrap(),
+                Name::from_ascii("hostmaster.example.com.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                30,
+            )),
+        ));
+
+        assert_eq!(
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
+            CacheTtlDecision::Cache(5)
+        );
+    }
+
+    #[test]
+    fn cache_rejects_response_question_mismatched_with_key() {
+        let cache = test_cache(default_test_config());
+        let response = cacheable_response_for_domain("other.example.com.", 60);
+
+        assert_eq!(
+            cache.compute_cache_ttl(&response, &cache_key_for_domain("example.com")),
+            CacheTtlDecision::Skip(CacheSkipReason::NoTtl)
         );
     }
 
     #[test]
     fn any_query_allows_non_empty_cname_answer() {
         let cache = test_cache(default_test_config());
-        let response = cname_only_response_for_domain("example.com.", 60);
+        let response = cname_only_response_for_domain_and_type("example.com.", 60, RecordType::ANY);
 
         assert_eq!(
-            cache.compute_cache_ttl(&response, RecordType::ANY),
+            cache.compute_cache_ttl(
+                &response,
+                &cache_key_for_domain_and_type("example.com", RecordType::ANY),
+            ),
             CacheTtlDecision::Cache(60)
         );
     }
@@ -2391,8 +2603,9 @@ mod tests {
         nodata.set_rcode(Rcode::NoError);
         let cname_only = cname_only_response_for_domain("example.com.", 60);
 
-        assert_eq!(cache.compute_negative_ttl(&nodata), Some(60));
-        assert_eq!(cache.compute_negative_ttl(&cname_only), None);
+        let key = cache_key_for_domain("example.com");
+        assert_eq!(cache.compute_negative_ttl(&nodata, &key), Some(60));
+        assert_eq!(cache.compute_negative_ttl(&cname_only, &key), None);
     }
 
     #[tokio::test]
@@ -2437,7 +2650,7 @@ mod tests {
         assert_eq!(
             cache
                 .metrics
-                .skip_no_ttl_total
+                .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
@@ -2475,7 +2688,7 @@ mod tests {
         assert_eq!(
             cache
                 .metrics
-                .skip_no_ttl_total
+                .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
@@ -2519,7 +2732,7 @@ mod tests {
         assert_eq!(
             cache
                 .metrics
-                .skip_no_ttl_total
+                .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
         );
@@ -2538,7 +2751,11 @@ mod tests {
             false,
         ));
         let key = Cache::build_cache_key(&mut context, false).unwrap();
-        context.set_response(cname_only_response_for_domain("example.com.", 60));
+        context.set_response(cname_only_response_for_domain_and_type(
+            "example.com.",
+            60,
+            RecordType::ANY,
+        ));
 
         cache.execute_with_next(&mut context, None).await.unwrap();
 
@@ -2577,7 +2794,14 @@ mod tests {
             RData::A(crate::proto::rdata::A(Ipv4Addr::new(1, 1, 1, 1))),
         ));
 
-        cache.update_cache_entry(cache.cache_map.get().unwrap(), key, response, 120);
+        let disposition = response_disposition_for_cache(&response, &key);
+        cache.update_cache_entry(
+            cache.cache_map.get().unwrap(),
+            key,
+            response,
+            120,
+            disposition,
+        );
 
         let lookup = cache
             .try_cache_hit(&mut context, cache.cache_map.get().unwrap())
@@ -2773,7 +2997,14 @@ mod tests {
         ));
 
         let key = Cache::build_cache_key(&mut context, false).unwrap();
-        cache.update_cache_entry(cache.cache_map.get().unwrap(), key.clone(), response, 120);
+        let disposition = response_disposition_for_cache(&response, &key);
+        cache.update_cache_entry(
+            cache.cache_map.get().unwrap(),
+            key.clone(),
+            response,
+            120,
+            disposition,
+        );
 
         let stored = cache
             .cache_map
@@ -2930,7 +3161,7 @@ mod tests {
         assert_eq!(
             cache
                 .metrics
-                .skip_no_ttl_total
+                .skip_incomplete_answer_total
                 .load(AtomicOrdering::Relaxed),
             1
         );

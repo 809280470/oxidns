@@ -226,7 +226,7 @@ pub enum PluginTagValidationError {
 ///
 /// The length limit is a product-level constraint for stable configuration
 /// identifiers. Runtime-generated quick-setup tags may be longer and should
-/// use [`validate_plugin_tag_path_segment`] when registering API routes.
+/// use `validate_plugin_tag_path_segment` when registering API routes.
 pub fn validate_plugin_tag(tag: &str) -> Result<(), PluginTagValidationError> {
     if tag.is_empty() {
         return Err(PluginTagValidationError::Empty);

@@ -207,6 +207,7 @@ import Admonition from "@theme/Admonition";
 - 作用：定义多上游模式下的并发查询扇出数。
 - 运行影响：
   - 值越大，多上游竞争越积极，但同时会增加上游请求量。
+  - 该值只决定本次实际启动的上游数量，不会在收到 CNAME-only 响应后自动顺序尝试尚未启动的上游；`concurrent: 1` 保持单次上游选择语义。
   - 推荐常规配置使用 `2..=8`；更高值适合短期观测或明确需要多协议竞速的场景。
 
 #### `response_selection`
@@ -216,9 +217,16 @@ import Admonition from "@theme/Admonition";
 - 作用：定义多上游并发返回不一致时的结果选择策略。
 - 模式说明：
   - `fastest`：第一个成功返回的 DNS 响应胜出，传输错误不会胜出。
-  - `balanced`：默认模式。`NOERROR` 且包含答案时立即胜出；`NXDOMAIN` 或 NODATA 会短暂等待是否有正向答案。
+  - `balanced`：默认模式。包含请求类型且位于原始 QNAME/CNAME 链尾的完整答案立即胜出；`NXDOMAIN` 或 NODATA 会短暂等待是否有正向答案。
   - `prefer_positive`：正向答案立即胜出；负向答案等待已发起的并发上游全部结束后再返回。
   - `consensus`：正向答案立即胜出；负向答案需要两个上游确认，若并发数不足则退化为 `prefer_positive`。
+
+#### CNAME 响应处理
+
+- 对 A/AAAA 等非 CNAME 查询，只有最终请求类型位于原始 QNAME 的 CNAME 链尾时，才视为完整正向答案。
+- 仅含 CNAME、且没有最终请求类型和 SOA 的响应属于 incomplete alias：不会提前胜出、不会计入负响应共识，但当没有更好结果时仍会原样返回。
+- `CNAME + SOA` 且没有最终请求类型会识别为 NODATA；`NXDOMAIN` 即使带有 CNAME 也仍是负响应。
+- `forward` 不执行隐藏式 fallback 或 CNAME chase；需要更多上游竞争时请显式提高 `concurrent`，或在策略中配置 `fallback`。
 
 #### `upstreams`
 
@@ -424,8 +432,11 @@ import Admonition from "@theme/Admonition";
 - `forward_success_total`
 - `forward_error_total`
 - `forward_timeout_total`
+- `forward_incomplete_alias_selected_total`
 - `forward_latency_count`
 - `forward_latency_sum_ms`
+
+`forward_incomplete_alias_selected_total` 仅统计执行语义分类的并发选择模式（`balanced`、`prefer_positive`、`consensus`）。单上游和 `fastest` 不会为了该指标额外扫描响应。
 
 每个上游另外导出带 `upstream` 标签的指标（标签值为上游 tag，未配置时为解析后的地址）：
 
@@ -456,6 +467,8 @@ import Admonition from "@theme/Admonition";
 ### 作用
 
 对响应做 TTL 感知缓存，支持负缓存与持久化。
+
+对 A/AAAA 等非 CNAME 查询，cache 仅缓存位于原始 QNAME/CNAME 链尾的完整请求类型答案，并校验响应 Question 的 QNAME/QTYPE/QCLASS 与缓存 key 一致。裸 CNAME 响应不会写入该地址查询 key；带 SOA 的 `CNAME + NODATA` 会写入负缓存，其寿命取 SOA negative TTL、CNAME 等 Answer 最小 TTL 与配置上限中的最小值。
 
 ### 配置示例
 
@@ -598,7 +611,7 @@ import Admonition from "@theme/Admonition";
 - `cache_miss_total`
 - `cache_expired_total`
 - `cache_insert_total`
-- `cache_skip_total{reason="truncated|no_ttl|low_positive_ttl"}`
+- `cache_skip_total{reason="truncated|no_ttl|incomplete_answer|low_positive_ttl"}`
 - `cache_lazy_refresh_total{result="started|success|failed"}`
 - `cache_entry_count`
 
