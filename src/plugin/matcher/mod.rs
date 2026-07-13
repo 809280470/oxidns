@@ -41,6 +41,7 @@ pub mod rate_limiter;
 pub mod rcode;
 pub mod resp_ip;
 pub mod string_exp;
+pub mod time;
 pub mod true_matcher;
 
 #[allow(dead_code)]

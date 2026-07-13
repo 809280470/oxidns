@@ -522,6 +522,20 @@ export const enUSDocs = {
   random: {
     args: "`args` of `random` only accepts a probability value.\n\n- Type: `array`; Required: Yes; Default: None\n- Value range: `0.0` to `1.0`\n- Function: Define the probability of returning `true` for this match.\n- Operational impact:\n  - `0.0` means always miss.\n  - `1.0` means always hit.",
   },
+  time: {
+    timezone:
+      "- Type: `string`; Required: No; Default: system timezone\n- Function: Set the IANA timezone used for matching, such as `Asia/Shanghai` or `UTC`.\n- Operational impact: When omitted, the system timezone is resolved; initialization fails if it is unavailable so a policy never silently uses the wrong timezone.",
+    periods:
+      "- Type: `array`; Required: Yes; Count: `1..=64`\n- Function: Define recurring matching windows; any matching window returns `true`.\n- Operational impact: Time, weekday, and day-of-month conditions in one window must all match.",
+    "periods[].start":
+      "- Type: `string`; Required: set together with `end` or omit both\n- Format: `HH:MM`, from `00:00` to `23:59`.\n- Notes: Equal start and end times are invalid; a start later than end crosses midnight.",
+    "periods[].end":
+      "- Type: `string`; Required: set together with `start` or omit both\n- Format: `HH:MM`. The interval uses `[start, end)`, so the exact end time does not match.",
+    "periods[].weekdays":
+      "- Type: `array[string]`; Required: No\n- Values: case-insensitive `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, or `sun`.\n- Operational impact: Omit to allow every weekday.",
+    "periods[].monthdays":
+      "- Type: `array[integer]`; Required: No\n- Values: `1..=31`.\n- Operational impact: Omit to allow every day; a day absent from a month does not match.",
+  },
   rate_limiter: {
     qps: "- Type: `number`; Required: No; Default: `20`\n- Function: Define the token replenishment rate per second.\n- Operational impact:\n  - The larger the value, the more requests allowed to pass per unit time.",
     burst:

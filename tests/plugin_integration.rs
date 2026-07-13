@@ -1006,6 +1006,66 @@ plugins:
 }
 
 #[tokio::test]
+async fn test_time_matcher_config_and_quick_setup_initialize() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: office_hours
+    type: time
+    args:
+      timezone: Asia/Shanghai
+      periods:
+        - start: "09:00"
+          end: "18:00"
+          weekdays: [mon, tue, wed, thu, fri]
+        - monthdays: [1, 15]
+  - tag: seq
+    type: sequence
+    args:
+      - matches: time 22:00-02:00
+        exec: accept
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("office_hours")
+        .expect("time matcher should be registered");
+    assert_eq!(matcher.plugin_type, PluginType::Matcher);
+    assert_eq!(matcher.plugin_name, "time");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_time_matcher_rejects_invalid_period_config() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: invalid_time
+    type: time
+    args:
+      periods:
+        - start: "09:00"
+          end: "09:00"
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("same time boundaries must be rejected");
+    assert!(
+        err.to_string()
+            .contains("periods[0].start and periods[0].end must differ")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_sequence_accept_in_jump_stops_current_and_parent_sequences() -> Result<()> {
     let yaml = r#"
 log:

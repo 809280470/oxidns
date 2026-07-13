@@ -2126,6 +2126,63 @@ export const zhCNPluginDefined = {
         paramPlaceholder: "0.1",
       },
     },
+    time: {
+      name: "Time",
+      description: "按时区、时间段、星期和每月日期匹配",
+      fields: {
+        timezone: {
+          label: "时区",
+          description: "留空时使用系统时区；填写有效 IANA 时区可固定策略判断时区。",
+          placeholder: "Asia/Shanghai",
+        },
+        periods: {
+          label: "时间周期",
+          description: "任一周期命中即返回 true；同一周期内的时间、星期和月日条件需要同时满足。",
+          placeholder:
+            '[{"start":"09:00","end":"18:00","weekdays":["mon","tue","wed","thu","fri"]}]',
+        },
+        "periods[]": {
+          label: "时间周期",
+        },
+        "periods[].start": {
+          label: "开始时间",
+          description: "使用 HH:MM；与结束时间同时填写。",
+          placeholder: "09:00",
+        },
+        "periods[].end": {
+          label: "结束时间",
+          description: "使用 HH:MM；早于开始时间时表示跨午夜。",
+          placeholder: "18:00",
+        },
+        "periods[].weekdays": {
+          label: "星期",
+          description: "留空则不限制星期。",
+          placeholder: "mon\ntue\nwed\nthu\nfri",
+        },
+        "periods[].weekdays[]": {
+          options: {
+            mon: "周一",
+            tue: "周二",
+            wed: "周三",
+            thu: "周四",
+            fri: "周五",
+            sat: "周六",
+            sun: "周日",
+          },
+        },
+        "periods[].monthdays": {
+          label: "每月日期",
+          description: "填写 1 到 31；留空则不限制每月日期。",
+          placeholder: "1\n15",
+        },
+        "periods[].monthdays[]": {
+          placeholder: "1",
+        },
+      },
+      quickSetup: {
+        paramPlaceholder: "09:00-18:00",
+      },
+    },
     rate_limiter: {
       name: "Rate Limiter",
       description: "基于客户端 IP 的令牌桶限流",

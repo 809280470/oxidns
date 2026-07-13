@@ -128,6 +128,7 @@ server -> sequence
 | --- | --- |
 | [`mark`](matcher.mdx#mark) | 匹配上下文中的 mark 集合。 |
 | [`env`](matcher.mdx#env) | 匹配进程环境变量。 |
+| [`time`](matcher.mdx#time) | 按时区、时间段、星期和每月日期匹配。 |
 | [`random`](matcher.mdx#random) | 按概率命中，适合灰度和采样。 |
 | [`rate_limiter`](matcher.mdx#rate_limiter) | 基于客户端 IP 的令牌桶限流。 |
 | [`string_exp`](matcher.mdx#string_exp) | 通用字符串表达式匹配器，补足专用 matcher 不够灵活的场景。 |

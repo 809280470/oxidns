@@ -128,6 +128,7 @@ See [Matcher Plugins](matcher.mdx) for full field reference.
 | --- | --- |
 | [`mark`](matcher.mdx#mark) | Matches marks already written into the DNS context. |
 | [`env`](matcher.mdx#env) | Matches process environment variables. |
+| [`time`](matcher.mdx#time) | Matches by timezone, time window, weekday, and day of month. |
 | [`random`](matcher.mdx#random) | Matches probabilistically for rollout or sampling. |
 | [`rate_limiter`](matcher.mdx#rate_limiter) | Token-bucket rate limiting by client IP. |
 | [`string_exp`](matcher.mdx#string_exp) | General-purpose string expression matcher for cases where dedicated matchers are too rigid. |
