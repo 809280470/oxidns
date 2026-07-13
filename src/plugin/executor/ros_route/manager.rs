@@ -1446,7 +1446,19 @@ impl RouteManager {
                 self.routes.remove(&key);
                 continue;
             }
-            seen_keys.insert(key.clone());
+            if !seen_keys.insert(key.clone()) {
+                if let Err(error) = self.api.delete_route_by_id(&route.id, route.family).await {
+                    warn!(
+                        plugin = %self.cfg.plugin_tag,
+                        route_id = %route.id,
+                        dst = %route.dst_address,
+                        err = %error,
+                        "ros_route failed to remove duplicate owned route"
+                    );
+                    first_error.get_or_insert(error);
+                }
+                continue;
+            }
             let persistent_residue = meta.kind == RouteCommentKind::Persistent;
 
             if let Some(existing) = self.routes.get_mut(&key) {
@@ -1472,18 +1484,20 @@ impl RouteManager {
                     }
                     let gateway_drift = route.gateway.as_deref() != Some(existing.gateway.as_str());
                     let distance_drift = route.distance != Some(existing.distance);
+                    let disabled_drift = route.disabled;
                     let expected_comment = RouteCommentCodec::encode(
                         &self.cfg.comment_prefix,
                         &self.cfg.plugin_tag,
                         existing,
                     );
                     let comment_drift = route.comment.as_deref() != Some(expected_comment.as_str());
-                    if gateway_drift || distance_drift || comment_drift {
+                    if gateway_drift || distance_drift || comment_drift || disabled_drift {
                         existing.sync_state = SyncState::Dirty;
                     }
                 } else {
                     let gateway_drift = route.gateway.as_deref() != Some(existing.gateway.as_str());
                     let distance_drift = route.distance != Some(existing.distance);
+                    let disabled_drift = route.disabled;
                     let expected_comment = RouteCommentCodec::encode(
                         &self.cfg.comment_prefix,
                         &self.cfg.plugin_tag,
@@ -1493,6 +1507,7 @@ impl RouteManager {
                     if gateway_drift
                         || distance_drift
                         || comment_drift
+                        || disabled_drift
                         || matches!(existing.sync_state, SyncState::PendingCreate)
                     {
                         existing.sync_state = SyncState::Dirty;
@@ -1537,13 +1552,14 @@ impl RouteManager {
             if !matches!(entry.sync_state, SyncState::PendingDelete) {
                 let gateway_drift = route.gateway.as_deref() != Some(entry.gateway.as_str());
                 let distance_drift = route.distance != Some(entry.distance);
+                let disabled_drift = route.disabled;
                 let expected_comment = RouteCommentCodec::encode(
                     &self.cfg.comment_prefix,
                     &self.cfg.plugin_tag,
                     &entry,
                 );
                 let comment_drift = route.comment.as_deref() != Some(expected_comment.as_str());
-                if gateway_drift || distance_drift || comment_drift {
+                if gateway_drift || distance_drift || comment_drift || disabled_drift {
                     entry.sync_state = SyncState::Dirty;
                 }
             }
@@ -2365,6 +2381,7 @@ mod tests {
                     "fdns;pg=route-test;kind=dynamic;dm=example.com.;exp={};seen=100",
                     u64::MAX
                 )),
+                disabled: false,
             }],
             ..MockApiState::default()
         }));
@@ -2411,6 +2428,7 @@ mod tests {
                 comment: Some(format!(
                     "fdns;pg=route-test;kind=dynamic;dm={domain};exp={expires_at};seen={now}"
                 )),
+                disabled: false,
             }],
             ..MockApiState::default()
         }));
@@ -2445,6 +2463,7 @@ mod tests {
                 comment: Some(format!(
                     "fdns;pg=route-test;kind=dynamic;dm=first.example.;exp={expires_at};seen={now}"
                 )),
+                disabled: false,
             }],
             ..MockApiState::default()
         }));
@@ -2545,6 +2564,7 @@ mod tests {
                 gateway: Some("192.0.2.1".to_string()),
                 distance: Some(100),
                 comment: Some(comment),
+                disabled: false,
             }],
             ..MockApiState::default()
         }));
@@ -2554,6 +2574,74 @@ mod tests {
         assert_eq!(
             api.state.lock().expect("mock lock").deleted_ids,
             vec!["*validation".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_prunes_duplicate_owned_routes() {
+        AppClock::start();
+        let now = unix_now();
+        let expires_at = now + 300;
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 23));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let comment = format!(
+            "fdns;pg=route-test;kind=dynamic;dm=duplicate.example.;exp={expires_at};seen={now}"
+        );
+        let route = |id: &str| RouterRoute {
+            id: id.to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: format!("{ip}/32"),
+            routing_table: "via_proxy".to_string(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(comment.clone()),
+            disabled: false,
+        };
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![route("*primary"), route("*duplicate")],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        let state = api.state.lock().expect("mock lock");
+        assert_eq!(state.deleted_ids, vec!["*duplicate".to_string()]);
+        assert_eq!(state.routes.len(), 1);
+        assert_eq!(state.routes[0].id, "*primary");
+        assert_eq!(manager.routes[&key].router_id.as_deref(), Some("*primary"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_refreshes_disabled_owned_route() {
+        AppClock::start();
+        let now = unix_now();
+        let expires_at = now + 300;
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 24));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*disabled".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: format!("{ip}/32"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(format!(
+                    "fdns;pg=route-test;kind=dynamic;dm=disabled.example.;exp={expires_at};seen={now}"
+                )),
+                disabled: true,
+            }],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
+        assert_eq!(
+            api.state.lock().expect("mock lock").upsert_attempts,
+            vec![ip]
         );
     }
 
@@ -2573,6 +2661,7 @@ mod tests {
                     "fdns;pg=route-test;kind=dynamic;dm=example.com.;exp={};seen=100",
                     u64::MAX
                 )),
+                disabled: false,
             }],
             ..MockApiState::default()
         }));

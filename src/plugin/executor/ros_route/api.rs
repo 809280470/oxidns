@@ -21,6 +21,7 @@ const ROUTE_TABLE_FIELD: &str = "routing-table";
 const ROUTE_GATEWAY_FIELD: &str = "gateway";
 const ROUTE_DISTANCE_FIELD: &str = "distance";
 const ROUTE_COMMENT_FIELD: &str = "comment";
+const ROUTE_DISABLED_FIELD: &str = "disabled";
 const COMMENT_FIELD_PLUGIN: &str = "pg";
 
 const COMMAND_SYSTEM_IDENTITY_PRINT: &str = "/system/identity/print";
@@ -83,6 +84,8 @@ pub(super) struct RouterRoute {
     pub(super) distance: Option<u8>,
     /// Optional comment field from RouterOS.
     pub(super) comment: Option<String>,
+    /// Whether RouterOS currently excludes this route from forwarding.
+    pub(super) disabled: bool,
 }
 
 #[async_trait]
@@ -306,6 +309,14 @@ impl MikrotikRsClient {
         Ok(classify_exact_routes(routes, comment_prefix, plugin_tag))
     }
 
+    async fn prune_duplicate_owned_routes(&self, duplicates: Vec<RouterRoute>) -> Result<()> {
+        for duplicate in duplicates {
+            self.delete_route_by_id(&duplicate.id, duplicate.family)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn list_routes_for_family(
         &self,
         table: &str,
@@ -424,6 +435,11 @@ fn parse_router_route_from_reply(
         })
         .transpose()?;
     let comment = reply.get(ROUTE_COMMENT_FIELD).map(str::to_string);
+    let disabled = reply
+        .get(ROUTE_DISABLED_FIELD)
+        .map(|raw| parse_routeros_bool(raw, ROUTE_DISABLED_FIELD, action))
+        .transpose()?
+        .unwrap_or(false);
 
     Ok(RouterRoute {
         id,
@@ -433,7 +449,20 @@ fn parse_router_route_from_reply(
         gateway,
         distance,
         comment,
+        disabled,
     })
+}
+
+fn parse_routeros_bool(raw: &str, field: &str, action: &str) -> Result<bool> {
+    if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("yes") || raw == "1" {
+        return Ok(true);
+    }
+    if raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("no") || raw == "0" {
+        return Ok(false);
+    }
+    Err(DnsError::plugin(format!(
+        "ros_route {action} response has invalid '{field}' value '{raw}'"
+    )))
 }
 
 fn comment_matches_prefix(comment: &str, prefix: &str) -> bool {
@@ -472,6 +501,7 @@ fn route_owned_by_plugin(route: &RouterRoute, comment_prefix: &str, plugin_tag: 
 #[derive(Debug, Default)]
 struct ExactRouteOwnership {
     owned: Option<RouterRoute>,
+    duplicate_owned: Vec<RouterRoute>,
     has_foreign: bool,
 }
 
@@ -483,7 +513,11 @@ fn classify_exact_routes(
     let mut inspection = ExactRouteOwnership::default();
     for route in routes {
         if route_owned_by_plugin(&route, comment_prefix, plugin_tag) {
-            inspection.owned.get_or_insert(route);
+            if inspection.owned.is_some() {
+                inspection.duplicate_owned.push(route);
+            } else {
+                inspection.owned = Some(route);
+            }
         } else {
             inspection.has_foreign = true;
         }
@@ -530,10 +564,12 @@ impl MikrotikApi for MikrotikRsClient {
         comment_prefix: &str,
         plugin_tag: &str,
     ) -> Result<Option<RouterRoute>> {
-        Ok(self
+        let inspection = self
             .inspect_exact_routes(key, comment_prefix, plugin_tag)
-            .await?
-            .owned)
+            .await?;
+        self.prune_duplicate_owned_routes(inspection.duplicate_owned)
+            .await?;
+        Ok(inspection.owned)
     }
 
     async fn upsert_host_route(
@@ -548,7 +584,8 @@ impl MikrotikApi for MikrotikRsClient {
         // Upsert strategy:
         // 1) inspect every exact-prefix row for owned and foreign routes
         // 2) reject any foreign duplicate before refreshing an owned row
-        // 3) update only changed fields, or add when no row exists
+        // 3) prune duplicate owned rows so one key converges to one route
+        // 4) update changed/disabled fields, or add when no row exists
         let inspection = self
             .inspect_exact_routes(key, comment_prefix, plugin_tag)
             .await?;
@@ -559,11 +596,14 @@ impl MikrotikApi for MikrotikRsClient {
                 key.table
             )));
         }
+        self.prune_duplicate_owned_routes(inspection.duplicate_owned)
+            .await?;
         if let Some(existing) = inspection.owned {
             let gateway_changed = existing.gateway.as_deref() != Some(gateway);
             let distance_changed = existing.distance != Some(distance);
             let comment_changed = existing.comment.as_deref() != Some(comment);
-            if gateway_changed || distance_changed || comment_changed {
+            let disabled_changed = existing.disabled;
+            if gateway_changed || distance_changed || comment_changed || disabled_changed {
                 let distance_str = distance.to_string();
                 let mut set_builder = CommandBuilder::new()
                     .command(route_command(key.family(), RouteOp::Set))
@@ -577,6 +617,9 @@ impl MikrotikApi for MikrotikRsClient {
                 }
                 if comment_changed {
                     set_builder = set_builder.attribute(ROUTE_COMMENT_FIELD, Some(comment));
+                }
+                if disabled_changed {
+                    set_builder = set_builder.attribute(ROUTE_DISABLED_FIELD, Some("no"));
                 }
                 let _ = self
                     .send_rows("set host route", set_builder.build())
@@ -705,6 +748,7 @@ mod tests {
             gateway: Some("192.0.2.1".to_string()),
             distance: Some(100),
             comment: comment.map(str::to_string),
+            disabled: false,
         }
     }
 
@@ -713,6 +757,10 @@ mod tests {
         let inspection = classify_exact_routes(
             [
                 route("*owned", Some("fdns;pg=route-test;dm=example.com")),
+                route(
+                    "*owned-duplicate",
+                    Some("fdns;pg=route-test;dm=example.com"),
+                ),
                 route("*foreign", Some("operator-managed")),
             ],
             "fdns",
@@ -723,7 +771,37 @@ mod tests {
             inspection.owned.as_ref().map(|route| route.id.as_str()),
             Some("*owned")
         );
+        assert_eq!(
+            inspection
+                .duplicate_owned
+                .iter()
+                .map(|route| route.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["*owned-duplicate"]
+        );
         assert!(inspection.has_foreign);
+    }
+
+    #[test]
+    fn route_parser_recognizes_routeros_disabled_values() {
+        let reply = RouterReply {
+            attributes: HashMap::from([
+                (ROUTER_ID_FIELD.to_string(), Some("*disabled".to_string())),
+                (
+                    ROUTE_DST_FIELD.to_string(),
+                    Some("203.0.113.20/32".to_string()),
+                ),
+                (ROUTE_DISABLED_FIELD.to_string(), Some("yes".to_string())),
+            ]),
+        };
+
+        let route = parse_router_route_from_reply("test parse", RouteFamily::Ipv4, &reply)
+            .expect("parse disabled route");
+
+        assert!(route.disabled);
+        assert!(parse_routeros_bool("true", ROUTE_DISABLED_FIELD, "test").unwrap());
+        assert!(!parse_routeros_bool("false", ROUTE_DISABLED_FIELD, "test").unwrap());
+        assert!(parse_routeros_bool("invalid", ROUTE_DISABLED_FIELD, "test").is_err());
     }
 
     #[tokio::test]
