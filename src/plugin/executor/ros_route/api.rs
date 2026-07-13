@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder, Event, MikrotikDevice};
+use tracing::warn;
 
 use super::manager::{RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
@@ -88,7 +89,12 @@ pub(super) struct RouterRoute {
 pub(super) trait MikrotikApi: Debug + Send + Sync {
     /// List all routes in target table that can be considered by manager
     /// reconciliation.
-    async fn list_managed_routes(&self, table: &str) -> Result<Vec<RouterRoute>>;
+    async fn list_managed_routes(
+        &self,
+        table: &str,
+        require_ipv4: bool,
+        require_ipv6: bool,
+    ) -> Result<Vec<RouterRoute>>;
     /// Find one route by route key (family + table + destination).
     async fn find_route(
         &self,
@@ -327,6 +333,35 @@ impl MikrotikRsClient {
         }
         Ok(false)
     }
+
+    async fn list_routes_for_family(
+        &self,
+        table: &str,
+        family: RouteFamily,
+    ) -> Result<Vec<RouterRoute>> {
+        let print = CommandBuilder::new()
+            .command(route_command(family, RouteOp::Print))
+            .query_equal(ROUTE_TABLE_FIELD, table)
+            .build();
+        let action = match family {
+            RouteFamily::Ipv4 => "print ipv4 routes",
+            RouteFamily::Ipv6 => "print ipv6 routes",
+        };
+        let parse_action = match family {
+            RouteFamily::Ipv4 => "parse ipv4 route",
+            RouteFamily::Ipv6 => "parse ipv6 route",
+        };
+        let rows = self.send_rows(action, print).await?;
+        rows.iter()
+            .map(|row| {
+                let mut route = parse_router_route_from_reply(parse_action, family, row)?;
+                if route.routing_table.is_empty() {
+                    route.routing_table = table.to_string();
+                }
+                Ok(route)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -422,36 +457,32 @@ fn route_owned_by_plugin(route: &RouterRoute, comment_prefix: &str, plugin_tag: 
 
 #[async_trait]
 impl MikrotikApi for MikrotikRsClient {
-    async fn list_managed_routes(&self, table: &str) -> Result<Vec<RouterRoute>> {
-        // RouterOS IPv4/IPv6 routes live in different namespaces.
+    async fn list_managed_routes(
+        &self,
+        table: &str,
+        require_ipv4: bool,
+        require_ipv6: bool,
+    ) -> Result<Vec<RouterRoute>> {
+        // RouterOS IPv4/IPv6 routes live in different namespaces. Disabled
+        // families are still scanned when available so stale owned routes can
+        // be removed, but an unavailable optional namespace must not prevent
+        // the configured family from operating.
         let mut routes = Vec::new();
-
-        let v4_print = CommandBuilder::new()
-            .command(route_command(RouteFamily::Ipv4, RouteOp::Print))
-            .query_equal(ROUTE_TABLE_FIELD, table)
-            .build();
-        let rows_v4 = self.send_rows("print ipv4 routes", v4_print).await?;
-        for row in &rows_v4 {
-            let mut route =
-                parse_router_route_from_reply("parse ipv4 route", RouteFamily::Ipv4, row)?;
-            if route.routing_table.is_empty() {
-                route.routing_table = table.to_string();
+        for (family, required) in [
+            (RouteFamily::Ipv4, require_ipv4),
+            (RouteFamily::Ipv6, require_ipv6),
+        ] {
+            match self.list_routes_for_family(table, family).await {
+                Ok(family_routes) => routes.extend(family_routes),
+                Err(error) if !required => {
+                    warn!(
+                        ?family,
+                        err = %error,
+                        "ros_route optional RouterOS route family is unavailable"
+                    );
+                }
+                Err(error) => return Err(error),
             }
-            routes.push(route);
-        }
-
-        let v6_print = CommandBuilder::new()
-            .command(route_command(RouteFamily::Ipv6, RouteOp::Print))
-            .query_equal(ROUTE_TABLE_FIELD, table)
-            .build();
-        let rows_v6 = self.send_rows("print ipv6 routes", v6_print).await?;
-        for row in &rows_v6 {
-            let mut route =
-                parse_router_route_from_reply("parse ipv6 route", RouteFamily::Ipv6, row)?;
-            if route.routing_table.is_empty() {
-                route.routing_table = table.to_string();
-            }
-            routes.push(route);
         }
 
         Ok(routes)

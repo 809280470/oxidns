@@ -31,8 +31,8 @@
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
@@ -253,6 +253,8 @@ use self::manager::{
 #[derive(Debug)]
 struct MikrotikExecutor {
     tag: String,
+    instance_id: u64,
+    active_registered: AtomicBool,
     metrics: Arc<RosRouteMetrics>,
     config: MikrotikConfig,
     manager: Option<RouteManager>,
@@ -267,6 +269,79 @@ struct RosRouteMetrics {
     dropped_total: AtomicU64,
     sync_error_total: AtomicU64,
     sync_timeout_total: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ActiveRouteInstance {
+    instance_id: u64,
+    metrics: Arc<RosRouteMetrics>,
+}
+
+static NEXT_ROUTE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn active_route_instances() -> &'static Mutex<AHashMap<String, Vec<ActiveRouteInstance>>> {
+    static INSTANCES: OnceLock<Mutex<AHashMap<String, Vec<ActiveRouteInstance>>>> = OnceLock::new();
+    INSTANCES.get_or_init(|| Mutex::new(AHashMap::new()))
+}
+
+fn register_active_route_instance(
+    tag: &str,
+    instance_id: u64,
+    metrics: Arc<RosRouteMetrics>,
+) -> Result<()> {
+    register_metric_source(metrics.clone())?;
+    let mut active = active_route_instances()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    active
+        .entry(tag.to_string())
+        .or_default()
+        .push(ActiveRouteInstance {
+            instance_id,
+            metrics,
+        });
+    Ok(())
+}
+
+/// Unregister one runtime and return whether it is the last instance for tag.
+///
+/// Candidate runtimes are initialized before the previous runtime is
+/// destroyed. Tracking all active instances prevents the old runtime from
+/// cleaning RouterOS state that the replacement owns. It also restores the
+/// previous metric source when candidate initialization later rolls back.
+fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
+    let (is_last, metric_replacement, remove_metric) = {
+        let mut active = active_route_instances()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(instances) = active.get_mut(tag) else {
+            return false;
+        };
+        let Some(index) = instances
+            .iter()
+            .position(|instance| instance.instance_id == instance_id)
+        else {
+            return false;
+        };
+        let was_metric_owner = index + 1 == instances.len();
+        instances.remove(index);
+        let is_last = instances.is_empty();
+        let metric_replacement = was_metric_owner
+            .then(|| instances.last().map(|instance| instance.metrics.clone()))
+            .flatten();
+        let remove_metric = was_metric_owner && is_last;
+        if is_last {
+            active.remove(tag);
+        }
+        (is_last, metric_replacement, remove_metric)
+    };
+
+    if let Some(metrics) = metric_replacement {
+        let _ = register_metric_source(metrics);
+    } else if remove_metric {
+        unregister_metric_source(tag);
+    }
+    is_last
 }
 
 impl RosRouteMetrics {
@@ -326,7 +401,6 @@ impl Plugin for MikrotikExecutor {
     }
 
     async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
-        register_metric_source(self.metrics.clone())?;
         if self.manager.is_none() || self.command_tx.is_some() {
             return Ok(());
         }
@@ -347,13 +421,18 @@ impl Plugin for MikrotikExecutor {
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = Some(runtime);
         }
+        register_active_route_instance(&self.tag, self.instance_id, self.metrics.clone())?;
+        self.active_registered.store(true, Ordering::Release);
         Ok(())
     }
 
     async fn destroy(&self) -> Result<()> {
-        unregister_metric_source(&self.tag);
+        let is_last_instance = self.active_registered.swap(false, Ordering::AcqRel)
+            && release_active_route_instance(&self.tag, self.instance_id);
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
-            runtime.shutdown(self.config.cleanup_on_shutdown).await;
+            runtime
+                .shutdown(self.config.cleanup_on_shutdown && is_last_instance)
+                .await;
         }
         Ok(())
     }
@@ -522,6 +601,8 @@ impl PluginFactory for MikrotikFactory {
 
         Ok(UninitializedPlugin::Executor(Box::new(MikrotikExecutor {
             tag: plugin_config.tag.clone(),
+            instance_id: NEXT_ROUTE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            active_registered: AtomicBool::new(false),
             metrics: Arc::new(RosRouteMetrics::new(plugin_config.tag.clone())),
             config,
             manager: Some(manager),
@@ -545,8 +626,13 @@ fn extract_observation(
     };
 
     let response = context.response()?;
-    if response.rcode() != Rcode::NoError {
-        return None;
+    match response.rcode() {
+        Rcode::NoError => {}
+        // NXDOMAIN is authoritative for the queried name and therefore
+        // withdraws the observed address family. This is essential when
+        // fixed_ttl=0 because no time-based cleanup will happen later.
+        Rcode::NXDomain => return Some((domain, scope, Vec::new())),
+        _ => return None,
     }
 
     // Collapse duplicated A/AAAA answers by IP and keep max TTL per IP.
@@ -928,20 +1014,24 @@ gateway6: "2001:db8::1"
         parse_plugin_config(Some(args), false).expect("config")
     }
 
-    fn context_with_nodata(qtype: RecordType) -> DnsContext {
+    fn context_with_rcode(qtype: RecordType, rcode: Rcode) -> DnsContext {
         let mut request = Message::new();
         request.add_question(Question::new(
             Name::from_ascii("example.com.").expect("domain"),
             qtype,
             DNSClass::IN,
         ));
-        let response = request.response(Rcode::NoError);
+        let response = request.response(rcode);
         let mut context = DnsContext::new(
             "127.0.0.1:5353".parse::<SocketAddr>().expect("client"),
             request,
         );
         context.set_response(response);
         context
+    }
+
+    fn context_with_nodata(qtype: RecordType) -> DnsContext {
+        context_with_rcode(qtype, Rcode::NoError)
     }
 
     #[test]
@@ -986,5 +1076,41 @@ routing_table: "policy"
             extract_observation(&mut a_context, &config).expect("A NODATA observation");
         assert_eq!(scope, ObservationScope::Ipv4);
         assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn nxdomain_withdraws_only_the_queried_address_family() {
+        let config = observation_config();
+        let mut context = context_with_rcode(RecordType::AAAA, Rcode::NXDomain);
+
+        let (domain, scope, addrs) =
+            extract_observation(&mut context, &config).expect("AAAA NXDOMAIN observation");
+
+        assert_eq!(domain, "example.com");
+        assert_eq!(scope, ObservationScope::Ipv6);
+        assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn same_tag_runtime_replacement_only_allows_last_instance_cleanup() {
+        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(4, Ordering::Relaxed);
+        let success_tag = format!("route-reload-success-{sequence}");
+        let old_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
+        let new_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
+        register_active_route_instance(&success_tag, sequence, old_metrics).expect("old runtime");
+        register_active_route_instance(&success_tag, sequence + 1, new_metrics)
+            .expect("replacement runtime");
+        assert!(!release_active_route_instance(&success_tag, sequence));
+        assert!(release_active_route_instance(&success_tag, sequence + 1));
+
+        let rollback_tag = format!("route-reload-rollback-{sequence}");
+        let old_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
+        let candidate_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
+        register_active_route_instance(&rollback_tag, sequence + 2, old_metrics)
+            .expect("old runtime");
+        register_active_route_instance(&rollback_tag, sequence + 3, candidate_metrics)
+            .expect("candidate runtime");
+        assert!(!release_active_route_instance(&rollback_tag, sequence + 3));
+        assert!(release_active_route_instance(&rollback_tag, sequence + 2));
     }
 }

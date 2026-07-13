@@ -7,7 +7,7 @@
 //! - execute idempotent create/update/delete through [`MikrotikApi`]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ahash::{AHashMap, AHashSet};
@@ -40,7 +40,6 @@ const COMMENT_FIELD_SEEN: &str = "seen";
 const COMMENT_FIELD_KIND: &str = "kind";
 const COMMENT_KIND_GATEWAY_CHECK: &str = "gateway-check";
 const MAX_COMMENT_REFRESH_INTERVAL_SECS: u64 = 300;
-static START_UNIX_SECS: OnceLock<u64> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub(super) struct RouteManagerConfig {
@@ -201,8 +200,9 @@ pub(super) struct RouteEntry {
     pub(super) synced_expires_at_unix: Option<u64>,
     /// RouterOS internal route id.
     pub(super) router_id: Option<String>,
-    /// Whether route was restored from RouterOS comment metadata.
-    pub(super) recovered_from_comment: bool,
+    /// Whether RouterOS recovery could only restore one representative domain
+    /// and therefore cannot prove that withdrawing it removes every owner.
+    pub(super) recovered_ownership_incomplete: bool,
     /// Pending/synced transition state for API sync loop.
     pub(super) sync_state: SyncState,
 }
@@ -825,7 +825,7 @@ impl RouteManager {
                     last_refresh_unix: now,
                     synced_expires_at_unix: None,
                     router_id: None,
-                    recovered_from_comment: false,
+                    recovered_ownership_incomplete: false,
                     sync_state: SyncState::PendingCreate,
                 },
             );
@@ -961,14 +961,17 @@ impl RouteManager {
                 entry.ref_count = entry.ref_count.saturating_add(1);
             }
             entry.domain_expiries.insert(domain.to_string(), expires_at);
-            entry.expires_at_unix = entry
+            let known_expiry = entry
                 .domain_expiries
                 .values()
                 .copied()
                 .max()
                 .unwrap_or(expires_at);
-            entry.recovered_from_comment = false;
-
+            entry.expires_at_unix = if entry.recovered_ownership_incomplete {
+                entry.expires_at_unix.max(known_expiry)
+            } else {
+                known_expiry
+            };
             if entry.router_id.is_none() {
                 entry.sync_state = SyncState::PendingCreate;
             } else if matches!(entry.sync_state, SyncState::PendingDelete)
@@ -1003,7 +1006,7 @@ impl RouteManager {
                 last_refresh_unix: now,
                 synced_expires_at_unix: None,
                 router_id: None,
-                recovered_from_comment: false,
+                recovered_ownership_incomplete: false,
                 sync_state: SyncState::PendingCreate,
             },
         );
@@ -1018,8 +1021,19 @@ impl RouteManager {
             return None;
         }
 
+        let preserve_recovered_route = entry.recovered_ownership_incomplete
+            && entry.ref_count == 1
+            && entry.expires_at_unix > now;
         entry.domain_expiries.remove(domain);
         entry.ref_count = entry.ref_count.saturating_sub(1);
+        if preserve_recovered_route {
+            // A RouterOS comment stores only one representative qname. After a
+            // restart, withdrawing that qname is not proof that no other
+            // domains still reference the same IP. Keep the remote metadata
+            // unchanged and let its persisted max expiry retire the route.
+            return Some(key);
+        }
+
         entry.last_refresh_unix = now;
         if entry.comment_domain == domain || entry.comment_domain.is_empty() {
             entry.comment_domain = select_comment_domain(&entry.domains);
@@ -1029,7 +1043,12 @@ impl RouteManager {
             entry.expires_at_unix = now;
             entry.sync_state = SyncState::PendingDelete;
         } else {
-            entry.expires_at_unix = entry.domain_expiries.values().copied().max().unwrap_or(now);
+            let known_expiry = entry.domain_expiries.values().copied().max().unwrap_or(now);
+            entry.expires_at_unix = if entry.recovered_ownership_incomplete {
+                entry.expires_at_unix.max(known_expiry)
+            } else {
+                known_expiry
+            };
             if matches!(entry.sync_state, SyncState::Synced) {
                 entry.sync_state = SyncState::Dirty;
             }
@@ -1080,7 +1099,12 @@ impl RouteManager {
                 continue;
             }
 
-            let max_exp = route.domain_expiries.values().copied().max().unwrap_or(now);
+            let known_expiry = route.domain_expiries.values().copied().max().unwrap_or(now);
+            let max_exp = if route.recovered_ownership_incomplete {
+                route.expires_at_unix.max(known_expiry)
+            } else {
+                known_expiry
+            };
             if max_exp != route.expires_at_unix {
                 route.expires_at_unix = max_exp;
                 if matches!(route.sync_state, SyncState::Synced) {
@@ -1169,7 +1193,6 @@ impl RouteManager {
                         Ok(route_id) => {
                             if let Some(route) = self.routes.get_mut(&key) {
                                 route.router_id = Some(route_id);
-                                route.recovered_from_comment = false;
                                 route.sync_state = SyncState::Synced;
                                 route.last_refresh_unix = now;
                                 route.synced_expires_at_unix = Some(entry_snapshot.expires_at_unix);
@@ -1226,7 +1249,11 @@ impl RouteManager {
         let now = unix_now();
         let rows = self
             .api
-            .list_managed_routes(&self.cfg.routing_table)
+            .list_managed_routes(
+                &self.cfg.routing_table,
+                self.cfg.gateway4.is_some(),
+                self.cfg.gateway6.is_some(),
+            )
             .await?;
         let mut seen_keys = AHashSet::new();
         let mut first_error = None;
@@ -1392,7 +1419,7 @@ impl RouteManager {
                 last_refresh_unix: meta.last_refresh_unix,
                 synced_expires_at_unix: Some(meta.expires_at_unix),
                 router_id: Some(route.id.clone()),
-                recovered_from_comment: true,
+                recovered_ownership_incomplete: true,
                 sync_state: if expired || persistent_residue {
                     SyncState::PendingDelete
                 } else {
@@ -1505,7 +1532,11 @@ impl RouteManager {
         self.ensure_initialized().await?;
         let routes = self
             .api
-            .list_managed_routes(&self.cfg.routing_table)
+            .list_managed_routes(
+                &self.cfg.routing_table,
+                self.cfg.gateway4.is_some(),
+                self.cfg.gateway6.is_some(),
+            )
             .await?;
         for route in routes {
             if RouteCommentCodec::decode(
@@ -1664,13 +1695,7 @@ pub(super) fn is_default_route_dst(dst: &str) -> bool {
 
 #[inline]
 fn unix_now() -> u64 {
-    let start_unix = START_UNIX_SECS.get_or_init(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    });
-    start_unix.saturating_add(AppClock::elapsed_millis() / 1000)
+    AppClock::now_timestamp() / 1000
 }
 
 #[cfg(test)]
@@ -1685,7 +1710,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MikrotikApi for NoopApi {
-        async fn list_managed_routes(&self, _table: &str) -> Result<Vec<RouterRoute>> {
+        async fn list_managed_routes(
+            &self,
+            _table: &str,
+            _require_ipv4: bool,
+            _require_ipv6: bool,
+        ) -> Result<Vec<RouterRoute>> {
             unreachable!("this test only mutates local route state")
         }
 
@@ -1732,6 +1762,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockApiState {
         routes: Vec<RouterRoute>,
+        list_requirements: Vec<(bool, bool)>,
         fail_upserts: AHashSet<IpAddr>,
         upsert_attempts: Vec<IpAddr>,
         deleted_ids: Vec<String>,
@@ -1753,8 +1784,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MikrotikApi for MockApi {
-        async fn list_managed_routes(&self, _table: &str) -> Result<Vec<RouterRoute>> {
-            Ok(self.state.lock().expect("mock lock").routes.clone())
+        async fn list_managed_routes(
+            &self,
+            _table: &str,
+            require_ipv4: bool,
+            require_ipv6: bool,
+        ) -> Result<Vec<RouterRoute>> {
+            let mut state = self.state.lock().expect("mock lock");
+            state.list_requirements.push((require_ipv4, require_ipv6));
+            Ok(state.routes.clone())
         }
 
         async fn find_route(
@@ -1824,6 +1862,7 @@ mod tests {
     }
 
     fn manager_config(fixed_ttl: Option<u32>) -> RouteManagerConfig {
+        AppClock::start();
         RouteManagerConfig {
             plugin_tag: "route-test".to_string(),
             routing_table: "via_proxy".to_string(),
@@ -1840,6 +1879,13 @@ mod tests {
 
     fn manager_with_timeless_dynamic_routes() -> RouteManager {
         RouteManager::new(Arc::new(NoopApi), manager_config(Some(0)))
+    }
+
+    #[test]
+    fn unix_now_matches_the_application_timestamp() {
+        AppClock::start();
+        let app_now = AppClock::now_timestamp() / 1000;
+        assert!(unix_now().abs_diff(app_now) <= 1);
     }
 
     #[test]
@@ -2075,7 +2121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_recovers_timeless_domain_binding() {
+    async fn reconcile_recovers_timeless_domain_binding_conservatively() {
         AppClock::start();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 13));
         let api = Arc::new(MockApi::with_state(MockApiState {
@@ -2106,8 +2152,67 @@ mod tests {
         let key = RouteKey::new(ip, "via_proxy".to_string());
         assert_eq!(
             manager.routes.get(&key).map(|route| route.sync_state),
-            Some(SyncState::PendingDelete)
+            Some(SyncState::Synced)
         );
+        assert_eq!(manager.routes[&key].ref_count, 0);
+        assert_eq!(manager.routes[&key].expires_at_unix, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn recovered_route_survives_representative_domain_withdrawal_until_expiry() {
+        AppClock::start();
+        let now = unix_now();
+        let expires_at = now + 300;
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 18));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*shared".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: format!("{ip}/32"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(format!(
+                    "fdns;pg=route-test;dm=first.example.;exp={expires_at};seen={now}"
+                )),
+            }],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api, manager_config(None));
+
+        manager
+            .reconcile_from_router()
+            .await
+            .expect("recover route");
+        assert!(manager.routes[&key].recovered_ownership_incomplete);
+
+        manager.apply_observation(
+            "first.example.".to_string(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            now + 1,
+        );
+        assert_eq!(manager.routes[&key].expires_at_unix, expires_at);
+
+        manager.apply_observation(
+            "first.example.".to_string(),
+            ObservationScope::Ipv4,
+            Vec::new(),
+            now + 2,
+        );
+
+        let route = &manager.routes[&key];
+        assert_eq!(route.ref_count, 0);
+        assert_eq!(route.expires_at_unix, expires_at);
+        assert_eq!(route.comment_domain, "first.example.");
+        assert_eq!(route.sync_state, SyncState::Synced);
+
+        manager.update_route_expiration(expires_at);
+        assert_eq!(manager.routes[&key].sync_state, SyncState::PendingDelete);
     }
 
     #[test]
@@ -2207,6 +2312,7 @@ mod tests {
         manager.reconcile_from_router().await.expect("reconcile");
 
         let state = api.state.lock().expect("mock lock");
+        assert_eq!(state.list_requirements, vec![(true, false)]);
         assert_eq!(state.deleted_ids, vec!["*disabled-v6".to_string()]);
         assert!(state.routes.is_empty());
     }
