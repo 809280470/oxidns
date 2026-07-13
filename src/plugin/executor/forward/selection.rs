@@ -48,12 +48,6 @@ enum NegativeResponseKey {
 }
 
 #[derive(Debug)]
-struct NegativeVote {
-    key: NegativeResponseKey,
-    count: usize,
-}
-
-#[derive(Debug)]
 pub(super) struct SelectedResponse {
     pub(super) message: Message,
     pub(super) disposition: Option<ResponseDisposition>,
@@ -71,7 +65,8 @@ struct SelectionState<'a> {
     best_negative_response: Option<Message>,
     best_negative_disposition: Option<ResponseDisposition>,
     negative_votes: usize,
-    negative_vote_buckets: Vec<NegativeVote>,
+    nxdomain_votes: usize,
+    nodata_votes: usize,
 }
 
 impl<'a> SelectionState<'a> {
@@ -87,7 +82,8 @@ impl<'a> SelectionState<'a> {
             best_negative_response: None,
             best_negative_disposition: None,
             negative_votes: 0,
-            negative_vote_buckets: Vec::new(),
+            nxdomain_votes: 0,
+            nodata_votes: 0,
         }
     }
 
@@ -163,22 +159,14 @@ impl<'a> SelectionState<'a> {
     }
 
     fn record_negative_vote(&mut self, key: NegativeResponseKey) {
-        if let Some(bucket) = self
-            .negative_vote_buckets
-            .iter_mut()
-            .find(|bucket| bucket.key == key)
-        {
-            bucket.count += 1;
-            return;
+        match key {
+            NegativeResponseKey::NxDomain => self.nxdomain_votes += 1,
+            NegativeResponseKey::NoData => self.nodata_votes += 1,
         }
-        self.negative_vote_buckets
-            .push(NegativeVote { key, count: 1 });
     }
 
     fn has_negative_consensus(&self, required_votes: usize) -> bool {
-        self.negative_vote_buckets
-            .iter()
-            .any(|bucket| bucket.count >= required_votes)
+        self.nxdomain_votes >= required_votes || self.nodata_votes >= required_votes
     }
 }
 
@@ -250,8 +238,8 @@ async fn select_balanced(
     question: Option<&Question>,
 ) -> (Option<SelectedResponse>, Option<String>, bool) {
     let mut state = SelectionState::new(question);
-    let mut negative_grace =
-        std::pin::Pin::from(Box::new(tokio::time::sleep(BALANCED_NEGATIVE_GRACE)));
+    let negative_grace = tokio::time::sleep(BALANCED_NEGATIVE_GRACE);
+    tokio::pin!(negative_grace);
 
     loop {
         tokio::select! {
