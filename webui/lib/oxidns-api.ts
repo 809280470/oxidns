@@ -92,6 +92,12 @@ export interface ControlResponse {
   reload: ReloadSnapshot;
 }
 
+export type ProcessMemoryKind =
+  | "rss"
+  | "private_working_set"
+  | "private_commit"
+  | "working_set";
+
 export interface SystemResponse {
   ok: boolean;
   version: string;
@@ -104,6 +110,7 @@ export interface SystemResponse {
   reload: ReloadSnapshot;
   process_cpu_percent?: number;
   process_memory_mb?: number;
+  process_memory_kind?: ProcessMemoryKind;
   system_memory_total_mb?: number;
 }
 

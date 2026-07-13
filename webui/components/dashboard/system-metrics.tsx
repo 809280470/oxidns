@@ -8,6 +8,7 @@ import { Cpu, HardDrive, HeartPulse, Puzzle } from "lucide-react";
 import { useAppStore } from "@/lib/store";
 import { WEBUI } from "@/lib/i18n";
 import type { TranslationParams } from "@/lib/i18n";
+import type { ProcessMemoryKind } from "@/lib/oxidns-api";
 import { useI18n } from "@/lib/i18n/provider";
 
 // Ticks locally every second; re-calibrates whenever backendUptimeMs changes.
@@ -88,7 +89,22 @@ export function SystemMetrics() {
   const cpuPct = system?.process_cpu_percent ?? 0;
   const memMb = system?.process_memory_mb ?? 0;
   const totalMemMb = system?.system_memory_total_mb ?? 0;
-  const memPct = totalMemMb > 0 ? Math.min((memMb / totalMemMb) * 100, 100) : 0;
+  const memoryKind: ProcessMemoryKind =
+    system?.process_memory_kind ??
+    (system?.os === "windows" ? "working_set" : "rss");
+  const usesPhysicalMemory = memoryKind !== "private_commit";
+  const memPct =
+    usesPhysicalMemory && totalMemMb > 0
+      ? Math.min((memMb / totalMemMb) * 100, 100)
+      : 0;
+  const memoryMetricLabel =
+    memoryKind === "private_working_set"
+      ? t(WEBUI.dashboard.processPrivateWorkingSet)
+      : memoryKind === "private_commit"
+        ? t(WEBUI.dashboard.processPrivateCommit)
+        : memoryKind === "working_set"
+          ? t(WEBUI.dashboard.processWorkingSet)
+          : t(WEBUI.dashboard.processRss);
 
   const healthStatus = health?.status ?? "unknown";
   const isHealthy = healthStatus === "ok";
@@ -183,19 +199,22 @@ export function SystemMetrics() {
               {system ? formatMemory(memMb) : "-"}
             </div>
             <p className="text-xs text-muted-foreground mt-0.5">
-              {totalMemMb > 0
-                ? t(WEBUI.dashboard.memTotal, {
+              {usesPhysicalMemory && totalMemMb > 0
+                ? t(WEBUI.dashboard.memPhysical, {
+                    metric: memoryMetricLabel,
                     total: formatMemory(totalMemMb),
                     pct: memPct.toFixed(1),
                   })
-                : t(WEBUI.dashboard.processRss)}
+                : memoryMetricLabel}
             </p>
           </div>
-          <Progress
-            value={memPct}
-            className="h-1.5"
-            indicatorClassName={usageBarColor(memPct)}
-          />
+          {usesPhysicalMemory && totalMemMb > 0 && (
+            <Progress
+              value={memPct}
+              className="h-1.5"
+              indicatorClassName={usageBarColor(memPct)}
+            />
+          )}
         </CardContent>
       </Card>
 
