@@ -108,7 +108,7 @@ export function PluginConfigModeEditor({
         fields,
         parsedValues,
       );
-      onValidityChange?.(isPluginConfigFormValid(fields, nextFieldValues));
+      onValidityChange?.(isPluginConfigFormValid(fields, parsedValues));
       setFieldValues(nextFieldValues);
       onChange(parsedValues);
       return;

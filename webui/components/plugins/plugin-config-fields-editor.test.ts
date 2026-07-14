@@ -139,6 +139,17 @@ describe("time matcher config form", () => {
       periods: [],
     });
   });
+
+  it("rejects malformed raw YAML period values before normalization", () => {
+    const rawYamlValues = { periods: ["bad"] };
+    const normalizedValues = createPluginConfigFormValues(
+      fields,
+      rawYamlValues,
+    );
+
+    expect(isPluginConfigFormValid(fields, rawYamlValues)).toBe(false);
+    expect(isPluginConfigFormValid(fields, normalizedValues)).toBe(true);
+  });
 });
 
 describe("optional object config fields", () => {
