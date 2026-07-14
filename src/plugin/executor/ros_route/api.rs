@@ -166,7 +166,12 @@ pub(super) struct MikrotikRsClient {
     username: String,
     password: String,
     timeouts: MikrotikApiTimeouts,
-    connection: tokio::sync::Mutex<Option<MikrotikDevice>>,
+    connection: tokio::sync::Mutex<ConnectionSlot>,
+}
+
+struct ConnectionSlot {
+    generation: u64,
+    device: Option<MikrotikDevice>,
 }
 
 impl Debug for MikrotikRsClient {
@@ -190,21 +195,27 @@ impl MikrotikRsClient {
             username,
             password,
             timeouts,
-            connection: tokio::sync::Mutex::new(None),
+            connection: tokio::sync::Mutex::new(ConnectionSlot {
+                generation: 0,
+                device: None,
+            }),
         }
     }
 
-    async fn invalidate_connection(&self) {
+    async fn invalidate_connection(&self, generation: u64) {
         let mut guard = self.connection.lock().await;
-        *guard = None;
+        if guard.generation == generation {
+            guard.device = None;
+        }
     }
 
-    async fn get_or_connect(&self) -> Result<MikrotikDevice> {
-        {
-            let guard = self.connection.lock().await;
-            if let Some(device) = guard.as_ref() {
-                return Ok(device.clone());
-            }
+    async fn get_or_connect(&self) -> Result<(MikrotikDevice, u64)> {
+        // Keep the lock for the full connect attempt. Concurrent route
+        // pipelines then share one login instead of opening one RouterOS
+        // session per in-flight command after startup or reconnect.
+        let mut guard = self.connection.lock().await;
+        if let Some(device) = guard.device.as_ref() {
+            return Ok((device.clone(), guard.generation));
         }
 
         let password = if self.password.is_empty() {
@@ -234,29 +245,29 @@ impl MikrotikRsClient {
             }
         };
 
-        let mut guard = self.connection.lock().await;
-        *guard = Some(device.clone());
-        Ok(device)
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.device = Some(device.clone());
+        Ok((device, guard.generation))
     }
 
     async fn send_command_receiver(
         &self,
         action: &str,
         command: Command,
-    ) -> Result<tokio::sync::mpsc::Receiver<Event>> {
-        let device = self.get_or_connect().await?;
+    ) -> Result<(tokio::sync::mpsc::Receiver<Event>, u64)> {
+        let (device, generation) = self.get_or_connect().await?;
         let send_result =
             tokio::time::timeout(self.timeouts.send, device.send_command(command)).await;
         match send_result {
-            Ok(Ok(receiver)) => Ok(receiver),
+            Ok(Ok(receiver)) => Ok((receiver, generation)),
             Ok(Err(error)) => {
-                self.invalidate_connection().await;
+                self.invalidate_connection(generation).await;
                 Err(DnsError::plugin(format!(
                     "ros_route {action} send failed: {error}"
                 )))
             }
             Err(_) => {
-                self.invalidate_connection().await;
+                self.invalidate_connection(generation).await;
                 Err(DnsError::plugin(format!(
                     "ros_route {action} send timeout after {}s",
                     self.timeouts.send.as_secs()
@@ -265,17 +276,17 @@ impl MikrotikRsClient {
         }
     }
 
-    async fn finish_receive<T>(&self, result: Result<T>) -> Result<T> {
+    async fn finish_receive<T>(&self, generation: u64, result: Result<T>) -> Result<T> {
         if result.is_err() {
-            self.invalidate_connection().await;
+            self.invalidate_connection(generation).await;
         }
         result
     }
 
     async fn send_rows(&self, action: &str, command: Command) -> Result<Vec<RouterReply>> {
-        let mut receiver = self.send_command_receiver(action, command).await?;
+        let (mut receiver, generation) = self.send_command_receiver(action, command).await?;
         let result = receive_rows(action, self.timeouts.receive, &mut receiver).await;
-        self.finish_receive(result).await
+        self.finish_receive(generation, result).await
     }
 
     async fn find_route_by_exact_comment(
@@ -836,11 +847,11 @@ impl MikrotikApi for MikrotikRsClient {
             RouteFamily::Ipv6 => "print ipv6 connection destinations",
         };
         let command = connection_destinations_command(family, destinations);
-        let mut receiver = self.send_command_receiver(action, command).await?;
+        let (mut receiver, generation) = self.send_command_receiver(action, command).await?;
         let result =
             receive_connection_destinations(action, family, self.timeouts.receive, &mut receiver)
                 .await;
-        self.finish_receive(result).await
+        self.finish_receive(generation, result).await
     }
 
     async fn healthcheck(&self) -> Result<()> {

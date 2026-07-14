@@ -6,6 +6,7 @@
 //! - reconcile local state with RouterOS route table/comment metadata
 //! - execute idempotent create/update/delete through [`MikrotikApi`]
 
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +21,7 @@ use super::api::{MikrotikApi, RouterRoute};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::task as task_center;
+use crate::plugin::executor::ros_common::ObservedAddr;
 
 const ROUTE_DEFAULT_V4: &str = "0.0.0.0/0";
 const ROUTE_DEFAULT_V6: &str = "::/0";
@@ -34,6 +36,10 @@ const RECONCILE_INTERVAL_SECS: u64 = 180;
 const PERSISTENT_RELOAD_INTERVAL_SECS: u64 = 60;
 const CONNECTION_GUARD_RETRY_INTERVAL_SECS: u64 = SWEEP_INTERVAL_SECS;
 const CONNECTION_QUERY_BATCH_SIZE: usize = 128;
+/// Maximum number of route upserts in flight on the shared RouterOS API
+/// connection. This preserves CDN-answer throughput without allowing one DNS
+/// response to monopolize the command response buffer.
+const UPSERT_PIPELINE_SIZE: usize = 16;
 
 const COMMENT_FIELD_PLUGIN: &str = "pg";
 const COMMENT_FIELD_DOMAIN: &str = "dm";
@@ -490,12 +496,6 @@ fn owned_comment_has_kind(
     owner_matches && kind_matches
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) struct ObservedAddr {
-    pub(super) addr: IpAddr,
-    pub(super) ttl_secs: u32,
-}
-
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) enum ObservationScope {
     Ipv4,
@@ -511,22 +511,15 @@ impl ObservationScope {
             (Self::Ipv4 | Self::Both, IpAddr::V4(_)) | (Self::Ipv6 | Self::Both, IpAddr::V6(_))
         )
     }
-
-    #[inline]
-    fn family_scopes(self) -> &'static [Self] {
-        match self {
-            Self::Ipv4 => &[Self::Ipv4],
-            Self::Ipv6 => &[Self::Ipv6],
-            Self::Both => &[Self::Ipv4, Self::Ipv6],
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 struct PendingObservation {
+    domain: String,
+    replace_scope: ObservationScope,
     addrs: Vec<ObservedAddr>,
     observed_at_unix: u64,
-    /// Upper bound for replaying this complete family observation.
+    /// Upper bound for replaying this complete replacement observation.
     replay_until_unix: u64,
     /// Whether this family entry came from a name-level NXDOMAIN response.
     name_level_negative: bool,
@@ -536,7 +529,7 @@ struct PendingObservation {
 pub(super) enum ManagerCommand {
     ObserveDomain {
         domain: String,
-        scope: ObservationScope,
+        replace_scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
         negative_ttl_secs: Option<u32>,
         wait: Option<oneshot::Sender<Result<()>>>,
@@ -754,7 +747,7 @@ pub(super) struct RouteManager {
     persistent_ips: AHashSet<String>,
     pub(super) domain_bindings: AHashMap<String, DomainBinding>,
     pub(super) routes: AHashMap<RouteKey, RouteEntry>,
-    pending_observations: AHashMap<(String, ObservationScope), PendingObservation>,
+    pending_observations: VecDeque<PendingObservation>,
     /// Earliest next conntrack check for a deferred route deletion. This keeps
     /// repeated DNS withdrawals from turning into repeated RouterOS reads.
     connection_retry_after: AHashMap<RouteKey, u64>,
@@ -770,7 +763,7 @@ impl RouteManager {
             metrics: None,
             domain_bindings: AHashMap::new(),
             routes: AHashMap::new(),
-            pending_observations: AHashMap::new(),
+            pending_observations: VecDeque::new(),
             connection_retry_after: AHashMap::new(),
             initialized: false,
         }
@@ -1099,7 +1092,7 @@ impl RouteManager {
     fn apply_observation(
         &mut self,
         domain: String,
-        scope: ObservationScope,
+        replace_scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
         now: u64,
     ) -> Vec<RouteKey> {
@@ -1107,9 +1100,6 @@ impl RouteManager {
         // Deduplicate answer IPs and keep max ttl per IP for this observation.
         let mut dedup_expiries = AHashMap::<IpAddr, u64>::new();
         for observed in addrs {
-            if !scope.contains(observed.addr) {
-                continue;
-            }
             let family = RouteFamily::from_ip(observed.addr);
             if self.gateway_for(family).is_none() {
                 continue;
@@ -1133,7 +1123,7 @@ impl RouteManager {
         let removed_ips = binding
             .ips
             .iter()
-            .filter(|ip| scope.contains(**ip) && !dedup_expiries.contains_key(ip))
+            .filter(|ip| replace_scope.contains(**ip) && !dedup_expiries.contains_key(ip))
             .copied()
             .collect::<Vec<_>>();
         for ip in &removed_ips {
@@ -1166,81 +1156,64 @@ impl RouteManager {
     fn queue_pending_observation(
         &mut self,
         domain: String,
-        scope: ObservationScope,
+        replace_scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
         negative_ttl_secs: Option<u32>,
         observed_at_unix: u64,
     ) {
-        let name_level_negative = scope == ObservationScope::Both && addrs.is_empty();
-        if !name_level_negative {
+        let name_level_negative = replace_scope == ObservationScope::Both && addrs.is_empty();
+        if name_level_negative {
+            // A name-level denial supersedes every earlier replacement for the
+            // same name, regardless of family.
+            self.pending_observations
+                .retain(|observation| observation.domain != domain);
+        } else {
             // Any later response other than NXDOMAIN proves that a previously
             // queued name-level denial is stale for the whole name, including
             // its opposite-family entry. NODATA only scopes its own family,
             // but it still proves the name exists and cannot coexist with an
             // older NXDOMAIN.
-            self.pending_observations
-                .retain(|(queued_domain, _), observation| {
-                    queued_domain != &domain || !observation.name_level_negative
-                });
+            self.pending_observations.retain(|observation| {
+                observation.domain != domain || !observation.name_level_negative
+            });
         }
-        for &family_scope in scope.family_scopes() {
-            let family = match family_scope {
-                ObservationScope::Ipv4 => RouteFamily::Ipv4,
-                ObservationScope::Ipv6 => RouteFamily::Ipv6,
-                ObservationScope::Both => unreachable!("family scopes are concrete"),
-            };
-            if self.gateway_for(family).is_none() {
-                continue;
-            }
-            let family_addrs = addrs
+        let replay_until_unix = if addrs.is_empty() {
+            // A negative response without an SOA is not safely cacheable, and
+            // an explicit zero TTL expires immediately.
+            observed_at_unix.saturating_add(u64::from(negative_ttl_secs.unwrap_or(0)))
+        } else {
+            addrs
                 .iter()
-                .copied()
-                .filter(|observed| family_scope.contains(observed.addr))
-                .collect::<Vec<_>>();
-            let replay_until_unix = if family_addrs.is_empty() {
-                // A negative response without an SOA is not safely cacheable,
-                // and an explicit zero TTL expires immediately.
-                observed_at_unix.saturating_add(u64::from(negative_ttl_secs.unwrap_or(0)))
-            } else {
-                family_addrs
-                    .iter()
-                    .map(|observed| observed_at_unix.saturating_add(u64::from(observed.ttl_secs)))
-                    .max()
-                    .unwrap_or(observed_at_unix)
-            };
-            let key = (domain.clone(), family_scope);
-            if !self.pending_observations.contains_key(&key)
-                && self.pending_observations.len() >= MAX_PENDING_OBSERVATIONS
-            {
-                self.prune_pending_observations(unix_now());
-            }
-            if !self.pending_observations.contains_key(&key)
-                && self.pending_observations.len() >= MAX_PENDING_OBSERVATIONS
-            {
-                warn!(
-                    plugin = %self.cfg.plugin_tag,
-                    domain = %domain,
-                    ?family_scope,
-                    capacity = MAX_PENDING_OBSERVATIONS,
-                    "ros_route pending observation backlog is full, observation dropped"
-                );
-                continue;
-            }
-            self.pending_observations.insert(
-                key,
-                PendingObservation {
-                    addrs: family_addrs,
-                    observed_at_unix,
-                    replay_until_unix,
-                    name_level_negative,
-                },
-            );
+                .map(|observed| observed_at_unix.saturating_add(u64::from(observed.ttl_secs)))
+                .max()
+                .unwrap_or(observed_at_unix)
+        };
+        if self.pending_observations.len() >= MAX_PENDING_OBSERVATIONS {
+            self.prune_pending_observations(unix_now());
         }
+        if self.pending_observations.len() >= MAX_PENDING_OBSERVATIONS {
+            warn!(
+                plugin = %self.cfg.plugin_tag,
+                domain = %domain,
+                ?replace_scope,
+                capacity = MAX_PENDING_OBSERVATIONS,
+                "ros_route pending observation backlog is full, observation dropped"
+            );
+            return;
+        }
+        self.pending_observations.push_back(PendingObservation {
+            domain,
+            replace_scope,
+            addrs,
+            observed_at_unix,
+            replay_until_unix,
+            name_level_negative,
+        });
     }
 
     fn prune_pending_observations(&mut self, now: u64) {
         self.pending_observations
-            .retain(|_, observation| observation.replay_until_unix > now);
+            .retain(|observation| observation.replay_until_unix > now);
     }
 
     fn replay_pending_observations(&mut self) {
@@ -1248,13 +1221,13 @@ impl RouteManager {
         let pending = self
             .pending_observations
             .iter()
-            .filter(|(_, observation)| observation.replay_until_unix > now)
-            .map(|((domain, scope), observation)| (domain.clone(), *scope, observation.clone()))
+            .filter(|observation| observation.replay_until_unix > now)
+            .cloned()
             .collect::<Vec<_>>();
-        for (domain, scope, observation) in pending {
+        for observation in pending {
             self.apply_observation(
-                domain,
-                scope,
+                observation.domain,
+                observation.replace_scope,
                 observation.addrs,
                 observation.observed_at_unix,
             );
@@ -1504,10 +1477,12 @@ impl RouteManager {
         if keys.is_empty() {
             return Ok(());
         }
-        // Snapshot-first loop avoids borrow conflicts and keeps each key operation
-        // atomic. Isolate failures per key so one permanent conflict cannot
-        // starve unrelated pending routes.
+        // Snapshot first, then pipeline upserts in bounded batches. A DNS
+        // answer can contain many CDN addresses; serial writes amplify RouterOS
+        // round-trip latency, while an unbounded batch can exhaust the client
+        // response buffer.
         let mut first_error = None;
+        let mut pending_upserts = Vec::new();
         let mut pending_deletes = Vec::new();
         for key in keys {
             let Some(entry_snapshot) = self.routes.get(&key).cloned() else {
@@ -1519,7 +1494,6 @@ impl RouteManager {
 
             match entry_snapshot.sync_state {
                 SyncState::PendingCreate | SyncState::Dirty if entry_snapshot.has_owners() => {
-                    // Upsert route with latest gateway/comment metadata.
                     let mut comment_snapshot = entry_snapshot.clone();
                     comment_snapshot.last_refresh_unix = now;
                     let comment = RouteCommentCodec::encode(
@@ -1527,36 +1501,47 @@ impl RouteManager {
                         &self.cfg.plugin_tag,
                         &comment_snapshot,
                     );
-                    match self
-                        .api
-                        .upsert_host_route(
-                            &entry_snapshot.key,
-                            &entry_snapshot.gateway,
-                            entry_snapshot.distance,
-                            &comment,
-                            &self.cfg.comment_prefix,
-                            &self.cfg.plugin_tag,
-                        )
-                        .await
-                    {
-                        Ok(route_id) => {
-                            if let Some(route) = self.routes.get_mut(&key) {
-                                route.router_id = Some(route_id);
-                                route.sync_state = SyncState::Synced;
-                                route.last_refresh_unix = now;
-                                route.synced_expires_at_unix =
-                                    Some(RouteCommentCodec::expires_at_unix(&entry_snapshot));
-                            }
-                        }
-                        Err(error) => {
-                            first_error.get_or_insert(error);
-                        }
-                    }
+                    pending_upserts.push((key, entry_snapshot, comment));
                 }
                 SyncState::PendingDelete => {
                     pending_deletes.push(entry_snapshot.key);
                 }
                 _ => {}
+            }
+        }
+
+        for batch in pending_upserts.chunks(UPSERT_PIPELINE_SIZE) {
+            let api = self.api.as_ref();
+            let prefix = self.cfg.comment_prefix.as_str();
+            let plugin_tag = self.cfg.plugin_tag.as_str();
+            let results =
+                futures::future::join_all(batch.iter().map(|(_, entry_snapshot, comment)| {
+                    api.upsert_host_route(
+                        &entry_snapshot.key,
+                        &entry_snapshot.gateway,
+                        entry_snapshot.distance,
+                        comment,
+                        prefix,
+                        plugin_tag,
+                    )
+                }))
+                .await;
+
+            for ((key, entry_snapshot, _), result) in batch.iter().zip(results) {
+                match result {
+                    Ok(route_id) => {
+                        if let Some(route) = self.routes.get_mut(key) {
+                            route.router_id = Some(route_id);
+                            route.sync_state = SyncState::Synced;
+                            route.last_refresh_unix = now;
+                            route.synced_expires_at_unix =
+                                Some(RouteCommentCodec::expires_at_unix(entry_snapshot));
+                        }
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
         }
         self.sync_pending_deletes(pending_deletes, now, &mut first_error)
@@ -2096,20 +2081,19 @@ impl RouteManager {
     pub(super) async fn observe_domain(
         &mut self,
         domain: String,
-        scope: ObservationScope,
+        replace_scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
         negative_ttl_secs: Option<u32>,
         wait_for_sync: bool,
     ) -> Result<()> {
         let now = unix_now();
         if !self.initialized {
-            // Preserve only the latest complete observation per domain and
-            // address family. Initialization first recovers retained RouterOS
-            // comments, then replays these replacements with their original
-            // timestamps so retries cannot resurrect old IPs or extend TTLs.
+            // Preserve the latest replacement per domain/family. Every queued
+            // entry retains all answer addresses, and replay is ordered across
+            // families so an older response cannot resurrect stale routes.
             self.queue_pending_observation(
                 domain.clone(),
-                scope,
+                replace_scope,
                 addrs.clone(),
                 negative_ttl_secs,
                 now,
@@ -2128,7 +2112,7 @@ impl RouteManager {
                 return initialization_result;
             }
 
-            let touched = self.apply_observation(domain, scope, addrs, now);
+            let touched = self.apply_observation(domain, replace_scope, addrs, now);
             let sync_result = self.sync_route_keys(touched, now).await;
             return match (initialization_result, sync_result) {
                 (_, Err(error)) => Err(error),
@@ -2136,7 +2120,7 @@ impl RouteManager {
                 (Ok(()), Ok(())) => Ok(()),
             };
         }
-        let touched = self.apply_observation(domain, scope, addrs, now);
+        let touched = self.apply_observation(domain, replace_scope, addrs, now);
         self.sync_route_keys(touched, now).await
     }
 
@@ -2297,14 +2281,20 @@ async fn run_manager_worker(
         match command {
             ManagerCommand::ObserveDomain {
                 domain,
-                scope,
+                replace_scope,
                 addrs,
                 negative_ttl_secs,
                 wait,
             } => {
                 let wait_for_sync = wait.is_some();
                 let result = manager
-                    .observe_domain(domain, scope, addrs, negative_ttl_secs, wait_for_sync)
+                    .observe_domain(
+                        domain,
+                        replace_scope,
+                        addrs,
+                        negative_ttl_secs,
+                        wait_for_sync,
+                    )
                     .await;
                 match (wait, result) {
                     (Some(ch), outcome) => {
@@ -2420,6 +2410,8 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use crate::plugin::executor::ros_route::api::RouterRoute;
@@ -2509,6 +2501,77 @@ mod tests {
             Self {
                 state: StdMutex::new(state),
             }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PipelineApi {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MikrotikApi for PipelineApi {
+        async fn list_managed_routes(
+            &self,
+            _table: &str,
+            _require_ipv4: bool,
+            _require_ipv6: bool,
+        ) -> Result<Vec<RouterRoute>> {
+            Ok(Vec::new())
+        }
+
+        async fn find_route(
+            &self,
+            _key: &RouteKey,
+            _comment_prefix: &str,
+            _plugin_tag: &str,
+        ) -> Result<Option<RouterRoute>> {
+            Ok(None)
+        }
+
+        async fn upsert_host_route(
+            &self,
+            key: &RouteKey,
+            _gateway: &str,
+            _distance: u8,
+            _comment: &str,
+            _comment_prefix: &str,
+            _plugin_tag: &str,
+        ) -> Result<String> {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            Ok(format!("*{}", key.ip))
+        }
+
+        async fn validate_route_config(
+            &self,
+            _key: &RouteKey,
+            _gateway: &str,
+            _distance: u8,
+            _comment: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_route_by_id(&self, _id: &str, _family: RouteFamily) -> Result<()> {
+            Ok(())
+        }
+
+        async fn connection_destinations(
+            &self,
+            _family: RouteFamily,
+            _destinations: &[IpAddr],
+        ) -> Result<AHashSet<IpAddr>> {
+            Ok(AHashSet::new())
+        }
+
+        async fn healthcheck(&self) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -2651,6 +2714,24 @@ mod tests {
 
     fn manager_with_timeless_dynamic_routes() -> RouteManager {
         RouteManager::new(Arc::new(NoopApi), manager_config(Some(0)))
+    }
+
+    fn pending_observation<'a>(
+        manager: &'a RouteManager,
+        domain: &str,
+        replace_scope: ObservationScope,
+    ) -> Option<&'a PendingObservation> {
+        manager.pending_observations.iter().find(|observation| {
+            observation.domain == domain && observation.replace_scope == replace_scope
+        })
+    }
+
+    fn has_pending_observation(
+        manager: &RouteManager,
+        domain: &str,
+        replace_scope: ObservationScope,
+    ) -> bool {
+        pending_observation(manager, domain, replace_scope).is_some()
     }
 
     fn owned_router_route(id: &str, key: &RouteKey) -> RouterRoute {
@@ -2892,6 +2973,147 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observation_adds_all_answer_families_but_replaces_only_query_family() {
+        let domain = "mixed-answer.example.".to_string();
+        let old_ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 51));
+        let new_ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 52));
+        let old_ipv6 = "2001:db8::51".parse::<IpAddr>().expect("IPv6 address");
+        let new_ipv6 = "2001:db8::52".parse::<IpAddr>().expect("IPv6 address");
+        let old_ipv4_key = RouteKey::new(old_ipv4, "via_proxy".to_string());
+        let old_ipv6_key = RouteKey::new(old_ipv6, "via_proxy".to_string());
+        let new_ipv4_key = RouteKey::new(new_ipv4, "via_proxy".to_string());
+        let new_ipv6_key = RouteKey::new(new_ipv6, "via_proxy".to_string());
+        let mut config = manager_config(Some(0));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Both,
+            vec![
+                ObservedAddr {
+                    addr: old_ipv4,
+                    ttl_secs: 60,
+                },
+                ObservedAddr {
+                    addr: old_ipv6,
+                    ttl_secs: 60,
+                },
+            ],
+            100,
+        );
+        manager.apply_observation(
+            domain,
+            ObservationScope::Ipv4,
+            vec![
+                ObservedAddr {
+                    addr: new_ipv4,
+                    ttl_secs: 60,
+                },
+                ObservedAddr {
+                    addr: new_ipv6,
+                    ttl_secs: 60,
+                },
+            ],
+            101,
+        );
+
+        assert_eq!(
+            manager.routes[&old_ipv4_key].sync_state,
+            SyncState::PendingDelete
+        );
+        assert_ne!(
+            manager.routes[&old_ipv6_key].sync_state,
+            SyncState::PendingDelete
+        );
+        assert!(manager.routes.contains_key(&new_ipv4_key));
+        assert!(manager.routes.contains_key(&new_ipv6_key));
+    }
+
+    #[test]
+    fn pending_observations_replay_in_original_cross_family_order() {
+        let domain = "pending-order.example.".to_string();
+        let old_ipv6 = "2001:db8::61".parse::<IpAddr>().expect("IPv6 address");
+        let new_ipv6 = "2001:db8::62".parse::<IpAddr>().expect("IPv6 address");
+        let old_ipv6_key = RouteKey::new(old_ipv6, "via_proxy".to_string());
+        let new_ipv6_key = RouteKey::new(new_ipv6, "via_proxy".to_string());
+        let mut config = manager_config(Some(0));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+
+        // An A response can contain an AAAA record. The later AAAA response
+        // replaces only IPv6; replaying these in hash-map order could otherwise
+        // reattach the stale IPv6 route after the withdrawal.
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: old_ipv6,
+                ttl_secs: u32::MAX,
+            }],
+            None,
+            unix_now(),
+        );
+        manager.queue_pending_observation(
+            domain,
+            ObservationScope::Ipv6,
+            vec![ObservedAddr {
+                addr: new_ipv6,
+                ttl_secs: u32::MAX,
+            }],
+            None,
+            unix_now(),
+        );
+
+        manager.replay_pending_observations();
+
+        assert_eq!(
+            manager.routes[&old_ipv6_key].sync_state,
+            SyncState::PendingDelete
+        );
+        assert!(manager.routes.contains_key(&new_ipv6_key));
+    }
+
+    #[test]
+    fn pending_same_scope_observations_preserve_cross_family_additions() {
+        let domain = "pending-same-scope.example.".to_string();
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 63));
+        let ipv6 = "2001:db8::63".parse::<IpAddr>().expect("IPv6 address");
+        let ipv4_key = RouteKey::new(ipv4, "via_proxy".to_string());
+        let ipv6_key = RouteKey::new(ipv6, "via_proxy".to_string());
+        let mut config = manager_config(Some(0));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        let now = unix_now();
+
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ipv6,
+                ttl_secs: u32::MAX,
+            }],
+            None,
+            now,
+        );
+        manager.queue_pending_observation(
+            domain,
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ipv4,
+                ttl_secs: u32::MAX,
+            }],
+            None,
+            now,
+        );
+
+        manager.replay_pending_observations();
+
+        assert!(manager.routes.contains_key(&ipv4_key));
+        assert!(manager.routes.contains_key(&ipv6_key));
+    }
+
     #[tokio::test]
     async fn sync_continues_after_one_route_fails() {
         let failing_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
@@ -2927,6 +3149,29 @@ mod tests {
             manager.routes.get(&good_key).map(|route| route.sync_state),
             Some(SyncState::Synced)
         );
+    }
+
+    #[tokio::test]
+    async fn route_upserts_use_bounded_pipeline() {
+        let api = Arc::new(PipelineApi::default());
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+        let addrs = (1..=17)
+            .map(|last_octet| ObservedAddr {
+                addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, last_octet)),
+                ttl_secs: 60,
+            })
+            .collect();
+        manager.apply_observation(
+            "pipeline.example.".to_string(),
+            ObservationScope::Ipv4,
+            addrs,
+            100,
+        );
+
+        manager.sync_routes(100).await.expect("pipeline sync");
+
+        assert_eq!(api.attempts.load(Ordering::Relaxed), 17);
+        assert_eq!(api.max_active.load(Ordering::Acquire), UPSERT_PIPELINE_SIZE);
     }
 
     #[tokio::test]
@@ -3210,7 +3455,7 @@ mod tests {
         for index in 0..8 {
             tx.try_send(ManagerCommand::ObserveDomain {
                 domain: format!("queued-{index}.example."),
-                scope: ObservationScope::Ipv4,
+                replace_scope: ObservationScope::Ipv4,
                 addrs: vec![ObservedAddr {
                     addr: ip,
                     ttl_secs: 60,
@@ -3558,9 +3803,7 @@ mod tests {
             100,
         );
 
-        let pending = manager
-            .pending_observations
-            .get(&("ttl-bound.example.".to_string(), ObservationScope::Ipv4))
+        let pending = pending_observation(&manager, "ttl-bound.example.", ObservationScope::Ipv4)
             .expect("queued observation");
         assert_eq!(pending.replay_until_unix, 160);
     }
@@ -3591,17 +3834,15 @@ mod tests {
             101,
         );
 
-        let ipv4 = manager
-            .pending_observations
-            .get(&(domain.clone(), ObservationScope::Ipv4))
+        let ipv4 = pending_observation(&manager, &domain, ObservationScope::Ipv4)
             .expect("new positive observation");
         assert_eq!(ipv4.addrs.len(), 1);
         assert!(!ipv4.name_level_negative);
-        assert!(
-            !manager
-                .pending_observations
-                .contains_key(&(domain, ObservationScope::Ipv6))
-        );
+        assert!(!has_pending_observation(
+            &manager,
+            &domain,
+            ObservationScope::Ipv6
+        ));
     }
 
     #[test]
@@ -3626,16 +3867,16 @@ mod tests {
             101,
         );
 
-        assert!(
-            manager
-                .pending_observations
-                .contains_key(&(domain.clone(), ObservationScope::Ipv4))
-        );
-        assert!(
-            !manager
-                .pending_observations
-                .contains_key(&(domain, ObservationScope::Ipv6))
-        );
+        assert!(has_pending_observation(
+            &manager,
+            &domain,
+            ObservationScope::Ipv4
+        ));
+        assert!(!has_pending_observation(
+            &manager,
+            &domain,
+            ObservationScope::Ipv6
+        ));
     }
 
     #[tokio::test]
@@ -3765,15 +4006,16 @@ mod tests {
         }
 
         assert_eq!(manager.pending_observations.len(), MAX_PENDING_OBSERVATIONS);
-        assert!(
-            manager
-                .pending_observations
-                .contains_key(&("queued-0.example.".to_string(), ObservationScope::Ipv4,))
-        );
-        assert!(!manager.pending_observations.contains_key(&(
-            format!("queued-{}.example.", MAX_PENDING_OBSERVATIONS),
+        assert!(has_pending_observation(
+            &manager,
+            "queued-0.example.",
+            ObservationScope::Ipv4
+        ));
+        assert!(!has_pending_observation(
+            &manager,
+            &format!("queued-{}.example.", MAX_PENDING_OBSERVATIONS),
             ObservationScope::Ipv4,
-        )));
+        ));
     }
 
     #[test]
@@ -3805,11 +4047,11 @@ mod tests {
         );
 
         assert_eq!(manager.pending_observations.len(), 1);
-        assert!(
-            manager
-                .pending_observations
-                .contains_key(&("fresh.example.".to_string(), ObservationScope::Ipv4,))
-        );
+        assert!(has_pending_observation(
+            &manager,
+            "fresh.example.",
+            ObservationScope::Ipv4,
+        ));
     }
 
     #[tokio::test]

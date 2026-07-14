@@ -35,7 +35,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ahash::{AHashMap, AHashSet};
+#[cfg(test)]
+use ahash::AHashMap;
+use ahash::AHashSet;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
@@ -48,7 +50,7 @@ use self::api::{
 };
 use self::manager::{
     AddressListFamily, AddressListKey, AddressListManager, AddressListManagerConfig,
-    AddressListManagerRuntime, ManagerCommand, ObservedAddr,
+    AddressListManagerRuntime, ManagerCommand,
 };
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
@@ -57,6 +59,7 @@ use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
     unregister_metric_source,
 };
+use crate::plugin::executor::ros_common::{ObservedAddr, collect_answer_addrs};
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
 use crate::proto::Rcode;
@@ -539,34 +542,13 @@ fn extract_observation(
         .first_question()
         .map(|question| question.name().normalized().to_string())?;
 
-    // Collapse duplicate IPs inside one DNS response before sending work to
-    // the manager. For duplicates we keep the largest TTL because the manager
-    // should observe the strongest expiry hint from this response batch.
-    let mut dedup = AHashMap::<IpAddr, u32>::new();
-    for answer in response.answers() {
-        if let Some(ip) = answer.ip_addr() {
-            let ttl_secs = answer.ttl();
-            match ip {
-                IpAddr::V4(_) if config.address_list4.is_none() => continue,
-                IpAddr::V6(_) if config.address_list6.is_none() => continue,
-                _ => {}
-            }
-
-            dedup
-                .entry(ip)
-                .and_modify(|ttl| *ttl = (*ttl).max(ttl_secs))
-                .or_insert(ttl_secs);
-        }
-    }
-
-    if dedup.is_empty() {
+    let addrs = collect_answer_addrs(response, |ip| match ip {
+        IpAddr::V4(_) => config.address_list4.is_some(),
+        IpAddr::V6(_) => config.address_list6.is_some(),
+    });
+    if addrs.is_empty() {
         return None;
     }
-
-    let addrs = dedup
-        .into_iter()
-        .map(|(addr, ttl_secs)| ObservedAddr { addr, ttl_secs })
-        .collect::<Vec<_>>();
     Some((domain, addrs))
 }
 

@@ -53,7 +53,7 @@ use crate::infra::observability::metrics::{
 };
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
-use crate::proto::{Message, Question, Rcode, RecordType};
+use crate::proto::{Rcode, RecordType};
 use crate::{continue_next, plugin_factory};
 
 const DEFAULT_MIN_TTL: u32 = 60;
@@ -64,7 +64,6 @@ const DEFAULT_CONNTRACK_GUARD: bool = false;
 const DEFAULT_ROUTE_DISTANCE: u8 = 100;
 const DEFAULT_COMMENT_PREFIX: &str = "fdns";
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
-const MAX_CNAME_OBSERVATION_HOPS: usize = 16;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -164,7 +163,8 @@ struct MikrotikConfig {
 #[derive(Debug)]
 struct ExtractedObservation {
     domain: String,
-    scope: ObservationScope,
+    /// Address family that this response is allowed to replace or withdraw.
+    replace_scope: ObservationScope,
     addrs: Vec<ObservedAddr>,
     /// RFC 2308 lifetime for a negative response. Used only to bound replay
     /// while RouterOS initialization is unavailable.
@@ -265,9 +265,10 @@ use self::api::{
     MikrotikApi, MikrotikApiTimeouts, MikrotikRsClient,
 };
 use self::manager::{
-    ManagerCommand, ObservationScope, ObservedAddr, PersistentReloadConfig, RouteManager,
-    RouteManagerConfig, RouteManagerRuntime,
+    ManagerCommand, ObservationScope, PersistentReloadConfig, RouteManager, RouteManagerConfig,
+    RouteManagerRuntime,
 };
+use crate::plugin::executor::ros_common::{ObservedAddr, collect_answer_addrs};
 
 #[derive(Debug)]
 struct MikrotikExecutor {
@@ -563,7 +564,7 @@ impl Executor for MikrotikExecutor {
 
         let Some(ExtractedObservation {
             domain,
-            scope,
+            replace_scope,
             addrs,
             negative_ttl_secs,
         }) = extract_observation(context, &self.config)
@@ -575,7 +576,7 @@ impl Executor for MikrotikExecutor {
         if self.config.async_mode {
             match tx.try_send(ManagerCommand::ObserveDomain {
                 domain,
-                scope,
+                replace_scope,
                 addrs,
                 negative_ttl_secs,
                 wait: None,
@@ -602,7 +603,7 @@ impl Executor for MikrotikExecutor {
         let (wait_tx, wait_rx) = oneshot::channel::<Result<()>>();
         let send_cmd = ManagerCommand::ObserveDomain {
             domain,
-            scope,
+            replace_scope,
             addrs,
             negative_ttl_secs,
             wait: Some(wait_tx),
@@ -731,125 +732,63 @@ fn extract_observation(
 ) -> Option<ExtractedObservation> {
     let question = context.request.first_question()?;
     let domain = question.name().normalized().to_string();
-    let scope = match question.qtype() {
+    let replace_scope = match question.qtype() {
         RecordType::A => ObservationScope::Ipv4,
         RecordType::AAAA => ObservationScope::Ipv6,
         _ => return None,
     };
 
     let response = context.response()?;
-    match classify_response(response, Some(question)) {
-        ResponseDisposition::CompletePositive if response.rcode() == Rcode::NoError => {}
-        ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData) => {
+    // A response for another request must never update this request's route
+    // bindings. Keep this cheap identity check even though positive answers no
+    // longer need CNAME-chain reconstruction.
+    if response
+        .first_question()
+        .is_some_and(|response_question| response_question != question)
+    {
+        return None;
+    }
+
+    if response.rcode() == Rcode::NoError {
+        // RouterOS observers deliberately use the simple Answer-section
+        // semantics shared with ros_address_list: every enabled A/AAAA answer
+        // is useful. The queried type controls only what may be withdrawn.
+        let addrs = collect_answer_addrs(response, |ip| match ip {
+            IpAddr::V4(_) => config.gateway4.is_some(),
+            IpAddr::V6(_) => config.gateway6.is_some(),
+        });
+        if !addrs.is_empty() {
             return Some(ExtractedObservation {
                 domain,
-                scope,
+                replace_scope,
+                addrs,
+                negative_ttl_secs: None,
+            });
+        }
+    }
+
+    match classify_response(response, Some(question)) {
+        ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData) => {
+            Some(ExtractedObservation {
+                domain,
+                replace_scope,
                 addrs: Vec::new(),
                 negative_ttl_secs: response.negative_ttl_from_soa(),
-            });
+            })
         }
         // NXDOMAIN is authoritative for the name, not only the queried record
         // type, so withdraw both address families. This is essential when
-        // fixed_ttl=0 because no time-based cleanup will happen later. Running
-        // it through the shared classifier first ensures the echoed response
-        // question cannot withdraw routes for a different request name.
+        // fixed_ttl=0 because no time-based cleanup will happen later.
         ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NxDomain) => {
-            return Some(ExtractedObservation {
+            Some(ExtractedObservation {
                 domain,
-                scope: ObservationScope::Both,
+                replace_scope: ObservationScope::Both,
                 addrs: Vec::new(),
                 negative_ttl_secs: response.negative_ttl_from_soa(),
-            });
+            })
         }
-        _ => return None,
+        _ => None,
     }
-
-    extract_address_observations(response, question, scope, config).map(|addrs| {
-        ExtractedObservation {
-            domain,
-            scope,
-            addrs,
-            negative_ttl_secs: None,
-        }
-    })
-}
-
-fn extract_address_observations(
-    response: &Message,
-    question: &Question,
-    scope: ObservationScope,
-    config: &MikrotikConfig,
-) -> Option<Vec<ObservedAddr>> {
-    let mut current = question.name();
-    let mut cname_ttl = u32::MAX;
-    let mut saw_alias = false;
-
-    for hop in 0..=MAX_CNAME_OBSERVATION_HOPS {
-        // Collapse duplicated terminal A/AAAA answers by IP and keep the
-        // largest effective TTL. Every address is capped by all preceding
-        // CNAME records so the route cannot outlive the alias chain.
-        let mut dedup = AHashMap::<IpAddr, u32>::new();
-        let mut next_name = None;
-        let mut next_ttl = u32::MAX;
-        let mut conflicting_alias = false;
-
-        for answer in response.answers() {
-            if answer.name() != current || answer.class() != question.qclass() {
-                continue;
-            }
-
-            if let Some(ip) = answer.ip_addr()
-                && scope.contains(ip)
-            {
-                let family_enabled = match ip {
-                    IpAddr::V4(_) => config.gateway4.is_some(),
-                    IpAddr::V6(_) => config.gateway6.is_some(),
-                };
-                if family_enabled {
-                    let ttl_secs = answer.ttl().min(cname_ttl);
-                    dedup
-                        .entry(ip)
-                        .and_modify(|ttl| *ttl = (*ttl).max(ttl_secs))
-                        .or_insert(ttl_secs);
-                }
-                continue;
-            }
-
-            let Some(target) = answer.cname_target() else {
-                continue;
-            };
-            if let Some(existing) = next_name {
-                conflicting_alias |= existing != target;
-            } else {
-                next_name = Some(target);
-            }
-            next_ttl = next_ttl.min(answer.ttl());
-        }
-
-        if !dedup.is_empty() {
-            return Some(
-                dedup
-                    .into_iter()
-                    .map(|(addr, ttl_secs)| ObservedAddr { addr, ttl_secs })
-                    .collect(),
-            );
-        }
-        if conflicting_alias {
-            return None;
-        }
-        let Some(target) = next_name else {
-            return if saw_alias { None } else { Some(Vec::new()) };
-        };
-        if hop == MAX_CNAME_OBSERVATION_HOPS || target == current {
-            return None;
-        }
-
-        saw_alias = true;
-        cname_ttl = cname_ttl.min(next_ttl);
-        current = target;
-    }
-
-    None
 }
 
 fn parse_plugin_config(args: Option<Value>, emit_warnings: bool) -> Result<MikrotikConfig> {
@@ -1185,7 +1124,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::proto::rdata::{A, CNAME, SOA};
+    use crate::proto::rdata::{A, AAAA, CNAME, SOA};
     use crate::proto::{DNSClass, Message, Name, Question, RData, Record};
 
     fn observation_config() -> MikrotikConfig {
@@ -1291,13 +1230,13 @@ routing_table: "policy"
         let mut a_context = context_with_nodata(RecordType::A);
         let observation =
             extract_observation(&mut a_context, &config).expect("A NODATA observation");
-        assert_eq!(observation.scope, ObservationScope::Ipv4);
+        assert_eq!(observation.replace_scope, ObservationScope::Ipv4);
         assert!(observation.addrs.is_empty());
         assert_eq!(observation.negative_ttl_secs, None);
     }
 
     #[test]
-    fn observation_ttl_is_capped_by_cname_chain() {
+    fn observation_collects_all_answer_addresses_without_cname_ttl_cap() {
         let config = observation_config();
         let mut context = context_with_rcode(RecordType::A, Rcode::NoError);
         let response = context.response_mut().expect("response");
@@ -1318,17 +1257,28 @@ routing_table: "policy"
             600,
             RData::A(A(Ipv4Addr::new(203, 0, 113, 28))),
         ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("unrelated.example.com.").expect("owner"),
+            120,
+            RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xDB8, 0, 0, 0, 0, 0, 27))),
+        ));
 
         let observation = extract_observation(&mut context, &config).expect("CNAME observation");
 
-        assert_eq!(observation.scope, ObservationScope::Ipv4);
-        assert_eq!(
-            observation.addrs,
-            vec![ObservedAddr {
-                addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 27)),
-                ttl_secs: 30,
-            }]
-        );
+        assert_eq!(observation.replace_scope, ObservationScope::Ipv4);
+        assert_eq!(observation.addrs.len(), 3);
+        assert!(observation.addrs.contains(&ObservedAddr {
+            addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 27)),
+            ttl_secs: 300,
+        }));
+        assert!(observation.addrs.contains(&ObservedAddr {
+            addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 28)),
+            ttl_secs: 600,
+        }));
+        assert!(observation.addrs.contains(&ObservedAddr {
+            addr: IpAddr::V6(Ipv6Addr::new(0x2001, 0xDB8, 0, 0, 0, 0, 0, 27)),
+            ttl_secs: 120,
+        }));
     }
 
     #[test]
@@ -1340,7 +1290,7 @@ routing_table: "policy"
             extract_observation(&mut context, &config).expect("AAAA NXDOMAIN observation");
 
         assert_eq!(observation.domain, "example.com");
-        assert_eq!(observation.scope, ObservationScope::Both);
+        assert_eq!(observation.replace_scope, ObservationScope::Both);
         assert!(observation.addrs.is_empty());
     }
 

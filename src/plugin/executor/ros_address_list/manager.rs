@@ -27,6 +27,7 @@ use super::api::{MikrotikApi, RouterListEntry};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::task as task_center;
+use crate::plugin::executor::ros_common::ObservedAddr;
 
 /// Host prefix used for normalized IPv4 single-address entries.
 const HOST_PREFIX_V4: u8 = 32;
@@ -229,14 +230,6 @@ pub(super) struct AddressListManagerConfig {
     pub(super) max_ttl: u32,
     /// Optional fixed TTL override for dynamic observations.
     pub(super) fixed_ttl: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) struct ObservedAddr {
-    /// Observed A/AAAA answer IP.
-    pub(super) addr: IpAddr,
-    /// Raw TTL extracted from the DNS response before clamping.
-    pub(super) ttl_secs: u32,
 }
 
 #[derive(Debug)]

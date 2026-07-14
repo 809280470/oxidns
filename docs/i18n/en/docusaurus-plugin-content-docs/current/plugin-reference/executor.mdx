@@ -2634,6 +2634,7 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
 
 - `routing_table` and `gateway4`/`gateway6` select the target. The RouterOS table, routing rule, and default route must already exist.
 - `min_ttl`/`max_ttl` default to `60`/`3600` seconds. `fixed_ttl` overrides DNS TTL; `fixed_ttl: 0` disables time-based expiry, while a later answer for the same domain still withdraws an absent IP reference.
+- `ros_route` and `ros_address_list` collect every A/AAAA record for an enabled family from the Answer section. They do not rebuild CNAME chains or cap an address TTL by a CNAME TTL. In `ros_route`, an A query replaces/withdraws only IPv4 routes and an AAAA query only IPv6 routes, while both address families from the same Answer remain candidates for creation or refresh.
 - `persistent_route` is a DNS-independent IP/CIDR set; files reload every minute and are periodically reconciled.
 - RouterOS failures do not block DNS startup. `async: false` waits for one sync attempt but never changes the DNS response on failure.
 - `conntrack_guard` defaults to disabled. When enabled, dynamic withdrawal/expiry and removed persistent configuration check RouterOS conntrack before deleting; any tracked connection to the destination keeps the route and retries after 30 seconds. CIDRs check connections inside the prefix. Disabled connection tracking, RAW `notrack` traffic, and failed checks cannot prove safety, so the route is kept. Shutdown cleanup, validation residue, duplicates, and disabled-family cleanup still delete immediately.
