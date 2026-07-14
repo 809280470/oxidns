@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder, Event, MikrotikDevice};
 use tracing::warn;
 
-use super::manager::{RouteFamily, RouteKey};
+use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
 
 const ROUTER_ID_FIELD: &str = ".id";
@@ -22,8 +22,6 @@ const ROUTE_GATEWAY_FIELD: &str = "gateway";
 const ROUTE_DISTANCE_FIELD: &str = "distance";
 const ROUTE_COMMENT_FIELD: &str = "comment";
 const ROUTE_DISABLED_FIELD: &str = "disabled";
-const COMMENT_FIELD_PLUGIN: &str = "pg";
-
 const COMMAND_SYSTEM_IDENTITY_PRINT: &str = "/system/identity/print";
 
 const COMMAND_IP_ROUTE_PRINT: &str = "/ip/route/print";
@@ -465,37 +463,20 @@ fn parse_routeros_bool(raw: &str, field: &str, action: &str) -> Result<bool> {
     )))
 }
 
-fn comment_matches_prefix(comment: &str, prefix: &str) -> bool {
-    if prefix.is_empty() {
-        return true;
-    }
-    comment.starts_with(prefix) && comment.as_bytes().get(prefix.len()) == Some(&b';')
-}
-
-fn comment_field<'a>(comment: &'a str, key: &str) -> Option<&'a str> {
-    for token in comment.split(';') {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let Some((k, v)) = token.split_once('=') else {
-            continue;
-        };
-        if k.trim() == key {
-            return Some(v.trim());
-        }
-    }
-    None
-}
-
 fn route_owned_by_plugin(route: &RouterRoute, comment_prefix: &str, plugin_tag: &str) -> bool {
     let Some(comment) = route.comment.as_deref() else {
         return false;
     };
-    if !comment_matches_prefix(comment, comment_prefix) {
-        return false;
-    }
-    comment_field(comment, COMMENT_FIELD_PLUGIN) == Some(plugin_tag)
+    matches!(
+        RouteCommentCodec::decode(
+            comment_prefix,
+            plugin_tag,
+            route.family,
+            &route.dst_address,
+            comment,
+        ),
+        Ok(Some(_))
+    )
 }
 
 #[derive(Debug, Default)]
@@ -756,10 +737,13 @@ mod tests {
     fn exact_route_inspection_reports_owned_and_foreign_duplicates() {
         let inspection = classify_exact_routes(
             [
-                route("*owned", Some("fdns;pg=route-test;dm=example.com")),
+                route(
+                    "*owned",
+                    Some("fdns;pg=route-test;kind=dynamic;dm=example.com;exp=400;seen=100"),
+                ),
                 route(
                     "*owned-duplicate",
-                    Some("fdns;pg=route-test;dm=example.com"),
+                    Some("fdns;pg=route-test;kind=dynamic;dm=example.com;exp=400;seen=100"),
                 ),
                 route("*foreign", Some("operator-managed")),
             ],
@@ -780,6 +764,13 @@ mod tests {
             vec!["*owned-duplicate"]
         );
         assert!(inspection.has_foreign);
+    }
+
+    #[test]
+    fn route_without_ros_route_kind_is_foreign() {
+        let reused_tag = route("*reused-tag", Some("fdns;pg=route-test;dm=operator-route"));
+
+        assert!(!route_owned_by_plugin(&reused_tag, "fdns", "route-test"));
     }
 
     #[test]

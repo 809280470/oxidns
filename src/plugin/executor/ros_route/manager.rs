@@ -24,7 +24,6 @@ const ROUTE_DEFAULT_V4: &str = "0.0.0.0/0";
 const ROUTE_DEFAULT_V6: &str = "::/0";
 const ROUTE_PREFIX_V4: u8 = 32;
 const ROUTE_PREFIX_V6: u8 = 128;
-const PERSISTENT_ANCHOR_DOMAIN: &str = "__forgedns_persistent__";
 const PERSISTENT_COMMENT_DOMAIN: &str = "persistent";
 const PERSISTENT_EXPIRES_AT_UNIX: u64 = u64::MAX;
 const MANAGER_QUEUE_SIZE: usize = 1024;
@@ -191,8 +190,11 @@ pub(super) struct RouteEntry {
     pub(super) comment_domain: String,
     /// Per-domain expiry timestamps for ref-count and max-exp calculations.
     pub(super) domain_expiries: AHashMap<String, u64>,
-    /// Current reference count from `domains`.
+    /// Current dynamic DNS reference count from `domains`.
     pub(super) ref_count: u32,
+    /// Whether this route is explicitly configured through `persistent_route`.
+    /// Kept outside `domains` so no real qname can collide with internal state.
+    pub(super) persistent: bool,
     /// Route-level expiry (max of active refs).
     pub(super) expires_at_unix: u64,
     /// Last refresh timestamp.
@@ -207,6 +209,13 @@ pub(super) struct RouteEntry {
     pub(super) recovered_ownership_incomplete: bool,
     /// Pending/synced transition state for API sync loop.
     pub(super) sync_state: SyncState,
+}
+
+impl RouteEntry {
+    #[inline]
+    fn has_owners(&self) -> bool {
+        self.persistent || self.ref_count > 0
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -227,7 +236,7 @@ pub(super) enum RouteCommentKind {
 
 impl RouteCommentKind {
     fn for_route(route: &RouteEntry) -> Self {
-        if route.domains.contains(PERSISTENT_ANCHOR_DOMAIN) {
+        if route.persistent {
             Self::Persistent
         } else {
             Self::Dynamic
@@ -489,6 +498,9 @@ impl ObservationScope {
 struct PendingObservation {
     addrs: Vec<ObservedAddr>,
     observed_at_unix: u64,
+    /// Upper bound for replaying an empty negative observation. Positive
+    /// observations carry per-address TTLs and leave this unset.
+    replay_until_unix: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -497,6 +509,7 @@ pub(super) enum ManagerCommand {
         domain: String,
         scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
+        negative_ttl_secs: Option<u32>,
         wait: Option<oneshot::Sender<Result<()>>>,
     },
     UpdatePersistentIps {
@@ -504,10 +517,12 @@ pub(super) enum ManagerCommand {
     },
     Sweep,
     Reconcile,
-    Shutdown {
-        cleanup: bool,
-        done: oneshot::Sender<()>,
-    },
+}
+
+#[derive(Debug)]
+struct ShutdownRequest {
+    cleanup: bool,
+    done: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +542,7 @@ pub(super) struct PersistentReloadConfig {
 #[derive(Debug)]
 pub(super) struct RouteManagerRuntime {
     tx: mpsc::Sender<ManagerCommand>,
+    shutdown_tx: Option<oneshot::Sender<ShutdownRequest>>,
     worker_handle: Option<JoinHandle<()>>,
     sweep_task_id: Option<u64>,
     reconcile_task_id: Option<u64>,
@@ -540,10 +556,11 @@ impl RouteManagerRuntime {
         persistent_reload: Option<PersistentReloadConfig>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<ManagerCommand>(MANAGER_QUEUE_SIZE);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<ShutdownRequest>();
 
         let worker_tag = tag.clone();
         let worker_handle = Some(tokio::spawn(async move {
-            run_manager_worker(worker_tag, manager, rx).await;
+            run_manager_worker(worker_tag, manager, rx, shutdown_rx).await;
         }));
 
         // RouterOS validation and the initial table scan intentionally happen
@@ -651,6 +668,7 @@ impl RouteManagerRuntime {
 
         Self {
             tx,
+            shutdown_tx: Some(shutdown_tx),
             worker_handle,
             sweep_task_id,
             reconcile_task_id,
@@ -664,31 +682,9 @@ impl RouteManagerRuntime {
     }
 
     pub(super) async fn shutdown(mut self, cleanup: bool) {
-        let mut shutdown_acked = false;
-        let (done_tx, done_rx) = oneshot::channel::<()>();
-        let shutdown_cmd = ManagerCommand::Shutdown {
-            cleanup,
-            done: done_tx,
-        };
-        let sent = match self.tx.try_send(shutdown_cmd) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-            Err(mpsc::error::TrySendError::Full(shutdown_cmd)) => matches!(
-                tokio::time::timeout(
-                    Duration::from_secs(SHUTDOWN_TIMEOUT_SECS),
-                    self.tx.send(shutdown_cmd),
-                )
-                .await,
-                Ok(Ok(()))
-            ),
-        };
-        if sent {
-            shutdown_acked =
-                tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), done_rx)
-                    .await
-                    .is_ok();
-        }
-
+        // Stop periodic producers before signaling the priority shutdown
+        // channel. The worker then drops queued normal commands instead of
+        // draining route writes ahead of cleanup.
         if let Some(task_id) = self.sweep_task_id.take() {
             task_center::stop_task(task_id).await;
         }
@@ -697,6 +693,21 @@ impl RouteManagerRuntime {
         }
         if let Some(task_id) = self.persistent_reload_task_id.take() {
             task_center::stop_task(task_id).await;
+        }
+
+        let mut shutdown_acked = false;
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        if self.shutdown_tx.take().is_some_and(|tx| {
+            tx.send(ShutdownRequest {
+                cleanup,
+                done: done_tx,
+            })
+            .is_ok()
+        }) {
+            shutdown_acked =
+                tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), done_rx)
+                    .await
+                    .is_ok();
         }
         if let Some(handle) = self.worker_handle.take() {
             if shutdown_acked {
@@ -800,10 +811,7 @@ impl RouteManager {
         meta: &RouteCommentMeta,
         now: u64,
     ) -> (bool, bool, u64, u64) {
-        let expects_persistent = self
-            .routes
-            .get(key)
-            .is_some_and(|route| route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
+        let expects_persistent = self.routes.get(key).is_some_and(|route| route.persistent);
         let expires_at = self.recovered_expiry(meta);
         let recoverable = match meta.kind {
             RouteCommentKind::Dynamic => expires_at > now,
@@ -894,9 +902,6 @@ impl RouteManager {
     }
 
     fn ensure_persistent_routes(&mut self, now: u64) {
-        // Persistent IPs are represented as a synthetic anchor domain so they
-        // naturally fit existing ref-count and expiration aggregation logic.
-        let anchor = PERSISTENT_ANCHOR_DOMAIN.to_string();
         let mut desired_keys = AHashSet::new();
         let persistent_ips = self.persistent_ips.iter().cloned().collect::<Vec<_>>();
         for cidr in persistent_ips {
@@ -929,19 +934,8 @@ impl RouteManager {
             if let Some(entry) = self.routes.get_mut(&key) {
                 let mut changed = false;
 
-                if entry.domains.insert(anchor.clone()) {
-                    entry.ref_count = entry.ref_count.saturating_add(1);
-                    changed = true;
-                }
-                if entry.ref_count == 0 {
-                    entry.ref_count = 1;
-                    changed = true;
-                }
-                if entry
-                    .domain_expiries
-                    .insert(anchor.clone(), PERSISTENT_EXPIRES_AT_UNIX)
-                    != Some(PERSISTENT_EXPIRES_AT_UNIX)
-                {
+                if !entry.persistent {
+                    entry.persistent = true;
                     changed = true;
                 }
                 if entry.expires_at_unix != PERSISTENT_EXPIRES_AT_UNIX {
@@ -954,6 +948,10 @@ impl RouteManager {
                 }
                 if entry.distance != self.cfg.distance {
                     entry.distance = self.cfg.distance;
+                    changed = true;
+                }
+                if entry.domains.is_empty() && entry.comment_domain != PERSISTENT_COMMENT_DOMAIN {
+                    entry.comment_domain = PERSISTENT_COMMENT_DOMAIN.to_string();
                     changed = true;
                 }
 
@@ -975,23 +973,17 @@ impl RouteManager {
                 continue;
             }
 
-            let mut domains = AHashSet::new();
-            domains.insert(PERSISTENT_ANCHOR_DOMAIN.to_string());
-            let mut domain_expiries = AHashMap::new();
-            domain_expiries.insert(
-                PERSISTENT_ANCHOR_DOMAIN.to_string(),
-                PERSISTENT_EXPIRES_AT_UNIX,
-            );
             self.routes.insert(
                 key.clone(),
                 RouteEntry {
                     key,
                     gateway,
                     distance: self.cfg.distance,
-                    domains,
+                    domains: AHashSet::new(),
                     comment_domain: PERSISTENT_COMMENT_DOMAIN.to_string(),
-                    domain_expiries,
-                    ref_count: 1,
+                    domain_expiries: AHashMap::new(),
+                    ref_count: 0,
+                    persistent: true,
                     expires_at_unix: PERSISTENT_EXPIRES_AT_UNIX,
                     last_refresh_unix: now,
                     synced_expires_at_unix: None,
@@ -1002,34 +994,30 @@ impl RouteManager {
             );
         }
 
-        // Remove persistent anchor from routes that are no longer configured by
-        // persistent IP sources (e.g. file content changed).
-        let anchored_keys = self
+        // Remove typed persistent ownership from routes that are no longer
+        // configured by persistent IP sources (e.g. file content changed).
+        let persistent_keys = self
             .routes
             .iter()
             .filter_map(|(key, entry)| {
-                if entry.domains.contains(PERSISTENT_ANCHOR_DOMAIN) {
+                if entry.persistent {
                     Some(key.clone())
                 } else {
                     None
                 }
             })
             .collect::<Vec<_>>();
-        for key in anchored_keys {
+        for key in persistent_keys {
             if desired_keys.contains(&key) {
                 continue;
             }
             let Some(entry) = self.routes.get_mut(&key) else {
                 continue;
             };
-            if !entry.domains.remove(PERSISTENT_ANCHOR_DOMAIN) {
-                continue;
-            }
-            entry.domain_expiries.remove(PERSISTENT_ANCHOR_DOMAIN);
-            entry.ref_count = entry.ref_count.saturating_sub(1);
+            entry.persistent = false;
             entry.last_refresh_unix = now;
             if entry.comment_domain == PERSISTENT_COMMENT_DOMAIN {
-                entry.comment_domain = select_comment_domain(&entry.domains);
+                entry.comment_domain = select_comment_domain(&entry.domains, false);
             }
 
             if entry.ref_count == 0 {
@@ -1117,6 +1105,7 @@ impl RouteManager {
         domain: String,
         scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
+        negative_ttl_secs: Option<u32>,
         observed_at_unix: u64,
     ) {
         for &family_scope in scope.family_scopes() {
@@ -1132,21 +1121,33 @@ impl RouteManager {
                 .iter()
                 .copied()
                 .filter(|observed| family_scope.contains(observed.addr))
-                .collect();
+                .collect::<Vec<_>>();
+            let replay_until_unix = family_addrs.is_empty().then(|| {
+                // A negative response without an SOA is not safely cacheable,
+                // and an explicit zero TTL expires immediately.
+                observed_at_unix.saturating_add(u64::from(negative_ttl_secs.unwrap_or(0)))
+            });
             self.pending_observations.insert(
                 (domain.clone(), family_scope),
                 PendingObservation {
                     addrs: family_addrs,
                     observed_at_unix,
+                    replay_until_unix,
                 },
             );
         }
     }
 
     fn replay_pending_observations(&mut self) {
+        let now = unix_now();
         let pending = self
             .pending_observations
             .iter()
+            .filter(|(_, observation)| {
+                observation
+                    .replay_until_unix
+                    .is_none_or(|replay_until| replay_until > now)
+            })
             .map(|((domain, scope), observation)| (domain.clone(), *scope, observation.clone()))
             .collect::<Vec<_>>();
         for (domain, scope, observation) in pending {
@@ -1170,8 +1171,9 @@ impl RouteManager {
         if let Some(entry) = self.routes.get_mut(&key) {
             let inserted = entry.domains.insert(domain.to_string());
             let comment_domain_changed = inserted
-                && domain != PERSISTENT_ANCHOR_DOMAIN
-                && (entry.ref_count == 0 || entry.comment_domain.is_empty());
+                && (entry.ref_count == 0
+                    || entry.comment_domain.is_empty()
+                    || entry.comment_domain == PERSISTENT_COMMENT_DOMAIN);
             if comment_domain_changed {
                 entry.comment_domain = domain.to_string();
             }
@@ -1220,6 +1222,7 @@ impl RouteManager {
                 comment_domain: domain.to_string(),
                 domain_expiries,
                 ref_count: 1,
+                persistent: false,
                 expires_at_unix: expires_at,
                 last_refresh_unix: now,
                 synced_expires_at_unix: None,
@@ -1255,12 +1258,20 @@ impl RouteManager {
 
         entry.last_refresh_unix = now;
         if entry.comment_domain == domain || entry.comment_domain.is_empty() {
-            entry.comment_domain = select_comment_domain(&entry.domains);
+            entry.comment_domain = select_comment_domain(&entry.domains, entry.persistent);
         }
 
         if entry.ref_count == 0 {
-            entry.expires_at_unix = now;
-            entry.sync_state = SyncState::PendingDelete;
+            if entry.persistent {
+                entry.comment_domain = PERSISTENT_COMMENT_DOMAIN.to_string();
+                entry.expires_at_unix = PERSISTENT_EXPIRES_AT_UNIX;
+                if matches!(entry.sync_state, SyncState::Synced) {
+                    entry.sync_state = SyncState::Dirty;
+                }
+            } else {
+                entry.expires_at_unix = now;
+                entry.sync_state = SyncState::PendingDelete;
+            }
         } else {
             let known_expiry = entry.domain_expiries.values().copied().max().unwrap_or(now);
             entry.expires_at_unix = if entry.recovered_ownership_incomplete {
@@ -1311,6 +1322,15 @@ impl RouteManager {
 
     fn update_route_expiration(&mut self, now: u64) {
         for route in self.routes.values_mut() {
+            if route.persistent {
+                if route.expires_at_unix != PERSISTENT_EXPIRES_AT_UNIX {
+                    route.expires_at_unix = PERSISTENT_EXPIRES_AT_UNIX;
+                    if matches!(route.sync_state, SyncState::Synced) {
+                        route.sync_state = SyncState::Dirty;
+                    }
+                }
+                continue;
+            }
             if route.ref_count == 0 {
                 if route.expires_at_unix <= now {
                     route.sync_state = SyncState::PendingDelete;
@@ -1388,7 +1408,7 @@ impl RouteManager {
             };
 
             match entry_snapshot.sync_state {
-                SyncState::PendingCreate | SyncState::Dirty if entry_snapshot.ref_count > 0 => {
+                SyncState::PendingCreate | SyncState::Dirty if entry_snapshot.has_owners() => {
                     // Upsert route with latest gateway/comment metadata.
                     let mut comment_snapshot = entry_snapshot.clone();
                     comment_snapshot.last_refresh_unix = now;
@@ -1614,7 +1634,7 @@ impl RouteManager {
             if let Some(existing) = self.routes.get_mut(&key) {
                 existing.router_id = Some(route.id.clone());
                 existing.synced_expires_at_unix = Some(meta.expires_at_unix);
-                if existing.ref_count == 0 {
+                if !existing.has_owners() {
                     // A local withdrawal already decided this route must be
                     // deleted. Seeing the still-existing remote row must not
                     // resurrect it from its old comment metadata.
@@ -1694,6 +1714,7 @@ impl RouteManager {
                 comment_domain: meta.comment_domain.clone(),
                 domain_expiries,
                 ref_count: u32::from(recover_dynamic_binding),
+                persistent: false,
                 expires_at_unix: recovered_expiry,
                 last_refresh_unix: meta.last_refresh_unix,
                 synced_expires_at_unix: Some(meta.expires_at_unix),
@@ -1748,13 +1769,13 @@ impl RouteManager {
                 continue;
             };
 
-            if route.ref_count == 0 || matches!(route.sync_state, SyncState::PendingDelete) {
+            if !route.has_owners() || matches!(route.sync_state, SyncState::PendingDelete) {
                 // The remote side already matches the local withdrawal. Drop
                 // the local route without issuing a redundant delete request.
                 self.routes.remove(&key);
             } else if route.router_id.is_some()
                 && matches!(route.sync_state, SyncState::Synced)
-                && !route.domains.contains(PERSISTENT_ANCHOR_DOMAIN)
+                && !route.persistent
             {
                 // A previously confirmed dynamic route disappeared without a
                 // new local write. Treat that as an operator deletion instead
@@ -1785,6 +1806,7 @@ impl RouteManager {
         domain: String,
         scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
+        negative_ttl_secs: Option<u32>,
         wait_for_sync: bool,
     ) -> Result<()> {
         let now = unix_now();
@@ -1793,7 +1815,7 @@ impl RouteManager {
             // address family. Initialization first recovers retained RouterOS
             // comments, then replays these replacements with their original
             // timestamps so retries cannot resurrect old IPs or extend TTLs.
-            self.queue_pending_observation(domain, scope, addrs, now);
+            self.queue_pending_observation(domain, scope, addrs, negative_ttl_secs, now);
             if !wait_for_sync {
                 return Ok(());
             }
@@ -1918,39 +1940,55 @@ fn validation_comment(prefix: &str, plugin_tag: &str, _family: RouteFamily, nonc
     out
 }
 
-fn select_comment_domain(domains: &AHashSet<String>) -> String {
-    domains
-        .iter()
-        .filter(|domain| domain.as_str() != PERSISTENT_ANCHOR_DOMAIN)
-        .min()
-        .cloned()
-        .unwrap_or_else(|| {
-            if domains.contains(PERSISTENT_ANCHOR_DOMAIN) {
-                PERSISTENT_COMMENT_DOMAIN.to_string()
-            } else {
-                String::new()
-            }
-        })
+fn select_comment_domain(domains: &AHashSet<String>, persistent: bool) -> String {
+    domains.iter().min().cloned().unwrap_or_else(|| {
+        if persistent {
+            PERSISTENT_COMMENT_DOMAIN.to_string()
+        } else {
+            String::new()
+        }
+    })
 }
 
 async fn run_manager_worker(
     tag: String,
     mut manager: RouteManager,
     mut rx: mpsc::Receiver<ManagerCommand>,
+    mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
 ) {
     // Single-owner event loop for route state.
     // All cross-map updates are serialized here to keep transitions deterministic.
-    while let Some(command) = rx.recv().await {
+    loop {
+        let command = tokio::select! {
+            biased;
+            shutdown = &mut shutdown_rx => {
+                if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
+                    if let Err(e) = manager.shutdown(cleanup).await {
+                        warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
+                    }
+                    let _ = done.send(());
+                }
+                break;
+            }
+            command = rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                command
+            }
+        };
+
         match command {
             ManagerCommand::ObserveDomain {
                 domain,
                 scope,
                 addrs,
+                negative_ttl_secs,
                 wait,
             } => {
                 let wait_for_sync = wait.is_some();
                 let result = manager
-                    .observe_domain(domain, scope, addrs, wait_for_sync)
+                    .observe_domain(domain, scope, addrs, negative_ttl_secs, wait_for_sync)
                     .await;
                 match (wait, result) {
                     (Some(ch), outcome) => {
@@ -1994,13 +2032,6 @@ async fn run_manager_worker(
                 } else {
                     debug!(plugin = %tag, "ros_route reconcile completed");
                 }
-            }
-            ManagerCommand::Shutdown { cleanup, done } => {
-                if let Err(e) = manager.shutdown(cleanup).await {
-                    warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
-                }
-                let _ = done.send(());
-                break;
             }
         }
     }
@@ -2244,6 +2275,7 @@ mod tests {
             comment_domain: domain.to_string(),
             domain_expiries: AHashMap::from_iter([(domain.to_string(), 400)]),
             ref_count: 1,
+            persistent: false,
             expires_at_unix: 400,
             last_refresh_unix: 100,
             synced_expires_at_unix: None,
@@ -2527,6 +2559,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn priority_shutdown_drops_queued_route_writes() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 37));
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+        manager.initialized = true;
+        let (tx, rx) = mpsc::channel(MANAGER_QUEUE_SIZE);
+        for index in 0..8 {
+            tx.try_send(ManagerCommand::ObserveDomain {
+                domain: format!("queued-{index}.example."),
+                scope: ObservationScope::Ipv4,
+                addrs: vec![ObservedAddr {
+                    addr: ip,
+                    ttl_secs: 60,
+                }],
+                negative_ttl_secs: None,
+                wait: None,
+            })
+            .expect("queue observation");
+        }
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        shutdown_tx
+            .send(ShutdownRequest {
+                cleanup: false,
+                done: done_tx,
+            })
+            .expect("signal shutdown");
+
+        run_manager_worker("route-test".to_string(), manager, rx, shutdown_rx).await;
+        done_rx.await.expect("shutdown acknowledgement");
+
+        assert!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .upsert_attempts
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn synchronous_observation_retries_failed_initialization() {
         let domain = "sync.example.".to_string();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21));
@@ -2544,7 +2617,13 @@ mod tests {
 
         assert!(
             manager
-                .observe_domain(domain.clone(), ObservationScope::Ipv4, observed(), true)
+                .observe_domain(
+                    domain.clone(),
+                    ObservationScope::Ipv4,
+                    observed(),
+                    None,
+                    true,
+                )
                 .await
                 .is_err()
         );
@@ -2552,7 +2631,7 @@ mod tests {
 
         api.state.lock().expect("mock lock").fail_healthcheck = false;
         manager
-            .observe_domain(domain, ObservationScope::Ipv4, observed(), true)
+            .observe_domain(domain, ObservationScope::Ipv4, observed(), None, true)
             .await
             .expect("synchronous retry should initialize and sync");
 
@@ -2588,7 +2667,13 @@ mod tests {
         let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));
 
         manager
-            .observe_domain(domain.clone(), ObservationScope::Ipv4, Vec::new(), false)
+            .observe_domain(
+                domain.clone(),
+                ObservationScope::Ipv4,
+                Vec::new(),
+                Some(300),
+                false,
+            )
             .await
             .expect("queue withdrawal before initialization");
         assert!(!manager.initialized);
@@ -2627,10 +2712,7 @@ mod tests {
             }],
             101,
         );
-        assert_eq!(
-            manager.routes[&key].comment_domain,
-            PERSISTENT_COMMENT_DOMAIN
-        );
+        assert_eq!(manager.routes[&key].comment_domain, domain);
         manager.persistent_ips.clear();
         manager.ensure_persistent_routes(102);
 
@@ -2638,7 +2720,7 @@ mod tests {
         assert_eq!(route.ref_count, 1);
         assert_eq!(route.comment_domain, domain);
         assert_eq!(route.expires_at_unix, 401);
-        assert!(!route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
+        assert!(!route.persistent);
         assert_ne!(route.sync_state, SyncState::PendingDelete);
     }
 
@@ -2664,9 +2746,10 @@ mod tests {
         manager.apply_observation(domain, ObservationScope::Ipv4, Vec::new(), 102);
 
         let route = manager.routes.get(&key).expect("persistent route remains");
-        assert_eq!(route.ref_count, 1);
+        assert_eq!(route.ref_count, 0);
         assert_eq!(route.comment_domain, PERSISTENT_COMMENT_DOMAIN);
-        assert!(route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
+        assert!(route.persistent);
+        assert!(route.domains.is_empty());
         assert_eq!(route.expires_at_unix, PERSISTENT_EXPIRES_AT_UNIX);
         assert_ne!(route.sync_state, SyncState::PendingDelete);
         let comment = RouteCommentCodec::encode("fdns", "route-test", route);
@@ -2688,6 +2771,7 @@ mod tests {
                 addr: ip,
                 ttl_secs: 60,
             }],
+            None,
             1,
         );
         assert!(!manager.routes.contains_key(&key));
@@ -2703,6 +2787,67 @@ mod tests {
                 .upsert_attempts
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn expired_queued_negative_observation_is_not_replayed() {
+        let domain = "stale-negative.example.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 35));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let mut manager = manager_with_timeless_dynamic_routes();
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            1,
+        );
+        manager.queue_pending_observation(
+            domain,
+            ObservationScope::Ipv4,
+            Vec::new(),
+            Some(30),
+            100,
+        );
+
+        manager.replay_pending_observations();
+
+        assert_eq!(manager.routes[&key].ref_count, 1);
+        assert_ne!(manager.routes[&key].sync_state, SyncState::PendingDelete);
+    }
+
+    #[test]
+    fn non_cacheable_queued_negative_observation_is_not_replayed() {
+        AppClock::start();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 38));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        for negative_ttl_secs in [None, Some(0)] {
+            let domain = "non-cacheable-negative.example.".to_string();
+            let mut manager = manager_with_timeless_dynamic_routes();
+            manager.apply_observation(
+                domain.clone(),
+                ObservationScope::Ipv4,
+                vec![ObservedAddr {
+                    addr: ip,
+                    ttl_secs: 60,
+                }],
+                unix_now(),
+            );
+            manager.queue_pending_observation(
+                domain,
+                ObservationScope::Ipv4,
+                Vec::new(),
+                negative_ttl_secs,
+                unix_now(),
+            );
+
+            manager.replay_pending_observations();
+
+            assert_eq!(manager.routes[&key].ref_count, 1);
+            assert_ne!(manager.routes[&key].sync_state, SyncState::PendingDelete);
+        }
     }
 
     #[tokio::test]
@@ -2737,6 +2882,7 @@ mod tests {
                 "example.com.".to_string(),
                 ObservationScope::Ipv4,
                 Vec::new(),
+                Some(300),
                 true,
             )
             .await
@@ -2783,6 +2929,50 @@ mod tests {
         assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
         assert_eq!(manager.routes[&key].ref_count, 1);
         assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_anchor_name_remains_a_dynamic_qname_across_recovery() {
+        AppClock::start();
+        let now = unix_now();
+        let domain = "__forgedns_persistent__".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 36));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let mut initial = RouteManager::new(Arc::new(NoopApi), manager_config(Some(300)));
+        initial.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            now,
+        );
+        let initial_route = &initial.routes[&key];
+        assert!(!initial_route.persistent);
+        let comment = RouteCommentCodec::encode("fdns", "route-test", initial_route);
+        assert!(comment.contains(";kind=dynamic;"));
+
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*dynamic-anchor-name".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: format!("{ip}/32"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(comment),
+                disabled: false,
+            }],
+            ..MockApiState::default()
+        }));
+        let mut recovered = RouteManager::new(api, manager_config(Some(300)));
+
+        recovered.reconcile_from_router().await.expect("reconcile");
+
+        assert!(!recovered.routes[&key].persistent);
+        assert_eq!(recovered.routes[&key].ref_count, 1);
+        assert!(recovered.domain_bindings.contains_key(&domain));
     }
 
     #[tokio::test]

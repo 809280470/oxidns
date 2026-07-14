@@ -155,6 +155,16 @@ struct MikrotikConfig {
     cleanup_on_shutdown: bool,
 }
 
+#[derive(Debug)]
+struct ExtractedObservation {
+    domain: String,
+    scope: ObservationScope,
+    addrs: Vec<ObservedAddr>,
+    /// RFC 2308 lifetime for a negative response. Used only to bound replay
+    /// while RouterOS initialization is unavailable.
+    negative_ttl_secs: Option<u32>,
+}
+
 impl MikrotikConfigArgs {
     fn into_config(self, emit_warnings: bool) -> Result<MikrotikConfig> {
         let address = required_non_empty(self.address, "address")?;
@@ -487,11 +497,20 @@ impl Executor for MikrotikExecutor {
         next: Option<ExecutorNext>,
     ) -> Result<ExecStep> {
         let step = continue_next!(next, context)?;
+        if !self.active_registered.load(Ordering::Acquire) {
+            return Ok(step);
+        }
         let Some(tx) = self.command_tx.as_ref() else {
             return Ok(step);
         };
 
-        let Some((domain, scope, addrs)) = extract_observation(context, &self.config) else {
+        let Some(ExtractedObservation {
+            domain,
+            scope,
+            addrs,
+            negative_ttl_secs,
+        }) = extract_observation(context, &self.config)
+        else {
             return Ok(step);
         };
         self.metrics.observe_total.fetch_add(1, Ordering::Relaxed);
@@ -501,6 +520,7 @@ impl Executor for MikrotikExecutor {
                 domain,
                 scope,
                 addrs,
+                negative_ttl_secs,
                 wait: None,
             }) {
                 Ok(()) => {}
@@ -527,6 +547,7 @@ impl Executor for MikrotikExecutor {
             domain,
             scope,
             addrs,
+            negative_ttl_secs,
             wait: Some(wait_tx),
         };
         let send_outcome = tokio::time::timeout(
@@ -648,7 +669,7 @@ impl PluginFactory for MikrotikFactory {
 fn extract_observation(
     context: &mut DnsContext,
     config: &MikrotikConfig,
-) -> Option<(String, ObservationScope, Vec<ObservedAddr>)> {
+) -> Option<ExtractedObservation> {
     let question = context.request.first_question()?;
     let domain = question.name().normalized().to_string();
     let scope = match question.qtype() {
@@ -661,7 +682,12 @@ fn extract_observation(
     match classify_response(response, Some(question)) {
         ResponseDisposition::CompletePositive if response.rcode() == Rcode::NoError => {}
         ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData) => {
-            return Some((domain, scope, Vec::new()));
+            return Some(ExtractedObservation {
+                domain,
+                scope,
+                addrs: Vec::new(),
+                negative_ttl_secs: response.negative_ttl_from_soa(),
+            });
         }
         // NXDOMAIN is authoritative for the name, not only the queried record
         // type, so withdraw both address families. This is essential when
@@ -669,13 +695,24 @@ fn extract_observation(
         // it through the shared classifier first ensures the echoed response
         // question cannot withdraw routes for a different request name.
         ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NxDomain) => {
-            return Some((domain, ObservationScope::Both, Vec::new()));
+            return Some(ExtractedObservation {
+                domain,
+                scope: ObservationScope::Both,
+                addrs: Vec::new(),
+                negative_ttl_secs: response.negative_ttl_from_soa(),
+            });
         }
         _ => return None,
     }
 
-    extract_address_observations(response, question, scope, config)
-        .map(|addrs| (domain, scope, addrs))
+    extract_address_observations(response, question, scope, config).map(|addrs| {
+        ExtractedObservation {
+            domain,
+            scope,
+            addrs,
+            negative_ttl_secs: None,
+        }
+    })
 }
 
 fn extract_address_observations(
@@ -1089,7 +1126,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::proto::rdata::{A, CNAME};
+    use crate::proto::rdata::{A, CNAME, SOA};
     use crate::proto::{DNSClass, Message, Name, Question, RData, Record};
 
     fn observation_config() -> MikrotikConfig {
@@ -1167,10 +1204,11 @@ routing_table: "policy"
         assert!(extract_observation(&mut any_context, &config).is_none());
 
         let mut a_context = context_with_nodata(RecordType::A);
-        let (_, scope, addrs) =
+        let observation =
             extract_observation(&mut a_context, &config).expect("A NODATA observation");
-        assert_eq!(scope, ObservationScope::Ipv4);
-        assert!(addrs.is_empty());
+        assert_eq!(observation.scope, ObservationScope::Ipv4);
+        assert!(observation.addrs.is_empty());
+        assert_eq!(observation.negative_ttl_secs, None);
     }
 
     #[test]
@@ -1196,12 +1234,11 @@ routing_table: "policy"
             RData::A(A(Ipv4Addr::new(203, 0, 113, 28))),
         ));
 
-        let (_, scope, addrs) =
-            extract_observation(&mut context, &config).expect("CNAME observation");
+        let observation = extract_observation(&mut context, &config).expect("CNAME observation");
 
-        assert_eq!(scope, ObservationScope::Ipv4);
+        assert_eq!(observation.scope, ObservationScope::Ipv4);
         assert_eq!(
-            addrs,
+            observation.addrs,
             vec![ObservedAddr {
                 addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 27)),
                 ttl_secs: 30,
@@ -1214,12 +1251,12 @@ routing_table: "policy"
         let config = observation_config();
         let mut context = context_with_rcode(RecordType::AAAA, Rcode::NXDomain);
 
-        let (domain, scope, addrs) =
+        let observation =
             extract_observation(&mut context, &config).expect("AAAA NXDOMAIN observation");
 
-        assert_eq!(domain, "example.com");
-        assert_eq!(scope, ObservationScope::Both);
-        assert!(addrs.is_empty());
+        assert_eq!(observation.domain, "example.com");
+        assert_eq!(observation.scope, ObservationScope::Both);
+        assert!(observation.addrs.is_empty());
     }
 
     #[test]
@@ -1235,6 +1272,32 @@ routing_table: "policy"
         ));
 
         assert!(extract_observation(&mut context, &config).is_none());
+    }
+
+    #[test]
+    fn negative_observation_carries_soa_ttl_for_queued_replay() {
+        let config = observation_config();
+        let mut context = context_with_rcode(RecordType::A, Rcode::NXDomain);
+        context
+            .response_mut()
+            .expect("response")
+            .add_authority(Record::from_rdata(
+                Name::from_ascii("example.com.").expect("zone"),
+                120,
+                RData::SOA(SOA::new(
+                    Name::from_ascii("ns.example.com.").expect("mname"),
+                    Name::from_ascii("hostmaster.example.com.").expect("rname"),
+                    1,
+                    3600,
+                    600,
+                    86400,
+                    30,
+                )),
+            ));
+
+        let observation = extract_observation(&mut context, &config).expect("NXDOMAIN observation");
+
+        assert_eq!(observation.negative_ttl_secs, Some(30));
     }
 
     #[test]
