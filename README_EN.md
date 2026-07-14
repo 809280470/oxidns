@@ -80,7 +80,7 @@ It is better suited for users who want explicit control over DNS behavior, rathe
 | Matchers | `qname`, `question`, `qtype`, `qclass`, `client_ip`, `resp_ip`, `rcode`, `time`, `rate_limiter`, and more |
 | Data sets | `domain_set`, `dynamic_domain_set`, `ip_set`, `geoip`, `geosite`, `adguard_rule` |
 | Outbound networking | `network.outbound` centralizes nameservers and SOCKS5 settings for HTTP downloads, upgrade checks, webhooks, and upstreams |
-| System integrations | `ipset`, `nftset`, `ros_address_list`, `reverse_lookup` |
+| System integrations | `ipset`, `nftset`, `ros_address_list`, `ros_route`, `reverse_lookup` |
 | Debugging and operations | Health checks, config validation, hot reload, query records, Prometheus plugin metrics, real-time logs |
 | Deployment | Multi-platform builds, Debian packages, OpenWrt LuCI app, standalone WebUI hosting, service installation |
 
@@ -96,7 +96,7 @@ Typical use cases include:
 - Multi-upstream racing, fallback chains, and mixed protocol environments
 - Configurable concurrent upstream response selection to balance latency and negative-answer confidence
 - Fine-grained DNS policy routing based on domains, clients, and response results
-- DNS-result-driven `ipset` / `nftset` / MikroTik address list synchronization
+- DNS-result-driven `ipset` / `nftset` / MikroTik address-list and policy-route synchronization
 - Ad filtering, domain routing, local overrides, dual-stack preferences, and ECS control
 - Self-hosted DNS infrastructure that needs explicit control and debugging
 - Lightweight deployments that serve a separately built WebUI on the same management port

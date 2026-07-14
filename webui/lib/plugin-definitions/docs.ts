@@ -350,6 +350,25 @@ export const pluginFieldDocs = {
     mask6:
       "- 类型：`integer`；必填：否；默认值：由实现确定\n- 作用：兼容写法下分别定义 IPv4 / IPv6 前缀长度。",
   },
+  ros_route: {
+    address:
+      "- 类型：`string`；必填：是\n- RouterOS API 地址，通常为 `host:port`。",
+    username: "- 类型：`string`；必填：是\n- RouterOS API 登录用户名。",
+    password: "- 类型：`string`；必填：是\n- RouterOS API 登录密码。",
+    routing_table:
+      "- 类型：`string`；必填：是\n- 写入静态路由的 RouterOS routing table；插件不会创建该表或对应 routing rule。",
+    gateway4: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv4 路由下一跳。",
+    gateway6: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv6 路由下一跳。",
+    distance: "- 类型：`u8`；默认：`100`\n- RouterOS 静态路由 distance。",
+    "persistent_route.ips":
+      "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由；单 IP 会标准化为主机路由，`/0` 会被忽略。",
+    "persistent_route.files":
+      "- 类型：`array<string>`\n- 固定路由来源文件，每分钟重新读取并对账。",
+    fixed_ttl:
+      "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL。设为 `0` 时不按时间过期，但同一域名后续应答移除该 IP 时仍会撤销引用。",
+    cleanup_on_shutdown:
+      "- 类型：`bool`；默认：`true`\n- 正常关闭时清理该插件 tag 拥有的动态和固定路由。",
+  },
   ros_address_list: {
     address:
       "- 类型：`string`；必填：是；默认值：无\n- 作用：指定 RouterOS API 服务地址，通常写为 `host:port`。插件启动后将使用该地址建立管理连接，并在运行期间维持与设备的同步关系。\n- 配置建议：使用 RouterOS API 明文端口时通常为 `8728`，如部署了加密 API，应按实际端口填写。",
