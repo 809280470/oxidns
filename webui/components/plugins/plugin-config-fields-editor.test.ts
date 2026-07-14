@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { matcherPluginDefinitions } from "@/lib/plugin-definitions/matcher";
+import { executorPluginDefinitions } from "@/lib/plugin-definitions/executor";
 
 import {
   createDefaultPluginConfigValues,
@@ -24,6 +25,14 @@ if (!periodsField?.item || periodsField.item.type !== "object") {
   throw new Error("time matcher periods must use an object schema");
 }
 const periodFields = periodsField.item.fields;
+
+const nftSetDefinition = executorPluginDefinitions.find(
+  (definition) => definition.kind === "nftset",
+);
+
+if (!nftSetDefinition) {
+  throw new Error("nftset executor definition must exist");
+}
 
 describe("time matcher config form", () => {
   it("normalizes legacy weekday aliases to ISO numbers while preserving monthdays", () => {
@@ -57,6 +66,16 @@ describe("time matcher config form", () => {
     expect(
       (period.monthdays as unknown[]).every((day) => typeof day === "number"),
     ).toBe(true);
+  });
+
+  it("normalizes weekday aliases case-insensitively", () => {
+    const formValues = createPluginConfigFormValues(fields, {
+      periods: [{ weekdays: ["MON", "Fri"] }],
+    });
+
+    expect(serializePluginConfigValues(fields, formValues)).toEqual({
+      periods: [{ weekdays: [1, 5] }],
+    });
   });
 
   it("preserves omitted time bounds for existing all-day rules", () => {
@@ -109,6 +128,30 @@ describe("time matcher config form", () => {
     expect(isPluginConfigFormValid(fields, formValues)).toBe(false);
     expect(serializePluginConfigValues(fields, formValues)).toEqual({
       periods: [],
+    });
+  });
+});
+
+describe("optional object config fields", () => {
+  it("does not validate required children when an optional object is omitted", () => {
+    const formValues = createPluginConfigFormValues(
+      nftSetDefinition.configSchema,
+      {
+        table_family4: "ip",
+        table_name4: "mangle",
+        set_name4: "dns_v4",
+      },
+    );
+
+    expect(
+      isPluginConfigFormValid(nftSetDefinition.configSchema, formValues),
+    ).toBe(true);
+    expect(
+      serializePluginConfigValues(nftSetDefinition.configSchema, formValues),
+    ).toEqual({
+      table_family4: "ip",
+      table_name4: "mangle",
+      set_name4: "dns_v4",
     });
   });
 });

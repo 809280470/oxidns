@@ -285,6 +285,7 @@ export function isPluginConfigFormValid(
       typeof value === "object" &&
       !Array.isArray(value)
     ) {
+      if (!field.required && isEmptyConfigValue(value)) return true;
       return isPluginConfigFormValid(
         field.fields,
         value as Record<string, unknown>,
@@ -1083,12 +1084,19 @@ function TimeRangeFieldEditor({
             value={[toPickerValue(start), toPickerValue(end)]}
             onChange={(_, timeStrings) => {
               const [nextStart, nextEnd] = timeStrings;
+              if (!nextStart && !nextEnd) {
+                const nextValue = { ...value };
+                delete nextValue[startField.key];
+                delete nextValue[endField.key];
+                onChange(nextValue);
+                return;
+              }
               if (!nextStart || !nextEnd) return;
               updateRange(nextStart.slice(0, 5), nextEnd.slice(0, 5));
             }}
             className="oxidns-time-range-picker"
             popupClassName="oxidns-time-range-picker-popup"
-            allowClear={false}
+            allowClear
             disabled={readOnly}
             format="HH:mm"
             inputReadOnly
@@ -1868,10 +1876,13 @@ function normalizeArrayFieldValue(
   if (field.arrayPresentation && field.item && "options" in field.item) {
     const options = field.item.options ?? [];
     return normalizeArrayInputEntries(value).map((entry) => {
+      const normalizedEntry = String(entry).toLowerCase();
       const option = options.find(
         (candidate) =>
-          String(candidate.value) === String(entry) ||
-          candidate.aliases?.some((alias) => String(alias) === String(entry)),
+          String(candidate.value).toLowerCase() === normalizedEntry ||
+          candidate.aliases?.some(
+            (alias) => String(alias).toLowerCase() === normalizedEntry,
+          ),
       );
       return option?.value ?? entry;
     });
