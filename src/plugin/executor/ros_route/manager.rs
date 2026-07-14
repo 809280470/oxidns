@@ -156,7 +156,7 @@ pub(super) enum SyncState {
     ///
     /// Typical transitions:
     /// - new observation creates a fresh route entry
-    /// - reconcile detects a missing remote route for an in-use key
+    /// - reconcile detects that a desired persistent route was removed remotely
     /// - recovered entry lost its `router_id`
     PendingCreate,
     /// Local route state is consistent with RouterOS.
@@ -1464,7 +1464,8 @@ impl RouteManager {
         // 1) classify every exact route key as owned or foreign
         // 2) choose the best owned survivor and prune duplicates
         // 3) recover managed rows under the current TTL policy
-        // 4) mark missing local entries as create/delete candidates
+        // 4) accept missing synced dynamic rows as operator deletions, while preserving
+        //    pending writes and configured persistent routes
         // 5) execute one sync pass
         let now = unix_now();
         let rows = self
@@ -1746,12 +1747,27 @@ impl RouteManager {
             let Some(route) = self.routes.get_mut(&key) else {
                 continue;
             };
-            if route.ref_count > 0 {
+
+            if route.ref_count == 0 || matches!(route.sync_state, SyncState::PendingDelete) {
+                // The remote side already matches the local withdrawal. Drop
+                // the local route without issuing a redundant delete request.
+                self.routes.remove(&key);
+            } else if route.router_id.is_some()
+                && matches!(route.sync_state, SyncState::Synced)
+                && !route.domains.contains(PERSISTENT_ANCHOR_DOMAIN)
+            {
+                // A previously confirmed dynamic route disappeared without a
+                // new local write. Treat that as an operator deletion instead
+                // of immediately recreating it. Domain bindings intentionally
+                // remain: the next matching DNS observation will attach the IP
+                // again and create a fresh route.
+                self.routes.remove(&key);
+            } else {
+                // Pending local writes and explicitly configured persistent
+                // routes remain desired state even when no remote row exists.
                 route.router_id = None;
                 route.synced_expires_at_unix = None;
                 route.sync_state = SyncState::PendingCreate;
-            } else {
-                route.sync_state = SyncState::PendingDelete;
             }
         }
 
@@ -2804,6 +2820,79 @@ mod tests {
             251,
         );
         assert_eq!(manager.routes[&key].sync_state, SyncState::Dirty);
+    }
+
+    #[tokio::test]
+    async fn reconcile_accepts_manual_dynamic_deletion_until_next_observation() {
+        AppClock::start();
+        let now = unix_now();
+        let domain = "manual-delete.example.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 32));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));
+        let observation = || {
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }]
+        };
+
+        manager.apply_observation(domain.clone(), ObservationScope::Ipv4, observation(), now);
+        let route = manager.routes.get_mut(&key).expect("dynamic route");
+        route.router_id = Some("*removed-by-operator".to_string());
+        route.synced_expires_at_unix = Some(u64::MAX);
+        route.sync_state = SyncState::Synced;
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        assert!(!manager.routes.contains_key(&key));
+        assert!(manager.domain_bindings[&domain].ips.contains(&ip));
+        assert!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .upsert_attempts
+                .is_empty()
+        );
+
+        let touched =
+            manager.apply_observation(domain, ObservationScope::Ipv4, observation(), now + 1);
+        manager
+            .sync_route_keys(touched, now + 1)
+            .await
+            .expect("sync next observation");
+
+        assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
+        assert_eq!(
+            api.state.lock().expect("mock lock").upsert_attempts,
+            vec![ip]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_recreates_missing_configured_persistent_route() {
+        AppClock::start();
+        let now = unix_now();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 33));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::default());
+        let mut config = manager_config(Some(0));
+        config.persistent_ips.insert(format!("{ip}/32"));
+        let mut manager = RouteManager::new(api.clone(), config);
+        manager.ensure_persistent_routes(now);
+        let route = manager.routes.get_mut(&key).expect("persistent route");
+        route.router_id = Some("*removed-by-operator".to_string());
+        route.synced_expires_at_unix = Some(u64::MAX);
+        route.sync_state = SyncState::Synced;
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
+        assert_eq!(
+            api.state.lock().expect("mock lock").upsert_attempts,
+            vec![ip]
+        );
     }
 
     #[tokio::test]
