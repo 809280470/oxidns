@@ -18,6 +18,7 @@ import {
 } from "@/lib/plugin-config-yaml";
 import {
   createPluginConfigFormValues,
+  isPluginConfigFormValid,
   PluginConfigFieldsEditor,
   serializePluginConfigValues,
 } from "@/components/plugins/plugin-config-fields-editor";
@@ -74,14 +75,14 @@ export function PluginConfigModeEditor({
         ),
       );
       setYamlError(null);
-      onValidityChange?.(true);
+      onValidityChange?.(isPluginConfigFormValid(fields, fieldValues));
     }
     setMode(nextMode);
   };
 
   const handleFieldChange = (nextValues: Record<string, unknown>) => {
     setFieldValues(nextValues);
-    onValidityChange?.(true);
+    onValidityChange?.(isPluginConfigFormValid(fields, nextValues));
     onChange(serializePluginConfigValues(fields, nextValues));
   };
 
@@ -102,9 +103,13 @@ export function PluginConfigModeEditor({
       !Array.isArray(parsed.value)
     ) {
       setYamlError(null);
-      onValidityChange?.(true);
       const parsedValues = parsed.value as Record<string, unknown>;
-      setFieldValues(createPluginConfigFormValues(fields, parsedValues));
+      const nextFieldValues = createPluginConfigFormValues(
+        fields,
+        parsedValues,
+      );
+      onValidityChange?.(isPluginConfigFormValid(fields, nextFieldValues));
+      setFieldValues(nextFieldValues);
       onChange(parsedValues);
       return;
     }

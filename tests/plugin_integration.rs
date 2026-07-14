@@ -1018,7 +1018,7 @@ plugins:
       periods:
         - start: "09:00"
           end: "18:00"
-          weekdays: [mon, tue, wed, thu, fri]
+          weekdays: [1, 2, 3, 4, 5]
         - monthdays: [1, 15]
   - tag: seq
     type: sequence

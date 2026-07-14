@@ -42,9 +42,10 @@ struct TimeConfig {
 struct PeriodConfig {
     start: Option<String>,
     end: Option<String>,
-    weekdays: Option<Vec<String>>,
     // Keep raw YAML values until validation so each invalid list element can
-    // report its exact configuration path.
+    // report its exact configuration path. Weekdays accept the existing
+    // `mon` through `sun` names and ISO weekday numbers (`1` through `7`).
+    weekdays: Option<Vec<Value>>,
     monthdays: Option<Vec<Value>>,
 }
 
@@ -250,7 +251,7 @@ fn invalid_time_error(tag: &str, path: &str, raw: &str) -> DnsError {
     ))
 }
 
-fn compile_weekdays(tag: &str, path: &str, weekdays: Option<Vec<String>>) -> DnsResult<u8> {
+fn compile_weekdays(tag: &str, path: &str, weekdays: Option<Vec<Value>>) -> DnsResult<u8> {
     let Some(weekdays) = weekdays else {
         return Ok(0);
     };
@@ -262,18 +263,46 @@ fn compile_weekdays(tag: &str, path: &str, weekdays: Option<Vec<String>>) -> Dns
 
     let mut mask = 0;
     for (idx, raw) in weekdays.into_iter().enumerate() {
-        let value = raw.trim().to_ascii_lowercase();
-        let weekday = match value.as_str() {
-            "mon" => Weekday::Monday,
-            "tue" => Weekday::Tuesday,
-            "wed" => Weekday::Wednesday,
-            "thu" => Weekday::Thursday,
-            "fri" => Weekday::Friday,
-            "sat" => Weekday::Saturday,
-            "sun" => Weekday::Sunday,
-            _ => {
+        let value_path = format!("{path}.weekdays[{idx}]");
+        let weekday = match raw {
+            Value::String(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "mon" => Weekday::Monday,
+                "tue" => Weekday::Tuesday,
+                "wed" => Weekday::Wednesday,
+                "thu" => Weekday::Thursday,
+                "fri" => Weekday::Friday,
+                "sat" => Weekday::Saturday,
+                "sun" => Weekday::Sunday,
+                _ => {
+                    return Err(DnsError::plugin(format!(
+                        "time matcher '{tag}': {value_path} must be mon, tue, wed, thu, fri, sat, sun, or an ISO weekday number from 1 to 7, got '{raw}'"
+                    )));
+                }
+            },
+            Value::Number(number) => {
+                let day = number.as_i64().ok_or_else(|| {
+                    DnsError::plugin(format!(
+                        "time matcher '{tag}': {value_path} must be an ISO weekday number between 1 and 7, got {number}"
+                    ))
+                })?;
+                match day {
+                    1 => Weekday::Monday,
+                    2 => Weekday::Tuesday,
+                    3 => Weekday::Wednesday,
+                    4 => Weekday::Thursday,
+                    5 => Weekday::Friday,
+                    6 => Weekday::Saturday,
+                    7 => Weekday::Sunday,
+                    _ => {
+                        return Err(DnsError::plugin(format!(
+                            "time matcher '{tag}': {value_path} must be an ISO weekday number between 1 and 7, got {day}"
+                        )));
+                    }
+                }
+            }
+            other => {
                 return Err(DnsError::plugin(format!(
-                    "time matcher '{tag}': {path}.weekdays[{idx}] must be mon, tue, wed, thu, fri, sat, or sun, got '{raw}'"
+                    "time matcher '{tag}': {value_path} must be mon, tue, wed, thu, fri, sat, sun, or an ISO weekday number from 1 to 7, got {other:?}"
                 )));
             }
         };
@@ -421,6 +450,18 @@ mod tests {
             .collect()
     }
 
+    fn weekdays(days: &[&str]) -> Vec<Value> {
+        days.iter()
+            .map(|day| Value::String((*day).to_string()))
+            .collect()
+    }
+
+    fn weekday_numbers(days: &[u8]) -> Vec<Value> {
+        days.iter()
+            .map(|&day| Value::Number(Number::from(day as u64)))
+            .collect()
+    }
+
     fn config(periods: Vec<PeriodConfig>) -> TimeConfig {
         TimeConfig {
             timezone: Some("UTC".to_string()),
@@ -516,6 +557,27 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_weekdays_accepts_names_and_iso_numbers() {
+        let named = compile_weekdays("time", "periods[0]", Some(weekdays(&["MON", "sun"])))
+            .expect("named weekdays must be accepted");
+        let numbered = compile_weekdays("time", "periods[0]", Some(weekday_numbers(&[1, 7])))
+            .expect("ISO weekday numbers must be accepted");
+        assert_eq!(named, numbered);
+
+        for raw in ["0", "8", "1.5", "'1'"] {
+            let args: Value =
+                serde_yaml_ng::from_str(&format!("periods:\n  - weekdays: [{raw}]\n"))
+                    .expect("valid YAML");
+            let config =
+                parse_config("time", Some(args)).expect("config accepts raw weekday values");
+            let error = compile_periods("time", config.periods)
+                .expect_err("invalid weekday must be rejected")
+                .to_string();
+            assert!(error.contains("periods[0].weekdays[0]"));
+        }
+    }
+
+    #[test]
     fn test_time_window_uses_half_open_boundaries() {
         let matcher = matcher(config(vec![period(Some("09:00"), Some("18:00"))]));
         assert!(!matcher.matches_timestamp(parsed_timestamp("2023-12-31T23:59:00Z")));
@@ -530,7 +592,7 @@ mod tests {
             PeriodConfig {
                 start: Some("09:00".to_string()),
                 end: Some("18:00".to_string()),
-                weekdays: Some(vec!["MON".to_string()]),
+                weekdays: Some(weekdays(&["MON"])),
                 monthdays: Some(monthdays(&[1])),
             },
             PeriodConfig {
@@ -550,7 +612,7 @@ mod tests {
         let matcher = matcher(config(vec![PeriodConfig {
             start: Some("22:00".to_string()),
             end: Some("02:00".to_string()),
-            weekdays: Some(vec!["mon".to_string()]),
+            weekdays: Some(weekdays(&["mon"])),
             monthdays: Some(monthdays(&[1])),
         }]));
         assert!(matcher.matches_timestamp(parsed_timestamp("2024-01-01T22:00:00Z")));
