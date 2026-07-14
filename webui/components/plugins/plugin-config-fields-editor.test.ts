@@ -34,6 +34,14 @@ if (!nftSetDefinition) {
   throw new Error("nftset executor definition must exist");
 }
 
+const qnameDefinition = matcherPluginDefinitions.find(
+  (definition) => definition.kind === "qname",
+);
+
+if (!qnameDefinition) {
+  throw new Error("qname matcher definition must exist");
+}
+
 describe("time matcher config form", () => {
   it("normalizes legacy weekday aliases to ISO numbers while preserving monthdays", () => {
     const config = {
@@ -153,5 +161,18 @@ describe("optional object config fields", () => {
       table_name4: "mangle",
       set_name4: "dns_v4",
     });
+  });
+});
+
+describe("item option arrays", () => {
+  it("validates already serialized rows without discarding their values", () => {
+    const values = { args: ["$blocked", "domain:example.com"] };
+
+    expect(isPluginConfigFormValid(qnameDefinition.configSchema, values)).toBe(
+      true,
+    );
+    expect(
+      serializePluginConfigValues(qnameDefinition.configSchema, values),
+    ).toEqual(values);
   });
 });

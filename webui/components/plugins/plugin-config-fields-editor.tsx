@@ -2002,17 +2002,27 @@ function serializeSchemaArrayItem(
   return value;
 }
 
-function serializeOptionArrayEntry(
-  entry: SchemaArrayOptionValue,
-  field: ConfigField,
-) {
+function serializeOptionArrayEntry(entry: unknown, field: ConfigField) {
   const options = field.itemOptions ?? [];
-  const option =
-    options.find((item) => getChildOptionKey(item) === entry.optionKey) ??
-    options[0];
+  const isFormEntry =
+    entry &&
+    typeof entry === "object" &&
+    !Array.isArray(entry) &&
+    "optionKey" in entry &&
+    "value" in entry;
+  const option = isFormEntry
+    ? (options.find(
+        (item) =>
+          getChildOptionKey(item) ===
+          String((entry as SchemaArrayOptionValue).optionKey),
+      ) ?? options[0])
+    : inferArrayItemOption(entry, options);
 
   if (!option) return "";
-  return serializeSchemaArrayItem(entry.value, option);
+  return serializeSchemaArrayItem(
+    isFormEntry ? (entry as SchemaArrayOptionValue).value : entry,
+    option,
+  );
 }
 
 function createDefaultArrayItemValue(item: ConfigFieldChild): unknown {
