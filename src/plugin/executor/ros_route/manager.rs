@@ -1835,7 +1835,11 @@ impl RouteManager {
         if !cleanup {
             return Ok(());
         }
-        self.ensure_initialized().await?;
+
+        // Shutdown cleanup must never initialize or reconcile desired state:
+        // doing so could create/refresh routes immediately before deleting
+        // them. Read RouterOS directly and remove only rows owned by this
+        // plugin namespace.
         let routes = self
             .api
             .list_managed_routes(
@@ -1845,17 +1849,24 @@ impl RouteManager {
             )
             .await?;
         for route in routes {
-            if RouteCommentCodec::decode(
+            let comment = route.comment.as_deref().unwrap_or_default();
+            let owned_route = RouteCommentCodec::decode(
                 &self.cfg.comment_prefix,
                 &self.cfg.plugin_tag,
                 route.family,
                 &route.dst_address,
-                route.comment.as_deref().unwrap_or_default(),
+                comment,
             )
             .ok()
             .flatten()
-            .is_some()
-            {
+            .is_some();
+            let owned_gateway_check = owned_comment_has_kind(
+                &self.cfg.comment_prefix,
+                &self.cfg.plugin_tag,
+                comment,
+                COMMENT_KIND_GATEWAY_CHECK,
+            );
+            if owned_route || owned_gateway_check {
                 self.api.delete_route_by_id(&route.id, route.family).await?;
             }
         }
@@ -2462,6 +2473,57 @@ mod tests {
                 .is_err()
         );
         assert_eq!(manager.persistent_ips, desired);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_does_not_initialize_or_create_routes() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 34));
+        let validation_ip = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 34));
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![
+                RouterRoute {
+                    id: "*owned".to_string(),
+                    family: RouteFamily::Ipv4,
+                    dst_address: format!("{ip}/32"),
+                    routing_table: "via_proxy".to_string(),
+                    gateway: Some("192.0.2.1".to_string()),
+                    distance: Some(100),
+                    comment: Some(format!(
+                        "fdns;pg=route-test;kind=dynamic;dm=shutdown.example.;exp={};seen=100",
+                        u64::MAX
+                    )),
+                    disabled: false,
+                },
+                RouterRoute {
+                    id: "*gateway-check".to_string(),
+                    family: RouteFamily::Ipv4,
+                    dst_address: format!("{validation_ip}/32"),
+                    routing_table: "via_proxy".to_string(),
+                    gateway: Some("192.0.2.1".to_string()),
+                    distance: Some(100),
+                    comment: Some(validation_comment(
+                        "fdns",
+                        "route-test",
+                        RouteFamily::Ipv4,
+                        34,
+                    )),
+                    disabled: true,
+                },
+            ],
+            fail_healthcheck: true,
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));
+
+        manager.shutdown(true).await.expect("shutdown cleanup");
+
+        assert!(!manager.initialized);
+        let state = api.state.lock().expect("mock lock");
+        assert_eq!(
+            state.deleted_ids,
+            vec!["*owned".to_string(), "*gateway-check".to_string()]
+        );
+        assert!(state.upsert_attempts.is_empty());
     }
 
     #[tokio::test]

@@ -45,7 +45,7 @@ use tracing::warn;
 
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
-use crate::core::response::{ResponseDisposition, classify_response};
+use crate::core::response::{NegativeResponseKind, ResponseDisposition, classify_response};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
@@ -658,18 +658,19 @@ fn extract_observation(
     };
 
     let response = context.response()?;
-    match response.rcode() {
-        Rcode::NoError => match classify_response(response, Some(question)) {
-            ResponseDisposition::CompletePositive => {}
-            ResponseDisposition::DefinitiveNegative(_) => {
-                return Some((domain, scope, Vec::new()));
-            }
-            ResponseDisposition::IncompleteAlias | ResponseDisposition::Other => return None,
-        },
+    match classify_response(response, Some(question)) {
+        ResponseDisposition::CompletePositive if response.rcode() == Rcode::NoError => {}
+        ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData) => {
+            return Some((domain, scope, Vec::new()));
+        }
         // NXDOMAIN is authoritative for the name, not only the queried record
         // type, so withdraw both address families. This is essential when
-        // fixed_ttl=0 because no time-based cleanup will happen later.
-        Rcode::NXDomain => return Some((domain, ObservationScope::Both, Vec::new())),
+        // fixed_ttl=0 because no time-based cleanup will happen later. Running
+        // it through the shared classifier first ensures the echoed response
+        // question cannot withdraw routes for a different request name.
+        ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NxDomain) => {
+            return Some((domain, ObservationScope::Both, Vec::new()));
+        }
         _ => return None,
     }
 
@@ -1219,6 +1220,21 @@ routing_table: "policy"
         assert_eq!(domain, "example.com");
         assert_eq!(scope, ObservationScope::Both);
         assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn nxdomain_with_mismatched_question_is_ignored() {
+        let config = observation_config();
+        let mut context = context_with_rcode(RecordType::A, Rcode::NXDomain);
+        let response = context.response_mut().expect("response");
+        response.questions_mut().clear();
+        response.add_question(Question::new(
+            Name::from_ascii("other.example.").expect("other domain"),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+
+        assert!(extract_observation(&mut context, &config).is_none());
     }
 
     #[test]
