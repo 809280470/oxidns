@@ -1,7 +1,12 @@
 "use client";
 
 import { PluginReferencePicker } from "@/components/plugins/plugin-reference-picker";
+import { ConfigProvider, TimePicker } from "antd";
+import enUS from "antd/locale/en_US";
+import zhCN from "antd/locale/zh_CN";
+import dayjs from "dayjs";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
@@ -30,7 +35,15 @@ import { cn } from "@/lib/utils";
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import { ChevronDown, Info, Minus, Plus } from "lucide-react";
-import { Fragment, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
 
 type ArrayItemSyntax = "value" | "plugin" | "quick" | "domain";
 
@@ -112,6 +125,7 @@ function InvertCheckbox({
 // pre-filled (no placeholder affordance).
 const PLACEHOLDER_INPUT_TYPES = new Set([
   "text",
+  "time",
   "number",
   "textarea",
   "duration",
@@ -123,6 +137,8 @@ export function createDefaultPluginConfigValues(fields: ConfigField[]) {
   fields.forEach((field) => {
     if (field.type === "array") {
       defaults[field.key] = [];
+    } else if (field.type === "time" && field.timeRange) {
+      defaults[field.key] = field.timeRange.defaultValue;
     } else if (field.type === "object" && field.fields) {
       defaults[field.key] = createDefaultPluginConfigValues(field.fields);
     } else if (field.type === "record") {
@@ -147,7 +163,12 @@ export function createPluginConfigFormValues(
 
   fields.forEach((field) => {
     const value = config[field.key];
-    if (value === undefined) return;
+    if (value === undefined) {
+      if (field.type === "time" && field.timeRange) {
+        delete values[field.key];
+      }
+      return;
+    }
 
     if (field.type === "array") {
       values[field.key] = normalizeArrayFieldValue(value, field);
@@ -230,13 +251,81 @@ export function serializePluginConfigValues(
 export function isPluginConfigFormValid(
   fields: ConfigField[],
   values: Record<string, unknown>,
-) {
+): boolean {
   return fields.every((field) => {
-    if (!field.required) return true;
     const value = values[field.key];
-    if (Array.isArray(value)) return value.length > 0;
-    return value !== undefined && value !== "";
+    if (field.required) {
+      if (
+        Array.isArray(value) &&
+        serializeArrayFieldValue(value, field).length === 0
+      ) {
+        return false;
+      }
+      if (value === undefined || value === "") return false;
+    }
+
+    if (field.type === "time" && !isEmptyConfigValue(value)) {
+      if (typeof value !== "string" || !isValidTimeValue(value)) return false;
+    }
+
+    if (field.timeRange?.role === "start") {
+      const endField = findTimeRangePair(fields, field);
+      if (!endField) return false;
+      const endValue = values[endField.key];
+      const hasStart = !isEmptyConfigValue(value);
+      const hasEnd = !isEmptyConfigValue(endValue);
+      if (hasStart !== hasEnd) return false;
+      if (hasStart && value === endValue) return false;
+    }
+
+    if (
+      field.type === "object" &&
+      field.fields &&
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+    ) {
+      if (!field.required && isEmptyConfigValue(value)) return true;
+      return isPluginConfigFormValid(
+        field.fields,
+        value as Record<string, unknown>,
+      );
+    }
+
+    if (
+      field.type === "array" &&
+      field.item?.type === "object" &&
+      Array.isArray(value)
+    ) {
+      const itemFields = field.item.fields;
+      return value.every(
+        (entry) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          !Array.isArray(entry) &&
+          isPluginConfigFormValid(itemFields, entry as Record<string, unknown>),
+      );
+    }
+
+    return true;
   });
+}
+
+const TIME_VALUE_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+function isValidTimeValue(value: string) {
+  return TIME_VALUE_PATTERN.test(value);
+}
+
+function findTimeRangePair(fields: ConfigField[], field: ConfigField) {
+  if (!field.timeRange) return undefined;
+  const group = field.timeRange;
+  const pairRole = group.role === "start" ? "end" : "start";
+  return fields.find(
+    (candidate) =>
+      candidate.timeRange?.id === group.id &&
+      candidate.timeRange?.role === pairRole,
+  );
 }
 
 export function PluginConfigFieldsEditor({
@@ -540,6 +629,18 @@ function ConfigFieldControl({
           disabled={readOnly}
         />
       );
+    case "time":
+      return (
+        <Input
+          type="time"
+          step={60}
+          value={typeof value === "string" ? value : ""}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={defaultPlaceholder}
+          className="font-mono text-sm"
+          disabled={readOnly}
+        />
+      );
     case "number":
       return (
         <Input
@@ -564,6 +665,16 @@ function ConfigFieldControl({
         />
       );
     case "array":
+      if (field.arrayPresentation) {
+        return (
+          <ArrayChoiceFieldEditor
+            field={field}
+            value={Array.isArray(value) ? value : []}
+            onChange={onChange}
+            readOnly={readOnly}
+          />
+        );
+      }
       if (field.item || field.itemOptions) {
         return (
           <SchemaArrayFieldEditor
@@ -840,21 +951,486 @@ function ObjectFieldEditor({
 }) {
   return (
     <div className="space-y-4">
-      {fields.map((field) => (
-        <Field key={field.key}>
-          <ConfigFieldLabel field={field} />
-          <ConfigFieldControl
-            field={field}
-            plugins={plugins}
-            value={value[field.key]}
-            onChange={(nextFieldValue) =>
-              onChange({ ...value, [field.key]: nextFieldValue })
-            }
-            defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
-            readOnly={readOnly}
+      {fields.map((field) => {
+        if (field.timeRange?.role === "end") return null;
+        if (field.timeRange?.role === "start") {
+          const endField = findTimeRangePair(fields, field);
+          if (endField) {
+            return (
+              <TimeRangeFieldEditor
+                key={field.timeRange.id}
+                startField={field}
+                endField={endField}
+                value={value}
+                onChange={onChange}
+                readOnly={readOnly}
+              />
+            );
+          }
+        }
+
+        return (
+          <Field key={field.key}>
+            <ConfigFieldLabel field={field} />
+            <ConfigFieldControl
+              field={field}
+              plugins={plugins}
+              value={value[field.key]}
+              onChange={(nextFieldValue) =>
+                onChange({ ...value, [field.key]: nextFieldValue })
+              }
+              defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
+              readOnly={readOnly}
+            />
+          </Field>
+        );
+      })}
+    </div>
+  );
+}
+
+function TimeRangeFieldEditor({
+  startField,
+  endField,
+  value,
+  onChange,
+  readOnly,
+}: {
+  startField: ConfigField;
+  endField: ConfigField;
+  value: Record<string, unknown>;
+  onChange: (value: Record<string, unknown>) => void;
+  readOnly: boolean;
+}) {
+  const { locale, t } = useI18n();
+  const rawStart = value[startField.key];
+  const rawEnd = value[endField.key];
+  const defaultStart = startField.timeRange?.defaultValue ?? "09:00";
+  const defaultEnd = endField.timeRange?.defaultValue ?? "18:00";
+  const rawStartValue = typeof rawStart === "string" ? rawStart : "";
+  const rawEndValue = typeof rawEnd === "string" ? rawEnd : "";
+  const hasStart = Boolean(rawStartValue);
+  const hasEnd = Boolean(rawEndValue);
+  const isUnrestricted = !hasStart && !hasEnd;
+  const start = rawStartValue || defaultStart;
+  const end = rawEndValue || defaultEnd;
+  const incomplete = hasStart !== hasEnd;
+  const equal = hasStart && hasEnd && start === end;
+  const invalid =
+    (hasStart && !isValidTimeValue(start)) ||
+    (hasEnd && !isValidTimeValue(end));
+  const error = incomplete
+    ? t(WEBUI.plugins.timeRangeIncomplete)
+    : equal
+      ? t(WEBUI.plugins.timeRangeEqual)
+      : invalid
+        ? t(WEBUI.plugins.timeRangeInvalid)
+        : null;
+
+  const updateRange = (startValue: string, endValue: string) => {
+    onChange({
+      ...value,
+      [startField.key]: startValue,
+      [endField.key]: endValue,
+    });
+  };
+
+  const toPickerValue = (time: string) => {
+    const [hour, minute] = time.split(":").map(Number);
+    return dayjs().hour(hour).minute(minute).second(0).millisecond(0);
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium">
+          {t(WEBUI.plugins.timeRange)}
+        </span>
+        {hasStart && hasEnd && start > end && (
+          <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+            {t(WEBUI.plugins.nextDay)}
+          </span>
+        )}
+      </div>
+      {isUnrestricted ? (
+        <div className="flex items-center gap-2">
+          <span className="rounded-md border border-dashed px-2.5 py-1.5 text-sm text-muted-foreground">
+            {t(WEBUI.plugins.unrestrictedTime)}
+          </span>
+          {!readOnly && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => updateRange(defaultStart, defaultEnd)}
+            >
+              {t(WEBUI.plugins.setTimeRange)}
+            </Button>
+          )}
+        </div>
+      ) : (
+        <ConfigProvider
+          locale={locale === "zh-CN" ? zhCN : enUS}
+          theme={{
+            token: {
+              borderRadius: 8,
+              controlHeight: 32,
+              fontFamily: "var(--font-mono)",
+              fontSize: 14,
+            },
+          }}
+        >
+          <TimePicker.RangePicker
+            value={[toPickerValue(start), toPickerValue(end)]}
+            onChange={(_, timeStrings) => {
+              const [nextStart, nextEnd] = timeStrings;
+              if (!nextStart && !nextEnd) {
+                const nextValue = { ...value };
+                delete nextValue[startField.key];
+                delete nextValue[endField.key];
+                onChange(nextValue);
+                return;
+              }
+              if (!nextStart || !nextEnd) return;
+              updateRange(nextStart.slice(0, 5), nextEnd.slice(0, 5));
+            }}
+            className="oxidns-time-range-picker"
+            popupClassName="oxidns-time-range-picker-popup"
+            allowClear
+            disabled={readOnly}
+            format="HH:mm"
+            inputReadOnly
+            minuteStep={1}
+            needConfirm={false}
+            order={false}
+            placeholder={[startField.label, endField.label]}
           />
-        </Field>
-      ))}
+        </ConfigProvider>
+      )}
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+function ArrayChoiceFieldEditor({
+  field,
+  value,
+  onChange,
+  readOnly,
+}: {
+  field: ConfigField;
+  value: unknown[];
+  onChange: (value: unknown[]) => void;
+  readOnly: boolean;
+}) {
+  const { t } = useI18n();
+  const options =
+    field.item && "options" in field.item ? (field.item.options ?? []) : [];
+  const isWeekdayPicker = field.arrayPresentation === "weekday-chips";
+  const isMonthdayPicker = field.arrayPresentation === "calendar-grid";
+  const [isMonthdayGridOpen, setIsMonthdayGridOpen] = useState(
+    value.length > 0,
+  );
+  const selected = new Set(
+    isWeekdayPicker && value.length === 0
+      ? options.map((option) => String(option.value))
+      : value.map((entry) => String(entry)),
+  );
+  const dragSelectionRef = useRef<{
+    pointerId: number;
+    checked: boolean;
+    selected: Set<string>;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
+
+  const commitSelection = (nextSelected: Set<string>) => {
+    const nextValue = options
+      .filter((option) => nextSelected.has(String(option.value)))
+      .map((option) => option.value);
+    onChange(
+      isWeekdayPicker && nextValue.length === options.length ? [] : nextValue,
+    );
+  };
+
+  const updateSelection = (nextSelected: Set<string>) => {
+    if (isWeekdayPicker && nextSelected.size === 0) return false;
+    commitSelection(nextSelected);
+    return true;
+  };
+
+  const toggle = (optionValue: string | number, checked: boolean) => {
+    const nextSelected = new Set(selected);
+    const key = String(optionValue);
+    if (checked) nextSelected.add(key);
+    else nextSelected.delete(key);
+    updateSelection(nextSelected);
+  };
+
+  const beginPointerSelection = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    optionValue: string | number,
+  ) => {
+    if (readOnly || event.pointerType !== "mouse" || event.button !== 0) return;
+    event.preventDefault();
+    const nextSelected = new Set(selected);
+    const key = String(optionValue);
+    const checked = !nextSelected.has(key);
+    if (checked) nextSelected.add(key);
+    else nextSelected.delete(key);
+    if (!updateSelection(nextSelected)) return;
+    dragSelectionRef.current = {
+      pointerId: event.pointerId,
+      checked,
+      selected: nextSelected,
+    };
+    suppressClickRef.current = true;
+  };
+
+  const extendPointerSelection = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    optionValue: string | number,
+  ) => {
+    const session = dragSelectionRef.current;
+    if (!session || session.pointerId !== event.pointerId) return;
+    const key = String(optionValue);
+    if (session.selected.has(key) === session.checked) return;
+    const nextSelected = new Set(session.selected);
+    if (session.checked) nextSelected.add(key);
+    else nextSelected.delete(key);
+    if (updateSelection(nextSelected)) session.selected = nextSelected;
+  };
+
+  const handleChoiceClick = (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    optionValue: string | number,
+    checked: boolean,
+  ) => {
+    if (suppressClickRef.current) {
+      event.preventDefault();
+      suppressClickRef.current = false;
+      return;
+    }
+    toggle(optionValue, !checked);
+  };
+
+  useEffect(() => {
+    const finishPointerSelection = () => {
+      dragSelectionRef.current = null;
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
+    };
+    window.addEventListener("pointerup", finishPointerSelection);
+    window.addEventListener("pointercancel", finishPointerSelection);
+    return () => {
+      window.removeEventListener("pointerup", finishPointerSelection);
+      window.removeEventListener("pointercancel", finishPointerSelection);
+    };
+  }, []);
+
+  const applyPreset = (values: string[]) => {
+    commitSelection(new Set(values));
+  };
+
+  const isSelectedExactly = (values: string[]) =>
+    selected.size === values.length &&
+    values.every((value) => selected.has(value));
+
+  const weekdayValues = options.map((option) => String(option.value));
+  const workdayValues = weekdayValues.slice(0, 5);
+  const weekendValues = weekdayValues.slice(5);
+  const showChoices = !isMonthdayPicker || isMonthdayGridOpen;
+  const status = isWeekdayPicker
+    ? value.length === 0
+      ? t(WEBUI.plugins.everyDay)
+      : t(WEBUI.plugins.selectedWeekdays, { count: value.length })
+    : isMonthdayPicker
+      ? value.length === 0
+        ? t(WEBUI.plugins.unrestrictedDates)
+        : t(WEBUI.plugins.selectedMonthdays, { count: value.length })
+      : value.length === 0
+        ? t(WEBUI.plugins.unrestricted)
+        : t(WEBUI.plugins.selectedCount, { count: value.length });
+
+  return (
+    <div className="space-y-2.5 rounded-lg border border-border/70 bg-background/40 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs text-muted-foreground">{status}</span>
+        {!readOnly && isWeekdayPicker && (
+          <div className="flex flex-wrap items-center gap-1">
+            <Button
+              type="button"
+              variant={isSelectedExactly(weekdayValues) ? "secondary" : "ghost"}
+              size="xs"
+              onClick={() => applyPreset(weekdayValues)}
+            >
+              {t(WEBUI.plugins.everyDay)}
+            </Button>
+            <Button
+              type="button"
+              variant={isSelectedExactly(workdayValues) ? "secondary" : "ghost"}
+              size="xs"
+              onClick={() => applyPreset(workdayValues)}
+            >
+              {t(WEBUI.plugins.workdays)}
+            </Button>
+            <Button
+              type="button"
+              variant={isSelectedExactly(weekendValues) ? "secondary" : "ghost"}
+              size="xs"
+              onClick={() => applyPreset(weekendValues)}
+            >
+              {t(WEBUI.plugins.weekends)}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={() => onChange([])}
+              disabled={value.length === 0}
+            >
+              {t(WEBUI.plugins.clearSelection)}
+            </Button>
+          </div>
+        )}
+        {!readOnly && isMonthdayPicker && (
+          <Button
+            type="button"
+            variant={isMonthdayGridOpen ? "ghost" : "secondary"}
+            size="xs"
+            onClick={() => {
+              if (isMonthdayGridOpen) {
+                onChange([]);
+                setIsMonthdayGridOpen(false);
+              } else {
+                setIsMonthdayGridOpen(true);
+              }
+            }}
+          >
+            {isMonthdayGridOpen
+              ? value.length > 0
+                ? t(WEBUI.plugins.clearSelection)
+                : t(WEBUI.plugins.unrestrictedDates)
+              : t(WEBUI.plugins.specifiedDates)}
+          </Button>
+        )}
+        {!readOnly && !isWeekdayPicker && !isMonthdayPicker && (
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={() => onChange(options.map((option) => option.value))}
+              disabled={value.length === options.length}
+            >
+              {t(WEBUI.plugins.selectAll)}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={() => onChange([])}
+              disabled={value.length === 0}
+            >
+              {t(WEBUI.plugins.clearSelection)}
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {showChoices && (
+        <div
+          className={cn(
+            isMonthdayPicker || isWeekdayPicker
+              ? "grid w-full grid-cols-7 gap-1 sm:gap-1.5"
+              : "grid gap-1.5 [grid-template-columns:repeat(auto-fit,minmax(6.5rem,1fr))]",
+          )}
+        >
+          {options.map((option) => {
+            const optionKey = String(option.value);
+            const checked = selected.has(optionKey);
+            if (isMonthdayPicker) {
+              return (
+                <Button
+                  key={optionKey}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className={cn(
+                    "h-8 w-full select-none px-1 font-mono text-xs touch-pan-y",
+                    checked &&
+                      "border-primary/60 bg-primary/12 font-semibold text-primary hover:bg-primary/18 hover:text-primary",
+                  )}
+                  aria-pressed={checked}
+                  disabled={readOnly}
+                  onPointerDown={(event) =>
+                    beginPointerSelection(event, option.value)
+                  }
+                  onPointerEnter={(event) =>
+                    extendPointerSelection(event, option.value)
+                  }
+                  onClick={(event) =>
+                    handleChoiceClick(event, option.value, checked)
+                  }
+                >
+                  {option.label}
+                </Button>
+              );
+            }
+
+            if (isWeekdayPicker) {
+              return (
+                <Button
+                  key={optionKey}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className={cn(
+                    "w-full select-none px-1 touch-pan-y",
+                    checked &&
+                      "border-primary/60 bg-primary/12 font-semibold text-primary hover:bg-primary/18 hover:text-primary",
+                  )}
+                  aria-pressed={checked}
+                  disabled={readOnly}
+                  onPointerDown={(event) =>
+                    beginPointerSelection(event, option.value)
+                  }
+                  onPointerEnter={(event) =>
+                    extendPointerSelection(event, option.value)
+                  }
+                  onClick={(event) =>
+                    handleChoiceClick(event, option.value, checked)
+                  }
+                >
+                  {option.label}
+                </Button>
+              );
+            }
+
+            return (
+              <label
+                key={optionKey}
+                className={cn(
+                  "flex min-h-9 cursor-pointer items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm transition-colors",
+                  checked
+                    ? "border-primary/60 bg-primary/8 text-foreground"
+                    : "border-border bg-background hover:bg-muted/50",
+                  readOnly && "cursor-not-allowed opacity-60",
+                )}
+              >
+                <Checkbox
+                  checked={checked}
+                  onCheckedChange={(next) =>
+                    toggle(option.value, next === true)
+                  }
+                  disabled={readOnly}
+                />
+                <span>{option.label}</span>
+              </label>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -1297,6 +1873,21 @@ function normalizeArrayFieldValue(
     return normalizeOptionArrayValue(value, field.itemOptions);
   }
 
+  if (field.arrayPresentation && field.item && "options" in field.item) {
+    const options = field.item.options ?? [];
+    return normalizeArrayInputEntries(value).map((entry) => {
+      const normalizedEntry = String(entry).toLowerCase();
+      const option = options.find(
+        (candidate) =>
+          String(candidate.value).toLowerCase() === normalizedEntry ||
+          candidate.aliases?.some(
+            (alias) => String(alias).toLowerCase() === normalizedEntry,
+          ),
+      );
+      return option?.value ?? entry;
+    });
+  }
+
   if (field.item) {
     return normalizeSchemaArrayValue(value, field.item);
   }
@@ -1411,17 +2002,27 @@ function serializeSchemaArrayItem(
   return value;
 }
 
-function serializeOptionArrayEntry(
-  entry: SchemaArrayOptionValue,
-  field: ConfigField,
-) {
+function serializeOptionArrayEntry(entry: unknown, field: ConfigField) {
   const options = field.itemOptions ?? [];
-  const option =
-    options.find((item) => getChildOptionKey(item) === entry.optionKey) ??
-    options[0];
+  const isFormEntry =
+    entry &&
+    typeof entry === "object" &&
+    !Array.isArray(entry) &&
+    "optionKey" in entry &&
+    "value" in entry;
+  const option = isFormEntry
+    ? (options.find(
+        (item) =>
+          getChildOptionKey(item) ===
+          String((entry as SchemaArrayOptionValue).optionKey),
+      ) ?? options[0])
+    : inferArrayItemOption(entry, options);
 
   if (!option) return "";
-  return serializeSchemaArrayItem(entry.value, option);
+  return serializeSchemaArrayItem(
+    isFormEntry ? (entry as SchemaArrayOptionValue).value : entry,
+    option,
+  );
 }
 
 function createDefaultArrayItemValue(item: ConfigFieldChild): unknown {
@@ -1586,6 +2187,25 @@ function getObjectSummaryFromFields(
   const summary = selectedFields
     .map((field): string => {
       const fieldValue = objectValue[field.key];
+      if (field.timeRange?.role === "end") return "";
+      if (field.timeRange?.role === "start") {
+        const endField = findTimeRangePair(fields, field);
+        const endValue = endField ? objectValue[endField.key] : undefined;
+        if (isEmptyConfigValue(fieldValue) && isEmptyConfigValue(endValue)) {
+          return t(WEBUI.plugins.unrestrictedTime);
+        }
+        if (
+          typeof fieldValue === "string" &&
+          typeof endValue === "string" &&
+          fieldValue &&
+          endValue
+        ) {
+          return fieldValue > endValue
+            ? `${fieldValue}–${t(WEBUI.plugins.nextDay)} ${endValue}`
+            : `${fieldValue}–${endValue}`;
+        }
+        return t(WEBUI.plugins.timeRangeIncomplete);
+      }
       const formatted: string =
         field.type === "object"
           ? getObjectSummaryFromFields(
@@ -1594,13 +2214,40 @@ function getObjectSummaryFromFields(
               fieldValue,
               t,
             )
-          : formatSummaryValue(fieldValue, t);
+          : formatConfigFieldSummaryValue(field, fieldValue, t);
       return formatted ? `${field.label}: ${formatted}` : "";
     })
     .filter(Boolean)
     .join(" · ");
 
   return summary || t(WEBUI.plugins.notConfigured);
+}
+
+function formatConfigFieldSummaryValue(
+  field: ConfigField,
+  value: unknown,
+  t: TFn,
+) {
+  if (
+    field.type === "array" &&
+    field.arrayPresentation &&
+    Array.isArray(value) &&
+    field.item &&
+    "options" in field.item
+  ) {
+    const options = field.item.options ?? [];
+    if (value.length === 0) {
+      return field.arrayPresentation === "weekday-chips"
+        ? t(WEBUI.plugins.everyDay)
+        : t(WEBUI.plugins.unrestricted);
+    }
+    const selected = new Set(value.map((entry) => String(entry)));
+    const labels = options
+      .filter((option) => selected.has(String(option.value)))
+      .map((option) => option.label);
+    return labels.join(", ");
+  }
+  return formatSummaryValue(value, t);
 }
 
 function getObjectSummaryFields(

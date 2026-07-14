@@ -65,6 +65,7 @@ export interface PluginKindDefinition {
 }
 export type ConfigFieldType =
   | "text"
+  | "time"
   | "number"
   | "select"
   | "textarea"
@@ -75,6 +76,13 @@ export type ConfigFieldType =
   | "json"
   | "record"
   | "reference";
+
+export interface ConfigTimeRangeGroup {
+  id: string;
+  role: "start" | "end";
+  defaultValue: string;
+}
+
 export interface ConfigField {
   key: string;
   label: string;
@@ -87,6 +95,8 @@ export interface ConfigField {
   options?: {
     label: string;
     value: string | number;
+    /** Additional legacy values accepted when loading form data. */
+    aliases?: (string | number)[];
   }[];
   dynamicOptions?: "outboundProfiles";
   referenceTypes?: PluginType[];
@@ -98,6 +108,10 @@ export interface ConfigField {
   valuePlaceholder?: string;
   item?: ConfigFieldChild;
   itemOptions?: ConfigFieldChild[];
+  /** Render a finite array as direct multi-choice controls instead of add/remove rows. */
+  arrayPresentation?: "checklist" | "weekday-chips" | "calendar-grid";
+  /** Group two sibling time fields into one optional start/end range editor. */
+  timeRange?: ConfigTimeRangeGroup;
   fields?: ConfigField[];
   summaryFields?: string[];
   // Force the field to span both columns in the 2-col config grid. Use this
