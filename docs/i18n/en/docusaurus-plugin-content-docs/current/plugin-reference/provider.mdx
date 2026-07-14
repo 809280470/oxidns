@@ -242,6 +242,65 @@ Loads reusable domain rules from v2ray-rules-dat `geosite.dat`.
   - Omit it or pass `[]` to load the full union of every entry in the dat file.
   - Example: `category-games@cn` keeps only rules under `category-games` that carry the `cn` attribute.
 
+### Composition Examples
+
+Split domain policy by code and use each provider directly from a matcher:
+
+```yaml
+plugins:
+  - tag: geosite_cn
+    type: geosite
+    args:
+      file: "/etc/oxidns/geosite.dat"
+      selectors: ["cn"]
+
+  # `geolocation-!cn` is a geosite.dat code, not a generic exclusion expression.
+  - tag: geosite_non_cn
+    type: geosite
+    args:
+      file: "/etc/oxidns/geosite.dat"
+      selectors: ["geolocation-!cn"]
+
+  - tag: match_cn_domain
+    type: qname
+    args: ["$geosite_cn"]
+
+  - tag: match_non_cn_question
+    type: question
+    args: ["$geosite_non_cn"]
+```
+
+Filter a code by attribute. Available codes and attributes depend on the dat release in use:
+
+```yaml
+- tag: geosite_games_cn
+  type: geosite
+  args:
+    file: "/etc/oxidns/geosite.dat"
+    selectors:
+      - "category-games@cn"
+
+- tag: match_games_cn
+  type: qname
+  args: ["$geosite_games_cn"]
+```
+
+Combine geosite data with local rules behind one reusable entrypoint:
+
+```yaml
+- tag: domestic_domains
+  type: domain_set
+  args:
+    exps:
+      - "full:internal.example"
+    sets:
+      - "geosite_cn"
+
+- tag: match_domestic_domain
+  type: qname
+  args: ["$domestic_domains"]
+```
+
 ### Behavior
 
 - `Plain` becomes `keyword:`.
@@ -251,6 +310,14 @@ Loads reusable domain rules from v2ray-rules-dat `geosite.dat`.
 - Can be referenced directly by `qname`, `cname`, and `question`, or aggregated by `domain_set`.
 - Supports independent refresh through `reload_provider` or `POST /plugins/<tag>/reload`.
 - To pre-export selected rules into text files before runtime, use `oxidns export-dat --kind geosite`.
+
+<Admonition type="note" title="Selector Notes">
+
+- Selectors perform exact code matching only. The `!` in `geolocation-!cn` is part of the code text; it does not mean “exclude cn”.
+- `code@attribute` retains only rules carrying that attribute. If one provider lists both `code` and `code@attribute`, the bare `code` loads every rule in that code.
+- Startup and provider reload fail when the requested selectors match no entry or produce no rules. Use `oxidns export-dat --kind geosite --selector <selector>` first to verify a selector against the data file.
+
+</Admonition>
 
 ---
 
@@ -436,9 +503,55 @@ Loads reusable IP and CIDR rules from v2ray-rules-dat `geoip.dat`.
   - Multiple selectors are merged as a union.
   - Omit it or pass `[]` to load the full union of every entry in the dat file.
 
+### Composition Examples
+
+Match either the client source address or addresses in a DNS response directly:
+
+```yaml
+plugins:
+  - tag: geoip_cn
+    type: geoip
+    args:
+      file: "/etc/oxidns/geoip.dat"
+      selectors: ["cn"]
+
+  - tag: match_client_cn
+    type: client_ip
+    args: ["$geoip_cn"]
+
+  - tag: match_answer_cn
+    type: resp_ip
+    args: ["$geoip_cn"]
+```
+
+Combine GeoIP data with local CIDRs for reuse by several matchers:
+
+```yaml
+- tag: cn_or_private_network
+  type: ip_set
+  args:
+    ips:
+      - "10.0.0.0/8"
+      - "fd00::/8"
+    sets:
+      - "geoip_cn"
+
+- tag: match_cn_or_private_client
+  type: client_ip
+  args: ["$cn_or_private_network"]
+```
+
 ### Behavior
 
 - Exposes IP-only membership checks.
 - Can be referenced directly by `client_ip`, `resp_ip`, and `ptr_ip`, or composed by `ip_set`.
 - Supports independent refresh through `reload_provider` or `POST /plugins/<tag>/reload`.
 - To pre-export selected rules into text files before runtime, use `oxidns export-dat --kind geoip`.
+
+<Admonition type="note" title="Selector Notes">
+
+- GeoIP selectors accept codes only; `@attribute`, wildcards, and exclusion expressions are not supported.
+- Startup and provider reload fail when a requested selector matches no entry. Validate it first with `oxidns export-dat --kind geoip --selector <selector>`.
+- Omitting `selectors` loads the whole dat file, which is usually large. Prefer the codes that the production policy actually needs.
+
+</Admonition>
