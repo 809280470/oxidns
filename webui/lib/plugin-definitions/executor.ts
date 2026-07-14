@@ -1730,12 +1730,18 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_route_dropped_total: "异步丢弃",
         ros_route_sync_error_total: "同步失败",
         ros_route_sync_timeout_total: "同步超时",
+        ros_route_delete_deferred_total: "延迟删除",
+        ros_route_connection_check_error_total: "连接检查失败",
       },
       metricHelp: {
         ros_route_observe_total: "提交给 RouterOS 路由管理器的域名观测总数。",
         ros_route_dropped_total: "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
         ros_route_sync_error_total: "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
         ros_route_sync_timeout_total: "同步模式下入队或等待超时的观测总数。",
+        ros_route_delete_deferred_total:
+          "因 RouterOS conntrack 中仍存在目标连接而延迟删除路由的总次数。",
+        ros_route_connection_check_error_total:
+          "路由删除期间 RouterOS conntrack 查询失败的总次数。",
       },
       cardPriority: ["ros_route_observe_total", "ros_route_sync_error_total"],
     } satisfies PluginMetricsDef,
@@ -1780,6 +1786,13 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "动态路由固定 TTL",
         type: "number",
         description: "填 0 表示动态路由不按时间过期。",
+      },
+      {
+        key: "conntrack_guard",
+        label: "连接跟踪保护",
+        type: "switch",
+        default: false,
+        description: "删除普通路由前检查 RouterOS conntrack；有目标连接时延后删除。",
       },
       { key: "cleanup_on_shutdown", label: "关闭时清理", type: "switch", default: true },
     ],

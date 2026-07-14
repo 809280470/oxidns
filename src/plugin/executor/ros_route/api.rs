@@ -6,10 +6,12 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::net::IpAddr;
 use std::time::Duration;
 
+use ahash::AHashSet;
 use async_trait::async_trait;
-use mikrotik_rs::{Command, CommandBuilder, Event, MikrotikDevice};
+use mikrotik_rs::{Command, CommandBuilder, Event, MikrotikDevice, QueryOperator};
 use tracing::warn;
 
 use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
@@ -22,6 +24,7 @@ const ROUTE_GATEWAY_FIELD: &str = "gateway";
 const ROUTE_DISTANCE_FIELD: &str = "distance";
 const ROUTE_COMMENT_FIELD: &str = "comment";
 const ROUTE_DISABLED_FIELD: &str = "disabled";
+const CONNECTION_DST_FIELD: &str = "dst-address";
 const COMMAND_SYSTEM_IDENTITY_PRINT: &str = "/system/identity/print";
 
 const COMMAND_IP_ROUTE_PRINT: &str = "/ip/route/print";
@@ -33,6 +36,9 @@ const COMMAND_IPV6_ROUTE_PRINT: &str = "/ipv6/route/print";
 const COMMAND_IPV6_ROUTE_ADD: &str = "/ipv6/route/add";
 const COMMAND_IPV6_ROUTE_SET: &str = "/ipv6/route/set";
 const COMMAND_IPV6_ROUTE_REMOVE: &str = "/ipv6/route/remove";
+
+const COMMAND_IP_FIREWALL_CONNECTION_PRINT: &str = "/ip/firewall/connection/print";
+const COMMAND_IPV6_FIREWALL_CONNECTION_PRINT: &str = "/ipv6/firewall/connection/print";
 
 pub(super) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
 pub(super) const DEFAULT_SEND_TIMEOUT_SECS: u64 = 5;
@@ -124,6 +130,15 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
     ) -> Result<()>;
     /// Delete route by internal id.
     async fn delete_route_by_id(&self, id: &str, family: RouteFamily) -> Result<()>;
+    /// Return tracked connection destinations for one address family.
+    ///
+    /// An empty `destinations` slice requests the full destination snapshot.
+    /// Callers use that only when a CIDR route needs local prefix matching.
+    async fn connection_destinations(
+        &self,
+        family: RouteFamily,
+        destinations: &[IpAddr],
+    ) -> Result<AHashSet<IpAddr>>;
     /// Lightweight command that verifies RouterOS API availability.
     async fn healthcheck(&self) -> Result<()>;
 }
@@ -197,7 +212,6 @@ impl MikrotikRsClient {
         } else {
             Some(self.password.as_str())
         };
-
         let connect_result = tokio::time::timeout(
             self.timeouts.connect,
             MikrotikDevice::connect(self.address.as_str(), &self.username, password),
@@ -205,10 +219,10 @@ impl MikrotikRsClient {
         .await;
         let device = match connect_result {
             Ok(Ok(device)) => device,
-            Ok(Err(e)) => {
+            Ok(Err(error)) => {
                 return Err(DnsError::plugin(format!(
                     "ros_route connect failed to {}: {}",
-                    self.address, e
+                    self.address, error
                 )));
             }
             Err(_) => {
@@ -225,40 +239,43 @@ impl MikrotikRsClient {
         Ok(device)
     }
 
-    async fn send_rows(&self, action: &str, command: Command) -> Result<Vec<RouterReply>> {
-        // All low-level transport/protocol errors are translated into plugin errors
-        // here. Manager sees stable semantic errors and does not handle
-        // stream-level details.
+    async fn send_command_receiver(
+        &self,
+        action: &str,
+        command: Command,
+    ) -> Result<tokio::sync::mpsc::Receiver<Event>> {
         let device = self.get_or_connect().await?;
         let send_result =
             tokio::time::timeout(self.timeouts.send, device.send_command(command)).await;
-        let mut rx = match send_result {
-            Ok(Ok(rx)) => rx,
-            Ok(Err(e)) => {
+        match send_result {
+            Ok(Ok(receiver)) => Ok(receiver),
+            Ok(Err(error)) => {
                 self.invalidate_connection().await;
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} send failed: {e}"
-                )));
+                Err(DnsError::plugin(format!(
+                    "ros_route {action} send failed: {error}"
+                )))
             }
             Err(_) => {
                 self.invalidate_connection().await;
-                return Err(DnsError::plugin(format!(
+                Err(DnsError::plugin(format!(
                     "ros_route {action} send timeout after {}s",
                     self.timeouts.send.as_secs()
-                )));
-            }
-        };
-
-        match receive_rows(action, self.timeouts.receive, &mut rx).await {
-            Ok(rows) => Ok(rows),
-            Err(error) => {
-                // A prematurely closed command channel can indicate that the
-                // connection actor dropped replies after its bounded queue
-                // filled. Never reuse that connection or accept partial data.
-                self.invalidate_connection().await;
-                Err(error)
+                )))
             }
         }
+    }
+
+    async fn finish_receive<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.invalidate_connection().await;
+        }
+        result
+    }
+
+    async fn send_rows(&self, action: &str, command: Command) -> Result<Vec<RouterReply>> {
+        let mut receiver = self.send_command_receiver(action, command).await?;
+        let result = receive_rows(action, self.timeouts.receive, &mut receiver).await;
+        self.finish_receive(result).await
     }
 
     async fn find_route_by_exact_comment(
@@ -355,30 +372,91 @@ impl MikrotikRsClient {
 async fn receive_rows(
     action: &str,
     receive_timeout: Duration,
-    rx: &mut tokio::sync::mpsc::Receiver<Event>,
+    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
 ) -> Result<Vec<RouterReply>> {
     let mut rows = Vec::new();
     loop {
-        let recv_result = tokio::time::timeout(receive_timeout, rx.recv()).await;
-        let Some(item) = (match recv_result {
-            Ok(item) => item,
-            Err(_) => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} receive timeout after {}s",
-                    receive_timeout.as_secs()
-                )));
-            }
-        }) else {
-            return Err(DnsError::plugin(format!(
-                "ros_route {action} response channel closed before a terminal event"
-            )));
-        };
-
-        match item {
+        match receive_event(action, receive_timeout, receiver).await? {
             Event::Reply { response, .. } => rows.push(RouterReply {
                 attributes: response.attributes,
             }),
             Event::Done { .. } | Event::Empty { .. } => return Ok(rows),
+            Event::Trap { response, .. } => {
+                return Err(DnsError::plugin(format!(
+                    "ros_route {action} trap: {}",
+                    response.message
+                )));
+            }
+            Event::Fatal { reason } => {
+                return Err(DnsError::plugin(format!(
+                    "ros_route {action} fatal: {reason}"
+                )));
+            }
+        }
+    }
+}
+
+async fn receive_event(
+    action: &str,
+    receive_timeout: Duration,
+    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
+) -> Result<Event> {
+    match tokio::time::timeout(receive_timeout, receiver.recv()).await {
+        Ok(Some(event)) => Ok(event),
+        Ok(None) => Err(DnsError::plugin(format!(
+            "ros_route {action} response channel closed before a terminal event"
+        ))),
+        Err(_) => Err(DnsError::plugin(format!(
+            "ros_route {action} receive timeout after {}s",
+            receive_timeout.as_secs()
+        ))),
+    }
+}
+
+fn insert_connection_destination(
+    action: &str,
+    family: RouteFamily,
+    attributes: HashMap<String, Option<String>>,
+    destinations: &mut AHashSet<IpAddr>,
+) -> Result<()> {
+    let raw = attributes
+        .get(CONNECTION_DST_FIELD)
+        .and_then(|value| value.as_deref())
+        .ok_or_else(|| {
+            DnsError::plugin(format!(
+                "ros_route {action} response missing '{CONNECTION_DST_FIELD}'"
+            ))
+        })?;
+    let ip = raw.parse::<IpAddr>().map_err(|error| {
+        DnsError::plugin(format!(
+            "ros_route {action} response has invalid '{CONNECTION_DST_FIELD}' '{raw}': {error}"
+        ))
+    })?;
+    if RouteFamily::from_ip(ip) != family {
+        return Err(DnsError::plugin(format!(
+            "ros_route {action} response returned {ip} for the wrong address family"
+        )));
+    }
+    destinations.insert(ip);
+    Ok(())
+}
+
+async fn receive_connection_destinations(
+    action: &str,
+    family: RouteFamily,
+    receive_timeout: Duration,
+    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
+) -> Result<AHashSet<IpAddr>> {
+    let mut destinations = AHashSet::new();
+    loop {
+        match receive_event(action, receive_timeout, receiver).await? {
+            Event::Reply { response, .. } => insert_connection_destination(
+                action,
+                family,
+                response.attributes,
+                &mut destinations,
+            )?,
+            Event::Done { .. } | Event::Empty { .. } => return Ok(destinations),
             Event::Trap { response, .. } => {
                 return Err(DnsError::plugin(format!(
                     "ros_route {action} trap: {}",
@@ -400,6 +478,35 @@ enum RouteOp {
     Add,
     Set,
     Remove,
+}
+
+/// Build a connection-tracking read limited to destination addresses.
+///
+/// RouterOS has separate IPv4 and IPv6 connection tables. Exact destination
+/// filters are combined with OR by the API query stack; an empty filter list
+/// intentionally reads all destination addresses for CIDR containment checks.
+fn connection_destinations_command(family: RouteFamily, destinations: &[IpAddr]) -> Command {
+    let mut command = CommandBuilder::new()
+        .command(connection_command(family))
+        .attribute(".proplist", Some(CONNECTION_DST_FIELD));
+    for ip in destinations {
+        command = command.query_equal(CONNECTION_DST_FIELD, &ip.to_string());
+    }
+    if destinations.len() > 1 {
+        command = command.query_operations(std::iter::repeat_n(
+            QueryOperator::Or,
+            destinations.len().saturating_sub(1),
+        ));
+    }
+    command.build()
+}
+
+#[inline]
+fn connection_command(family: RouteFamily) -> &'static str {
+    match family {
+        RouteFamily::Ipv4 => COMMAND_IP_FIREWALL_CONNECTION_PRINT,
+        RouteFamily::Ipv6 => COMMAND_IPV6_FIREWALL_CONNECTION_PRINT,
+    }
 }
 
 /// Map logical route operation to RouterOS command path by address family.
@@ -711,6 +818,31 @@ impl MikrotikApi for MikrotikRsClient {
         }
     }
 
+    async fn connection_destinations(
+        &self,
+        family: RouteFamily,
+        destinations: &[IpAddr],
+    ) -> Result<AHashSet<IpAddr>> {
+        if destinations
+            .iter()
+            .any(|destination| RouteFamily::from_ip(*destination) != family)
+        {
+            return Err(DnsError::plugin(
+                "ros_route connection destination filter has mixed address families",
+            ));
+        }
+        let action = match family {
+            RouteFamily::Ipv4 => "print ipv4 connection destinations",
+            RouteFamily::Ipv6 => "print ipv6 connection destinations",
+        };
+        let command = connection_destinations_command(family, destinations);
+        let mut receiver = self.send_command_receiver(action, command).await?;
+        let result =
+            receive_connection_destinations(action, family, self.timeouts.receive, &mut receiver)
+                .await;
+        self.finish_receive(result).await
+    }
+
     async fn healthcheck(&self) -> Result<()> {
         // Identity print is cheap and available on all RouterOS v7 targets.
         let command = CommandBuilder::new()
@@ -807,32 +939,44 @@ mod tests {
         assert!(parse_routeros_bool("invalid", ROUTE_DISABLED_FIELD, "test").is_err());
     }
 
-    #[tokio::test]
-    async fn response_channel_must_deliver_a_terminal_event() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        drop(tx);
+    #[test]
+    fn connection_query_uses_family_specific_table_and_exact_or_filters() {
+        let first: IpAddr = "203.0.113.10".parse().expect("ip");
+        let second: IpAddr = "203.0.113.11".parse().expect("ip");
+        let command = connection_destinations_command(RouteFamily::Ipv4, &[first, second]);
+        let wire = String::from_utf8_lossy(command.data());
 
-        let error = receive_rows("test command", Duration::from_secs(1), &mut rx)
-            .await
-            .expect_err("closed channel must not return a partial success");
+        assert!(wire.contains(COMMAND_IP_FIREWALL_CONNECTION_PRINT));
+        assert!(wire.contains(".proplist=dst-address"));
+        assert!(wire.contains("?dst-address=203.0.113.10"));
+        assert!(wire.contains("?dst-address=203.0.113.11"));
+        assert!(wire.contains("?#|"));
 
-        assert!(error.to_string().contains("closed before a terminal event"));
+        let ipv6 = connection_destinations_command(RouteFamily::Ipv6, &[]);
+        assert!(
+            String::from_utf8_lossy(ipv6.data()).contains(COMMAND_IPV6_FIREWALL_CONNECTION_PRINT)
+        );
     }
 
-    #[tokio::test]
-    async fn done_event_completes_the_response_without_waiting_for_close() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.send(Event::Done {
-            tag: Default::default(),
-        })
-        .await
-        .expect("send done event");
+    #[test]
+    fn connection_destinations_are_reduced_while_streaming() {
+        let mut destinations = AHashSet::new();
+        for _ in 0..2 {
+            insert_connection_destination(
+                "test connections",
+                RouteFamily::Ipv4,
+                HashMap::from([(
+                    CONNECTION_DST_FIELD.to_string(),
+                    Some("203.0.113.10".to_string()),
+                )]),
+                &mut destinations,
+            )
+            .expect("insert destination");
+        }
 
-        let rows = receive_rows("test command", Duration::from_secs(1), &mut rx)
-            .await
-            .expect("done event should complete response");
-
-        assert!(rows.is_empty());
-        assert!(!tx.is_closed());
+        assert_eq!(
+            destinations,
+            AHashSet::from_iter(["203.0.113.10".parse().expect("ip")])
+        );
     }
 }

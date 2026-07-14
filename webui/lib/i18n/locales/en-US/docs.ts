@@ -390,6 +390,8 @@ export const enUSDocs = {
     min_ttl: "- Type: `u32`; Default: `60`\n- Minimum clamp for dynamic DNS-route TTLs.",
     max_ttl: "- Type: `u32`; Default: `3600`\n- Maximum clamp for dynamic DNS-route TTLs.",
     fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry.",
+    conntrack_guard:
+      "- Type: `bool`; Default: `false`\n- Checks RouterOS conntrack before normal route deletion; any tracked connection to the destination defers deletion and retries after 30 seconds. Shutdown and internal maintenance cleanup are unchanged.",
     cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin on shutdown.",
   },
   ros_address_list: {

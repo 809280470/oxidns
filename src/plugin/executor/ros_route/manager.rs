@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use super::RosRouteMetrics;
 use super::api::{MikrotikApi, RouterRoute};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -31,6 +32,8 @@ const MAX_PENDING_OBSERVATIONS: usize = MANAGER_QUEUE_SIZE;
 const SWEEP_INTERVAL_SECS: u64 = 30;
 const RECONCILE_INTERVAL_SECS: u64 = 180;
 const PERSISTENT_RELOAD_INTERVAL_SECS: u64 = 60;
+const CONNECTION_GUARD_RETRY_INTERVAL_SECS: u64 = SWEEP_INTERVAL_SECS;
+const CONNECTION_QUERY_BATCH_SIZE: usize = 128;
 
 const COMMENT_FIELD_PLUGIN: &str = "pg";
 const COMMENT_FIELD_DOMAIN: &str = "dm";
@@ -65,6 +68,8 @@ pub(super) struct RouteManagerConfig {
     pub(super) max_ttl: u32,
     /// Optional fixed TTL override in seconds.
     pub(super) fixed_ttl: Option<u32>,
+    /// Whether normal desired-state deletion waits for RouterOS conntrack.
+    pub(super) conntrack_guard: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -745,10 +750,14 @@ impl RouteManagerRuntime {
 pub(super) struct RouteManager {
     api: Arc<dyn MikrotikApi>,
     cfg: RouteManagerConfig,
+    metrics: Option<Arc<RosRouteMetrics>>,
     persistent_ips: AHashSet<String>,
     pub(super) domain_bindings: AHashMap<String, DomainBinding>,
     pub(super) routes: AHashMap<RouteKey, RouteEntry>,
     pending_observations: AHashMap<(String, ObservationScope), PendingObservation>,
+    /// Earliest next conntrack check for a deferred route deletion. This keeps
+    /// repeated DNS withdrawals from turning into repeated RouterOS reads.
+    connection_retry_after: AHashMap<RouteKey, u64>,
     initialized: bool,
 }
 
@@ -758,11 +767,23 @@ impl RouteManager {
             api,
             persistent_ips: cfg.persistent_ips.clone(),
             cfg,
+            metrics: None,
             domain_bindings: AHashMap::new(),
             routes: AHashMap::new(),
             pending_observations: AHashMap::new(),
+            connection_retry_after: AHashMap::new(),
             initialized: false,
         }
+    }
+
+    pub(super) fn with_metrics(
+        api: Arc<dyn MikrotikApi>,
+        cfg: RouteManagerConfig,
+        metrics: Arc<RosRouteMetrics>,
+    ) -> Self {
+        let mut manager = Self::new(api, cfg);
+        manager.metrics = Some(metrics);
+        manager
     }
 
     async fn ensure_initialized(&mut self) -> Result<()> {
@@ -970,6 +991,7 @@ impl RouteManager {
             desired_keys.insert(key.clone());
 
             if let Some(entry) = self.routes.get_mut(&key) {
+                let was_pending_delete = matches!(entry.sync_state, SyncState::PendingDelete);
                 let mut changed = false;
 
                 if !entry.persistent {
@@ -1007,6 +1029,9 @@ impl RouteManager {
 
                 if changed {
                     entry.last_refresh_unix = now;
+                }
+                if was_pending_delete {
+                    self.connection_retry_after.remove(&key);
                 }
                 continue;
             }
@@ -1245,6 +1270,7 @@ impl RouteManager {
     ) -> Option<RouteKey> {
         let key = RouteKey::new(ip, self.cfg.routing_table.clone());
         if let Some(entry) = self.routes.get_mut(&key) {
+            let was_pending_delete = matches!(entry.sync_state, SyncState::PendingDelete);
             let inserted = entry.domains.insert(domain.to_string());
             let comment_domain_changed = inserted
                 && (entry.ref_count == 0
@@ -1279,6 +1305,9 @@ impl RouteManager {
                     && Self::comment_refresh_due(entry, now))
             {
                 entry.sync_state = SyncState::Dirty;
+            }
+            if was_pending_delete {
+                self.connection_retry_after.remove(&key);
             }
             return Some(key);
         }
@@ -1479,6 +1508,7 @@ impl RouteManager {
         // atomic. Isolate failures per key so one permanent conflict cannot
         // starve unrelated pending routes.
         let mut first_error = None;
+        let mut pending_deletes = Vec::new();
         for key in keys {
             let Some(entry_snapshot) = self.routes.get(&key).cloned() else {
                 first_error.get_or_insert_with(|| {
@@ -1524,39 +1554,186 @@ impl RouteManager {
                     }
                 }
                 SyncState::PendingDelete => {
-                    // Always re-read current ownership. The cached RouterOS id
-                    // may now belong to a route whose comment was changed by an
-                    // operator and must not be deleted.
-                    let delete_result = match self
-                        .api
-                        .find_route(
-                            &entry_snapshot.key,
-                            &self.cfg.comment_prefix,
-                            &self.cfg.plugin_tag,
-                        )
-                        .await
-                    {
-                        Ok(Some(found)) => {
-                            self.api.delete_route_by_id(&found.id, found.family).await
-                        }
-                        Ok(None) => Ok(()),
-                        Err(error) => Err(error),
-                    };
-                    match delete_result {
-                        Ok(()) => {
-                            self.routes.remove(&key);
-                        }
-                        Err(error) => {
-                            first_error.get_or_insert(error);
-                        }
-                    }
+                    pending_deletes.push(entry_snapshot.key);
                 }
                 _ => {}
             }
         }
+        self.sync_pending_deletes(pending_deletes, now, &mut first_error)
+            .await;
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    async fn sync_pending_deletes(
+        &mut self,
+        keys: Vec<RouteKey>,
+        now: u64,
+        first_error: &mut Option<DnsError>,
+    ) {
+        let mut ipv4_candidates = Vec::<(RouteKey, RouterRoute)>::new();
+        let mut ipv6_candidates = Vec::<(RouteKey, RouterRoute)>::new();
+        for key in keys {
+            if self.cfg.conntrack_guard && !self.conntrack_check_due(&key, now) {
+                continue;
+            }
+
+            // Always re-read current ownership. The cached RouterOS id may now
+            // belong to a route whose comment was changed by an operator and
+            // must not be deleted. A remotely missing row is an operator
+            // deletion, so no conntrack check is needed in that case.
+            match self
+                .api
+                .find_route(&key, &self.cfg.comment_prefix, &self.cfg.plugin_tag)
+                .await
+            {
+                Ok(Some(found)) => match found.family {
+                    RouteFamily::Ipv4 => ipv4_candidates.push((key, found)),
+                    RouteFamily::Ipv6 => ipv6_candidates.push((key, found)),
+                },
+                Ok(None) => {
+                    self.routes.remove(&key);
+                    self.connection_retry_after.remove(&key);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+
+        for (family, family_candidates) in [
+            (RouteFamily::Ipv4, ipv4_candidates),
+            (RouteFamily::Ipv6, ipv6_candidates),
+        ] {
+            if family_candidates.is_empty() {
+                continue;
+            }
+
+            let active_mask = if self.cfg.conntrack_guard {
+                match self
+                    .active_connection_mask(family, &family_candidates)
+                    .await
+                {
+                    Ok(active) => active,
+                    Err(error) => {
+                        for (key, _) in &family_candidates {
+                            self.defer_connection_check(key, now);
+                        }
+                        self.record_connection_check_error();
+                        warn!(
+                            plugin = %self.cfg.plugin_tag,
+                            ?family,
+                            routes = family_candidates.len(),
+                            retry_secs = CONNECTION_GUARD_RETRY_INTERVAL_SECS,
+                            err = %error,
+                            "ros_route connection-tracking check failed; keeping pending route deletions"
+                        );
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                }
+            } else {
+                vec![false; family_candidates.len()]
+            };
+
+            for ((key, route), has_active_connection) in
+                family_candidates.into_iter().zip(active_mask)
+            {
+                if has_active_connection {
+                    self.defer_connection_check(&key, now);
+                    self.record_delete_deferred();
+                    debug!(
+                        plugin = %self.cfg.plugin_tag,
+                        dst = %key.dst_address(),
+                        retry_secs = CONNECTION_GUARD_RETRY_INTERVAL_SECS,
+                        "ros_route deferred route deletion because a matching connection exists"
+                    );
+                    continue;
+                }
+
+                match self.api.delete_route_by_id(&route.id, route.family).await {
+                    Ok(()) => {
+                        self.routes.remove(&key);
+                        self.connection_retry_after.remove(&key);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn conntrack_check_due(&self, key: &RouteKey, now: u64) -> bool {
+        self.connection_retry_after
+            .get(key)
+            .is_none_or(|retry_at| *retry_at <= now)
+    }
+
+    #[inline]
+    fn defer_connection_check(&mut self, key: &RouteKey, now: u64) {
+        self.connection_retry_after.insert(
+            key.clone(),
+            now.saturating_add(CONNECTION_GUARD_RETRY_INTERVAL_SECS),
+        );
+    }
+
+    async fn active_connection_mask(
+        &self,
+        family: RouteFamily,
+        candidates: &[(RouteKey, RouterRoute)],
+    ) -> Result<Vec<bool>> {
+        let has_cidr = candidates
+            .iter()
+            .any(|(key, _)| key.prefix != family.prefix());
+        if has_cidr {
+            // RouterOS API query words only support exact property matching.
+            // A CIDR therefore needs one destination-only snapshot and local
+            // containment checks. Sort destinations once so every route uses
+            // a logarithmic range lookup rather than scanning the whole table.
+            let mut active_values = self
+                .api
+                .connection_destinations(family, &[])
+                .await?
+                .into_iter()
+                .map(ip_numeric_value)
+                .collect::<Vec<_>>();
+            active_values.sort_unstable();
+            return Ok(candidates
+                .iter()
+                .map(|(key, _)| sorted_destinations_cover_route(&active_values, key))
+                .collect());
+        }
+
+        let destinations = candidates.iter().map(|(key, _)| key.ip).collect::<Vec<_>>();
+        let mut active = AHashSet::new();
+        for chunk in destinations.chunks(CONNECTION_QUERY_BATCH_SIZE) {
+            active.extend(self.api.connection_destinations(family, chunk).await?);
+        }
+        Ok(candidates
+            .iter()
+            .map(|(key, _)| active.contains(&key.ip))
+            .collect())
+    }
+
+    #[inline]
+    fn record_delete_deferred(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .delete_deferred_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn record_connection_check_error(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .connection_check_error_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1669,6 +1846,7 @@ impl RouteManager {
                     first_error.get_or_insert(error);
                 }
                 self.routes.remove(&key);
+                self.connection_retry_after.remove(&key);
                 continue;
             }
 
@@ -1867,6 +2045,7 @@ impl RouteManager {
         for key in keys {
             if self.gateway_for(key.family()).is_none() {
                 self.routes.remove(&key);
+                self.connection_retry_after.remove(&key);
                 continue;
             }
             if seen_keys.contains(&key) {
@@ -1880,6 +2059,7 @@ impl RouteManager {
                 // The remote side already matches the local withdrawal. Drop
                 // the local route without issuing a redundant delete request.
                 self.routes.remove(&key);
+                self.connection_retry_after.remove(&key);
             } else if route.router_id.is_some()
                 && matches!(route.sync_state, SyncState::Synced)
                 && !route.persistent
@@ -1890,6 +2070,7 @@ impl RouteManager {
                 // remain: the next matching DNS observation will attach the IP
                 // again and create a fresh route.
                 self.routes.remove(&key);
+                self.connection_retry_after.remove(&key);
             } else {
                 // Pending local writes and explicitly configured persistent
                 // routes remain desired state even when no remote row exists.
@@ -2028,6 +2209,7 @@ impl RouteManager {
         }
         self.routes.clear();
         self.domain_bindings.clear();
+        self.connection_retry_after.clear();
         Ok(())
     }
 }
@@ -2180,6 +2362,52 @@ fn parse_dst_address(dst: &str) -> Option<(IpAddr, u8)> {
     Some((ip, prefix))
 }
 
+/// Return whether an address is covered by a managed route key.
+///
+/// Dynamic routes are always host prefixes, while `persistent_route` may use
+/// CIDRs. Keep the comparison local so conntrack queries can request only
+/// `dst-address` and never need RouterOS-side prefix expressions.
+#[cfg(test)]
+fn route_key_contains_ip(key: &RouteKey, candidate: IpAddr) -> bool {
+    if RouteFamily::from_ip(key.ip) != RouteFamily::from_ip(candidate) {
+        return false;
+    }
+    let (start, end) = route_key_numeric_bounds(key);
+    let candidate = ip_numeric_value(candidate);
+    (start..=end).contains(&candidate)
+}
+
+#[inline]
+fn ip_numeric_value(ip: IpAddr) -> u128 {
+    match ip {
+        IpAddr::V4(ip) => u128::from(u32::from(ip)),
+        IpAddr::V6(ip) => u128::from(ip),
+    }
+}
+
+fn route_key_numeric_bounds(key: &RouteKey) -> (u128, u128) {
+    let (raw, width, max) = match key.ip {
+        IpAddr::V4(ip) => (u128::from(u32::from(ip)), 32u8, u128::from(u32::MAX)),
+        IpAddr::V6(ip) => (u128::from(ip), 128u8, u128::MAX),
+    };
+    let host_bits = width.saturating_sub(key.prefix);
+    let mask = if key.prefix == 0 {
+        0
+    } else {
+        (max >> host_bits) << host_bits
+    };
+    let start = raw & mask;
+    (start, start | (max ^ mask))
+}
+
+fn sorted_destinations_cover_route(destinations: &[u128], key: &RouteKey) -> bool {
+    let (start, end) = route_key_numeric_bounds(key);
+    let first_candidate = destinations.partition_point(|destination| *destination < start);
+    destinations
+        .get(first_candidate)
+        .is_some_and(|destination| *destination <= end)
+}
+
 pub(super) fn is_default_route_dst(dst: &str) -> bool {
     dst == ROUTE_DEFAULT_V4 || dst == ROUTE_DEFAULT_V6
 }
@@ -2245,6 +2473,14 @@ mod tests {
             unreachable!("this test only mutates local route state")
         }
 
+        async fn connection_destinations(
+            &self,
+            _family: RouteFamily,
+            _destinations: &[IpAddr],
+        ) -> Result<AHashSet<IpAddr>> {
+            unreachable!("this test only mutates local route state")
+        }
+
         async fn healthcheck(&self) -> Result<()> {
             unreachable!("this test only mutates local route state")
         }
@@ -2257,6 +2493,9 @@ mod tests {
         fail_upserts: AHashSet<IpAddr>,
         upsert_attempts: Vec<IpAddr>,
         deleted_ids: Vec<String>,
+        active_connection_destinations: AHashSet<IpAddr>,
+        connection_queries: Vec<(RouteFamily, Vec<IpAddr>)>,
+        fail_connection_check: bool,
         fail_healthcheck: bool,
     }
 
@@ -2361,6 +2600,30 @@ mod tests {
             Ok(())
         }
 
+        async fn connection_destinations(
+            &self,
+            family: RouteFamily,
+            destinations: &[IpAddr],
+        ) -> Result<AHashSet<IpAddr>> {
+            let mut state = self.state.lock().expect("mock lock");
+            state
+                .connection_queries
+                .push((family, destinations.to_vec()));
+            if state.fail_connection_check {
+                return Err(DnsError::plugin("mock connection tracking failure"));
+            }
+            let active = state
+                .active_connection_destinations
+                .iter()
+                .copied()
+                .filter(|ip| {
+                    RouteFamily::from_ip(*ip) == family
+                        && (destinations.is_empty() || destinations.contains(ip))
+                })
+                .collect();
+            Ok(active)
+        }
+
         async fn healthcheck(&self) -> Result<()> {
             if self.state.lock().expect("mock lock").fail_healthcheck {
                 return Err(DnsError::plugin("mock healthcheck failure"));
@@ -2382,6 +2645,7 @@ mod tests {
             min_ttl: 60,
             max_ttl: 3600,
             fixed_ttl,
+            conntrack_guard: false,
         }
     }
 
@@ -2389,11 +2653,78 @@ mod tests {
         RouteManager::new(Arc::new(NoopApi), manager_config(Some(0)))
     }
 
+    fn owned_router_route(id: &str, key: &RouteKey) -> RouterRoute {
+        RouterRoute {
+            id: id.to_string(),
+            family: key.family(),
+            dst_address: key.dst_address(),
+            routing_table: key.table.clone(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(
+                "fdns;pg=route-test;kind=dynamic;dm=example.com.;exp=100;seen=100".to_string(),
+            ),
+            disabled: false,
+        }
+    }
+
+    fn pending_delete_entry(key: RouteKey, route_id: &str) -> RouteEntry {
+        RouteEntry {
+            key,
+            gateway: "192.0.2.1".to_string(),
+            distance: 100,
+            domains: AHashSet::new(),
+            comment_domain: String::new(),
+            domain_expiries: AHashMap::new(),
+            ref_count: 0,
+            persistent: false,
+            expires_at_unix: 100,
+            last_refresh_unix: 100,
+            synced_expires_at_unix: Some(100),
+            router_id: Some(route_id.to_string()),
+            recovered_ownership_incomplete: false,
+            sync_state: SyncState::PendingDelete,
+        }
+    }
+
     #[test]
     fn unix_now_matches_the_application_timestamp() {
         AppClock::start();
         let app_now = AppClock::now_timestamp() / 1000;
         assert!(unix_now().abs_diff(app_now) <= 1);
+    }
+
+    #[test]
+    fn route_key_contains_ip_handles_ipv4_and_ipv6_prefixes() {
+        let ipv4 = RouteKey::new_with_prefix(
+            "198.51.100.0".parse().expect("ipv4 network"),
+            24,
+            "via_proxy".to_string(),
+        )
+        .expect("ipv4 route");
+        assert!(route_key_contains_ip(
+            &ipv4,
+            "198.51.100.42".parse().expect("ipv4 member")
+        ));
+        assert!(!route_key_contains_ip(
+            &ipv4,
+            "198.51.101.1".parse().expect("ipv4 non-member")
+        ));
+
+        let ipv6 = RouteKey::new_with_prefix(
+            "2001:db8:42::".parse().expect("ipv6 network"),
+            64,
+            "via_proxy".to_string(),
+        )
+        .expect("ipv6 route");
+        assert!(route_key_contains_ip(
+            &ipv6,
+            "2001:db8:42::99".parse().expect("ipv6 member")
+        ));
+        assert!(!route_key_contains_ip(
+            &ipv6,
+            "2001:db8:43::1".parse().expect("ipv6 non-member")
+        ));
     }
 
     #[test]
@@ -2621,6 +2952,183 @@ mod tests {
         manager.sync_routes(101).await.expect("safe deletion");
         assert!(!manager.routes.contains_key(&key));
         assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conntrack_guard_defers_then_retries_route_deletion() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![owned_router_route("*guarded", &key)],
+            active_connection_destinations: AHashSet::from_iter([ip]),
+            ..MockApiState::default()
+        }));
+        let mut config = manager_config(Some(300));
+        config.conntrack_guard = true;
+        let mut manager = RouteManager::new(api.clone(), config);
+        manager
+            .routes
+            .insert(key.clone(), pending_delete_entry(key.clone(), "*guarded"));
+
+        manager.sync_routes(100).await.expect("guarded sync");
+        assert!(manager.routes.contains_key(&key));
+        assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
+        assert_eq!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .connection_queries
+                .len(),
+            1
+        );
+
+        manager.sync_routes(101).await.expect("cooldown sync");
+        assert_eq!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .connection_queries
+                .len(),
+            1,
+            "a repeated withdrawal must not re-query conntrack during cooldown"
+        );
+
+        api.state
+            .lock()
+            .expect("mock lock")
+            .active_connection_destinations
+            .clear();
+        manager.sync_routes(130).await.expect("retry deletion");
+        assert!(!manager.routes.contains_key(&key));
+        assert_eq!(
+            api.state.lock().expect("mock lock").deleted_ids,
+            vec!["*guarded".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn conntrack_guard_fails_closed_and_retries_later() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 43));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![owned_router_route("*check-error", &key)],
+            fail_connection_check: true,
+            ..MockApiState::default()
+        }));
+        let mut config = manager_config(Some(300));
+        config.conntrack_guard = true;
+        let mut manager = RouteManager::new(api.clone(), config);
+        manager.routes.insert(
+            key.clone(),
+            pending_delete_entry(key.clone(), "*check-error"),
+        );
+
+        assert!(manager.sync_routes(100).await.is_err());
+        assert!(manager.routes.contains_key(&key));
+        assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
+        assert_eq!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .connection_queries
+                .len(),
+            1
+        );
+
+        manager
+            .sync_routes(101)
+            .await
+            .expect("cooldown keeps route");
+        assert_eq!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .connection_queries
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn conntrack_guard_uses_snapshot_for_cidr_routes() {
+        let key = RouteKey::new_with_prefix(
+            "198.51.100.0".parse().expect("ip"),
+            24,
+            "via_proxy".to_string(),
+        )
+        .expect("route key");
+        let active_ip = "198.51.100.42".parse().expect("ip");
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![owned_router_route("*cidr", &key)],
+            active_connection_destinations: AHashSet::from_iter([active_ip]),
+            ..MockApiState::default()
+        }));
+        let mut config = manager_config(Some(300));
+        config.conntrack_guard = true;
+        let mut manager = RouteManager::new(api.clone(), config);
+        manager
+            .routes
+            .insert(key.clone(), pending_delete_entry(key.clone(), "*cidr"));
+
+        manager.sync_routes(100).await.expect("guarded cidr sync");
+        assert!(manager.routes.contains_key(&key));
+        assert_eq!(
+            api.state.lock().expect("mock lock").connection_queries,
+            vec![(RouteFamily::Ipv4, Vec::new())]
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_bypasses_conntrack_guard() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![owned_router_route("*shutdown", &key)],
+            active_connection_destinations: AHashSet::from_iter([ip]),
+            ..MockApiState::default()
+        }));
+        let mut config = manager_config(Some(300));
+        config.conntrack_guard = true;
+        let mut manager = RouteManager::new(api.clone(), config);
+
+        manager.shutdown(true).await.expect("shutdown cleanup");
+        let state = api.state.lock().expect("mock lock");
+        assert_eq!(state.deleted_ids, vec!["*shutdown".to_string()]);
+        assert!(state.connection_queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conntrack_guard_batches_host_route_queries() {
+        let mut routes = Vec::new();
+        let mut entries = Vec::new();
+        for offset in 1..=129u8 {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 18, 0, offset));
+            let key = RouteKey::new(ip, "via_proxy".to_string());
+            routes.push(owned_router_route(format!("*{offset}").as_str(), &key));
+            entries.push((
+                key.clone(),
+                pending_delete_entry(key, format!("*{offset}").as_str()),
+            ));
+        }
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes,
+            ..MockApiState::default()
+        }));
+        let mut config = manager_config(Some(300));
+        config.conntrack_guard = true;
+        let mut manager = RouteManager::new(api.clone(), config);
+        manager.routes.extend(entries);
+
+        manager.sync_routes(100).await.expect("batched deletion");
+        let query_sizes = api
+            .state
+            .lock()
+            .expect("mock lock")
+            .connection_queries
+            .iter()
+            .map(|(_, destinations)| destinations.len())
+            .collect::<Vec<_>>();
+        assert_eq!(query_sizes, vec![128, 1]);
     }
 
     #[tokio::test]

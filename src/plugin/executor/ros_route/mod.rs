@@ -60,6 +60,7 @@ const DEFAULT_MIN_TTL: u32 = 60;
 const DEFAULT_MAX_TTL: u32 = 3600;
 const DEFAULT_ASYNC_MODE: bool = true;
 const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
+const DEFAULT_CONNTRACK_GUARD: bool = false;
 const DEFAULT_ROUTE_DISTANCE: u8 = 100;
 const DEFAULT_COMMENT_PREFIX: &str = "fdns";
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
@@ -106,6 +107,9 @@ struct MikrotikConfigArgs {
     fixed_ttl: Option<u32>,
     /// Whether to clean managed dynamic routes on shutdown.
     cleanup_on_shutdown: Option<bool>,
+    /// Delay normal route removal while RouterOS connection tracking has a
+    /// connection for the route destination.
+    conntrack_guard: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -153,6 +157,8 @@ struct MikrotikConfig {
     fixed_ttl: Option<u32>,
     /// Shutdown cleanup behavior for dynamic routes.
     cleanup_on_shutdown: bool,
+    /// Delay normal route removal while a matching RouterOS connection exists.
+    conntrack_guard: bool,
 }
 
 #[derive(Debug)]
@@ -246,6 +252,7 @@ impl MikrotikConfigArgs {
             cleanup_on_shutdown: self
                 .cleanup_on_shutdown
                 .unwrap_or(DEFAULT_CLEANUP_ON_SHUTDOWN),
+            conntrack_guard: self.conntrack_guard.unwrap_or(DEFAULT_CONNTRACK_GUARD),
         })
     }
 }
@@ -281,6 +288,8 @@ struct RosRouteMetrics {
     dropped_total: AtomicU64,
     sync_error_total: AtomicU64,
     sync_timeout_total: AtomicU64,
+    delete_deferred_total: AtomicU64,
+    connection_check_error_total: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -422,6 +431,8 @@ impl RosRouteMetrics {
             dropped_total: AtomicU64::new(0),
             sync_error_total: AtomicU64::new(0),
             sync_timeout_total: AtomicU64::new(0),
+            delete_deferred_total: AtomicU64::new(0),
+            connection_check_error_total: AtomicU64::new(0),
         }
     }
 }
@@ -460,6 +471,18 @@ impl MetricSource for RosRouteMetrics {
             "Total synchronous route observations that timed out without changing DNS output.",
             &labels,
             self.sync_timeout_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "ros_route_delete_deferred_total",
+            "Total route deletions deferred because a matching RouterOS connection exists.",
+            &labels,
+            self.delete_deferred_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "ros_route_connection_check_error_total",
+            "Total RouterOS connection-tracking queries that failed during route deletion.",
+            &labels,
+            self.connection_check_error_total.load(Ordering::Relaxed),
         ));
     }
 }
@@ -684,14 +707,16 @@ impl PluginFactory for MikrotikFactory {
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
             fixed_ttl: config.fixed_ttl,
+            conntrack_guard: config.conntrack_guard,
         };
-        let manager = RouteManager::new(api, manager_cfg);
+        let metrics = Arc::new(RosRouteMetrics::new(plugin_config.tag.clone()));
+        let manager = RouteManager::with_metrics(api, manager_cfg, metrics.clone());
 
         Ok(UninitializedPlugin::Executor(Box::new(MikrotikExecutor {
             tag: plugin_config.tag.clone(),
             instance_id: NEXT_ROUTE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             active_registered: AtomicBool::new(false),
-            metrics: Arc::new(RosRouteMetrics::new(plugin_config.tag.clone())),
+            metrics,
             config,
             manager: Some(manager),
             command_tx: None,
@@ -1213,6 +1238,32 @@ fixed_ttl: 0
         .expect("yaml");
         let parsed = parse_plugin_config(Some(args), false).expect("config");
         assert_eq!(parsed.fixed_ttl, Some(0));
+    }
+
+    #[test]
+    fn conntrack_guard_defaults_to_disabled_and_can_be_enabled() {
+        let base = r#"
+address: "127.0.0.1:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+"#;
+        let default_args = serde_yaml_ng::from_str::<Value>(base).expect("yaml");
+        assert!(
+            !parse_plugin_config(Some(default_args), false)
+                .expect("default config")
+                .conntrack_guard
+        );
+
+        let enabled_args =
+            serde_yaml_ng::from_str::<Value>(&format!("{base}conntrack_guard: true\n"))
+                .expect("yaml");
+        assert!(
+            parse_plugin_config(Some(enabled_args), false)
+                .expect("enabled config")
+                .conntrack_guard
+        );
     }
 
     #[test]
