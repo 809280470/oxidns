@@ -160,6 +160,8 @@ export const enUSWebui = {
     specifiedDates: "Specific dates",
     nextDay: "next day",
     timeRange: "Time range",
+    unrestrictedTime: "Any time",
+    setTimeRange: "Set time range",
     selectedWeekdays: "{count} days selected",
     selectedMonthdays: "{count} dates selected",
     selectAll: "Select all",

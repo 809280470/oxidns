@@ -163,7 +163,12 @@ export function createPluginConfigFormValues(
 
   fields.forEach((field) => {
     const value = config[field.key];
-    if (value === undefined) return;
+    if (value === undefined) {
+      if (field.type === "time" && field.timeRange) {
+        delete values[field.key];
+      }
+      return;
+    }
 
     if (field.type === "array") {
       values[field.key] = normalizeArrayFieldValue(value, field);
@@ -1001,14 +1006,18 @@ function TimeRangeFieldEditor({
   const rawEnd = value[endField.key];
   const defaultStart = startField.timeRange?.defaultValue ?? "09:00";
   const defaultEnd = endField.timeRange?.defaultValue ?? "18:00";
-  const start =
-    typeof rawStart === "string" && rawStart ? rawStart : defaultStart;
-  const end = typeof rawEnd === "string" && rawEnd ? rawEnd : defaultEnd;
-  const incomplete = Boolean(start) !== Boolean(end);
-  const equal = Boolean(start) && start === end;
+  const rawStartValue = typeof rawStart === "string" ? rawStart : "";
+  const rawEndValue = typeof rawEnd === "string" ? rawEnd : "";
+  const hasStart = Boolean(rawStartValue);
+  const hasEnd = Boolean(rawEndValue);
+  const isUnrestricted = !hasStart && !hasEnd;
+  const start = rawStartValue || defaultStart;
+  const end = rawEndValue || defaultEnd;
+  const incomplete = hasStart !== hasEnd;
+  const equal = hasStart && hasEnd && start === end;
   const invalid =
-    (Boolean(start) && !isValidTimeValue(start)) ||
-    (Boolean(end) && !isValidTimeValue(end));
+    (hasStart && !isValidTimeValue(start)) ||
+    (hasEnd && !isValidTimeValue(end));
   const error = incomplete
     ? t(WEBUI.plugins.timeRangeIncomplete)
     : equal
@@ -1036,42 +1045,60 @@ function TimeRangeFieldEditor({
         <span className="text-sm font-medium">
           {t(WEBUI.plugins.timeRange)}
         </span>
-        {start > end && (
+        {hasStart && hasEnd && start > end && (
           <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
             {t(WEBUI.plugins.nextDay)}
           </span>
         )}
       </div>
-      <ConfigProvider
-        locale={locale === "zh-CN" ? zhCN : enUS}
-        theme={{
-          token: {
-            borderRadius: 8,
-            controlHeight: 32,
-            fontFamily: "var(--font-mono)",
-            fontSize: 14,
-          },
-        }}
-      >
-        <TimePicker.RangePicker
-          value={[toPickerValue(start), toPickerValue(end)]}
-          onChange={(_, timeStrings) => {
-            const [nextStart, nextEnd] = timeStrings;
-            if (!nextStart || !nextEnd) return;
-            updateRange(nextStart.slice(0, 5), nextEnd.slice(0, 5));
+      {isUnrestricted ? (
+        <div className="flex items-center gap-2">
+          <span className="rounded-md border border-dashed px-2.5 py-1.5 text-sm text-muted-foreground">
+            {t(WEBUI.plugins.unrestrictedTime)}
+          </span>
+          {!readOnly && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => updateRange(defaultStart, defaultEnd)}
+            >
+              {t(WEBUI.plugins.setTimeRange)}
+            </Button>
+          )}
+        </div>
+      ) : (
+        <ConfigProvider
+          locale={locale === "zh-CN" ? zhCN : enUS}
+          theme={{
+            token: {
+              borderRadius: 8,
+              controlHeight: 32,
+              fontFamily: "var(--font-mono)",
+              fontSize: 14,
+            },
           }}
-          className="oxidns-time-range-picker"
-          popupClassName="oxidns-time-range-picker-popup"
-          allowClear={false}
-          disabled={readOnly}
-          format="HH:mm"
-          inputReadOnly
-          minuteStep={1}
-          needConfirm={false}
-          order={false}
-          placeholder={[startField.label, endField.label]}
-        />
-      </ConfigProvider>
+        >
+          <TimePicker.RangePicker
+            value={[toPickerValue(start), toPickerValue(end)]}
+            onChange={(_, timeStrings) => {
+              const [nextStart, nextEnd] = timeStrings;
+              if (!nextStart || !nextEnd) return;
+              updateRange(nextStart.slice(0, 5), nextEnd.slice(0, 5));
+            }}
+            className="oxidns-time-range-picker"
+            popupClassName="oxidns-time-range-picker-popup"
+            allowClear={false}
+            disabled={readOnly}
+            format="HH:mm"
+            inputReadOnly
+            minuteStep={1}
+            needConfirm={false}
+            order={false}
+            placeholder={[startField.label, endField.label]}
+          />
+        </ConfigProvider>
+      )}
       {error && <p className="text-xs text-destructive">{error}</p>}
     </div>
   );
@@ -2144,7 +2171,7 @@ function getObjectSummaryFromFields(
         const endField = findTimeRangePair(fields, field);
         const endValue = endField ? objectValue[endField.key] : undefined;
         if (isEmptyConfigValue(fieldValue) && isEmptyConfigValue(endValue)) {
-          return `${field.timeRange.defaultValue}–${endField?.timeRange?.defaultValue ?? "18:00"}`;
+          return t(WEBUI.plugins.unrestrictedTime);
         }
         if (
           typeof fieldValue === "string" &&

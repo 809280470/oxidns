@@ -153,6 +153,8 @@ export const zhCNWebui = {
     specifiedDates: "指定日期",
     nextDay: "次日",
     timeRange: "时间范围",
+    unrestrictedTime: "不限时间",
+    setTimeRange: "设置时间范围",
     selectedWeekdays: "已选 {count} 天",
     selectedMonthdays: "已选 {count} 日",
     selectAll: "全选",

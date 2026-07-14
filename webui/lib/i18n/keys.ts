@@ -151,6 +151,8 @@ export const WEBUI = {
     specifiedDates: "webui.plugins.specifiedDates",
     nextDay: "webui.plugins.nextDay",
     timeRange: "webui.plugins.timeRange",
+    unrestrictedTime: "webui.plugins.unrestrictedTime",
+    setTimeRange: "webui.plugins.setTimeRange",
     selectedWeekdays: "webui.plugins.selectedWeekdays",
     selectedMonthdays: "webui.plugins.selectedMonthdays",
     selectAll: "webui.plugins.selectAll",

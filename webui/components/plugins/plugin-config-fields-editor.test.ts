@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { matcherPluginDefinitions } from "@/lib/plugin-definitions/matcher";
 
 import {
+  createDefaultPluginConfigValues,
   createPluginConfigFormValues,
   isPluginConfigFormValid,
   serializePluginConfigValues,
@@ -17,6 +18,12 @@ if (!timeDefinition) {
 }
 
 const fields = timeDefinition.configSchema;
+const periodsField = fields.find((field) => field.key === "periods");
+
+if (!periodsField?.item || periodsField.item.type !== "object") {
+  throw new Error("time matcher periods must use an object schema");
+}
+const periodFields = periodsField.item.fields;
 
 describe("time matcher config form", () => {
   it("normalizes legacy weekday aliases to ISO numbers while preserving monthdays", () => {
@@ -52,7 +59,7 @@ describe("time matcher config form", () => {
     ).toBe(true);
   });
 
-  it("initializes a period without time bounds to the default numeric range", () => {
+  it("preserves omitted time bounds for existing all-day rules", () => {
     const formValues = createPluginConfigFormValues(fields, {
       periods: [{ weekdays: ["mon", "wed"] }],
     });
@@ -60,18 +67,19 @@ describe("time matcher config form", () => {
 
     expect(isPluginConfigFormValid(fields, formValues)).toBe(true);
     expect(serializePluginConfigValues(fields, formValues)).toEqual({
-      periods: [{ start: "09:00", end: "18:00", weekdays: [1, 3] }],
+      periods: [{ weekdays: [1, 3] }],
     });
-    expect(period.start).toBe("09:00");
-    expect(period.end).toBe("18:00");
+    expect(period.start).toBeUndefined();
+    expect(period.end).toBeUndefined();
   });
 
   it("accepts overnight ranges and rejects incomplete or equal ranges", () => {
     const valid = createPluginConfigFormValues(fields, {
       periods: [{ start: "22:00", end: "02:00" }],
     });
-    const incomplete = createPluginConfigFormValues(fields, { periods: [{}] });
-    (incomplete.periods as Record<string, unknown>[])[0].end = "";
+    const incomplete = createPluginConfigFormValues(fields, {
+      periods: [{ start: "09:00" }],
+    });
     const equal = createPluginConfigFormValues(fields, {
       periods: [{ start: "09:00", end: "09:00" }],
     });
@@ -85,12 +93,22 @@ describe("time matcher config form", () => {
     expect(isPluginConfigFormValid(fields, malformed)).toBe(false);
   });
 
-  it("initializes an empty period with a valid default range", () => {
+  it("uses the default range only for newly added periods", () => {
+    const newPeriod = createDefaultPluginConfigValues(periodFields);
+    const newValues = { periods: [newPeriod] };
+
+    expect(isPluginConfigFormValid(fields, newValues)).toBe(true);
+    expect(serializePluginConfigValues(fields, newValues)).toEqual({
+      periods: [{ start: "09:00", end: "18:00" }],
+    });
+  });
+
+  it("rejects an existing empty period without time or calendar conditions", () => {
     const formValues = createPluginConfigFormValues(fields, { periods: [{}] });
 
-    expect(isPluginConfigFormValid(fields, formValues)).toBe(true);
+    expect(isPluginConfigFormValid(fields, formValues)).toBe(false);
     expect(serializePluginConfigValues(fields, formValues)).toEqual({
-      periods: [{ start: "09:00", end: "18:00" }],
+      periods: [],
     });
   });
 });
