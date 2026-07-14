@@ -200,9 +200,11 @@ API 路由分成三类：
   "plugins": {
     "total": 12,
     "servers": 4
-  }
+ }
 }
 ```
+
+`/api/health` 在插件初始化完成后返回 `200`，即使尚未配置 server 插件；此时响应中的 `status` 和 `checks.server_startup` 为 `not_ready`，用于区分管理 API 可用与 DNS 服务就绪。
 
 `build_bundle` 是当前二进制的主编译组合包，可能为 `minimal`、`standard`、`full` 或 `custom`。如果需要完整的 feature 和插件支持清单，请使用 `GET /api/build`。
 

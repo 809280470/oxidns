@@ -200,9 +200,11 @@ Example shape:
   "plugins": {
     "total": 12,
     "servers": 4
-  }
+ }
 }
 ```
+
+`/api/health` returns `200` after plugin initialization completes, even when no server plugin is configured. In that state, the response `status` and `checks.server_startup` are `not_ready`, distinguishing management API availability from DNS service readiness.
 
 `build_bundle` is the primary build bundle of the running binary: `minimal`, `standard`, `full`, or `custom`. Use `GET /api/build` when you need the full feature and plugin capability snapshot.
 
