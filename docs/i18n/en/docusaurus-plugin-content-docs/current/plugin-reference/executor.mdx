@@ -2611,6 +2611,34 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 
 </Admonition>
 
+## `ros_route`
+
+Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routing table. It is a continuation executor and should appear before the executor that produces the final answer.
+
+```yaml
+- tag: ros_route_policy
+  type: ros_route
+  args:
+    address: "192.168.88.1:8728"
+    username: "api-user"
+    password: "secret"
+    routing_table: "via_proxy"
+    gateway4: "192.168.88.2@main"
+    gateway6: "fe80::2%ether1"
+    fixed_ttl: 0
+    cleanup_on_shutdown: true
+    persistent_route:
+      ips: ["198.51.100.0/24"]
+```
+
+- `routing_table` and `gateway4`/`gateway6` select the target. The RouterOS table, routing rule, and default route must already exist.
+- `min_ttl`/`max_ttl` default to `60`/`3600` seconds. `fixed_ttl` overrides DNS TTL; `fixed_ttl: 0` disables time-based expiry, while a later answer for the same domain still withdraws an absent IP reference.
+- `persistent_route` is a DNS-independent IP/CIDR set; files reload every minute and are periodically reconciled.
+- RouterOS failures do not block DNS startup. `async: false` waits for one sync attempt but never changes the DNS response on failure.
+- With `cleanup_on_shutdown: true`, dynamic and persistent routes owned by this plugin tag are removed; `false` leaves them for recovery on the next start.
+
+---
+
 ## `upgrade`
 
 ### Purpose

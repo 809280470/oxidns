@@ -2721,6 +2721,34 @@ old-static.example.com static.example.net
 
 </Admonition>
 
+## `ros_route`
+
+将成功 DNS 应答中的 A/AAAA 地址写入 RouterOS 指定策略路由表。插件是 continuation executor，应放在产生最终应答的 executor 之前。
+
+```yaml
+- tag: ros_route_policy
+  type: ros_route
+  args:
+    address: "192.168.88.1:8728"
+    username: "api-user"
+    password: "secret"
+    routing_table: "via_proxy"
+    gateway4: "192.168.88.2@main"
+    gateway6: "fe80::2%ether1"
+    fixed_ttl: 0
+    cleanup_on_shutdown: true
+    persistent_route:
+      ips: ["198.51.100.0/24"]
+```
+
+- `routing_table`、`gateway4`/`gateway6` 定义写入目标；路由表、routing rule 和默认路由需预先在 RouterOS 配好。
+- `min_ttl`/`max_ttl` 默认分别为 `60`/`3600` 秒。`fixed_ttl` 覆盖 DNS TTL；其中 `fixed_ttl: 0` 表示动态路由不按时间过期，但同一域名后续应答移除该 IP 时会撤销其引用。
+- `persistent_route` 是独立于 DNS 的常驻 IP/CIDR 集合；文件内容每分钟重载并周期对账。
+- RouterOS 不可达时 DNS 服务仍会启动，路由操作在后台重试。`async: false` 只等待一次同步尝试，失败不会改变 DNS 应答。
+- `cleanup_on_shutdown: true` 会删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。
+
+---
+
 ## `upgrade`
 
 ### 作用

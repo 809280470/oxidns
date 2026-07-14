@@ -658,6 +658,39 @@ plugins:
     Ok(())
 }
 
+#[cfg(feature = "plugin-ros-route")]
+#[tokio::test]
+async fn test_ros_route_plugin_init_accepts_config_and_registers_executor() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: ros_route_policy
+    type: ros_route
+    args:
+      address: "127.0.0.1:9"
+      username: "api-user"
+      password: "secret"
+      connect_timeout: 1
+      send_timeout: 1
+      receive_timeout: 1
+      routing_table: "via_proxy"
+      gateway4: "192.0.2.1@main"
+      fixed_ttl: 0
+      cleanup_on_shutdown: false
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let route = registry
+        .get_plugin("ros_route_policy")
+        .expect("ros_route plugin should be registered");
+
+    assert_eq!(route.plugin_type, PluginType::Executor);
+    assert_eq!(route.plugin_name, "ros_route");
+
+    registry.destroy().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_plugin_system_init_resolves_sequence_dependency_and_quick_setup() -> Result<()> {
     let yaml = r#"

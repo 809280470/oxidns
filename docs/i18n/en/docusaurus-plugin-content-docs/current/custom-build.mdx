@@ -88,7 +88,7 @@ Adds DoH3 and platform integrations on top of `standard`.
 **Additional**
 
 - Inbound / upstream: DoH HTTP/3
-- Executors: `ros_address_list` (MikroTik), `ipset`, `nftset`
+- Executors: `ros_address_list` / `ros_route` (MikroTik), `ipset`, `nftset`
 
 ### Official release matrix
 
@@ -150,6 +150,7 @@ path.
 | Feature | Plugin | Main dependency |
 |---|---|---|
 | `plugin-mikrotik` | `ros_address_list` | `mikrotik-rs` |
+| `plugin-ros-route` | `ros_route` | `mikrotik-rs` |
 | `plugin-query-recorder` | `query_recorder` | `rusqlite` (bundled SQLite) |
 | `plugin-ipset` | `ipset` + `nftset` | `ripset` (Linux only) |
 | `plugin-cron` | `cron` | `cronexpr` |

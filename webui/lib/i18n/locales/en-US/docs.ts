@@ -372,6 +372,19 @@ export const enUSDocs = {
     mask6:
       "- Type: `integer`; Required: No; Default: Implementation determined\n- Function: Define the IPv4/IPv6 prefix length separately under compatible writing methods.",
   },
+  ros_route: {
+    address: "- Type: `string`; Required: yes\n- RouterOS API endpoint, usually `host:port`.",
+    username: "- Type: `string`; Required: yes\n- RouterOS API login username.",
+    password: "- Type: `string`; Required: yes\n- RouterOS API login password.",
+    routing_table: "- Type: `string`; Required: yes\n- Target policy-routing table; the plugin does not create tables or routing rules.",
+    gateway4: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv4 route next hop.",
+    gateway6: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
+    distance: "- Type: `u8`; Default: `100`\n- RouterOS static-route distance.",
+    "persistent_route.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes.",
+    "persistent_route.files": "- Type: `array<string>`\n- Persistent route files reloaded every minute.",
+    fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry.",
+    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin on shutdown.",
+  },
   ros_address_list: {
     address:
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the RouterOS API service address, usually written as `host:port`. This address will be used to establish a management connection after the plug-in is started and maintain synchronization with the device during operation.\n- Configuration recommendations: When using the RouterOS API plaintext port, it is usually `8728`. If an encrypted API is deployed, the actual port should be filled in.",

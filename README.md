@@ -80,7 +80,7 @@ OxiDNS 不试图替你隐藏复杂性。
 | 匹配器 | `qname`、`question`、`qtype`、`qclass`、`client_ip`、`resp_ip`、`rcode`、`time`、`rate_limiter` 等 |
 | 数据集 | `domain_set`、`dynamic_domain_set`、`ip_set`、`geoip`、`geosite`、`adguard_rule` |
 | 出站网络 | `network.outbound` 统一配置 HTTP 下载、升级检查、webhook 与 upstream 使用的 nameservers 与 SOCKS5 |
-| 系统联动 | `ipset`、`nftset`、`ros_address_list`、`reverse_lookup` |
+| 系统联动 | `ipset`、`nftset`、`ros_address_list`、`ros_route`、`reverse_lookup` |
 | 调试与运维 | 健康检查、配置校验、热重载、查询记录、Prometheus 插件指标、实时日志 |
 | 部署能力 | 多平台构建、Debian 包、OpenWrt LuCI 插件、独立 WebUI 托管、服务化安装 |
 
@@ -96,7 +96,7 @@ OxiDNS 适合部署在需要长期运行、可调试、可扩展的 DNS 环境�
 - 多上游并发查询、主备回退、协议混合接入
 - 可配置并发上游结果选择策略，在速度与负向答案可靠性之间取舍
 - 基于域名、客户端、响应结果的精细化策略路由
-- DNS 结果驱动的 `ipset` / `nftset` / MikroTik 地址列表同步
+- DNS 结果驱动的 `ipset` / `nftset` / MikroTik 地址列表与策略路由同步
 - 广告过滤、域名分流、本地覆盖、双栈偏好和 ECS 控制
 - 自建可控、可调试的 DNS 基础设施
 - 需要通过同一管理端口托管独立 WebUI 的轻量部署

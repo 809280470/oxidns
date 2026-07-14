@@ -1650,6 +1650,51 @@ export const enUSPluginDefined = {
         },
       },
     },
+    ros_route: {
+      name: "RouterOS Route",
+      description: "Sync response IPs into RouterOS policy routes",
+      fields: {
+        address: { label: "RouterOS API address", placeholder: "172.16.1.1:8728" },
+        username: { label: "Username" },
+        password: { label: "Password" },
+        connect_timeout: { label: "Connect timeout" },
+        send_timeout: { label: "Send timeout" },
+        receive_timeout: { label: "Receive timeout" },
+        async: { label: "Async submission" },
+        routing_table: { label: "Routing table", placeholder: "via_proxy" },
+        gateway4: { label: "IPv4 gateway", placeholder: "192.168.88.2@main" },
+        gateway6: { label: "IPv6 gateway", placeholder: "fe80::2%ether1" },
+        distance: { label: "Route distance" },
+        comment_prefix: { label: "Comment prefix" },
+        persistent_route: { label: "Persistent routes" },
+        "persistent_route.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
+        "persistent_route.ips[]": { label: "Value", placeholder: "1.1.1.1" },
+        "persistent_route.files": { label: "Files", placeholder: "/etc/oxidns/persistent_routes.txt" },
+        "persistent_route.files[]": { label: "Value", placeholder: "/etc/oxidns/persistent_routes.txt" },
+        min_ttl: { label: "Minimum dynamic-route TTL" },
+        max_ttl: { label: "Maximum dynamic-route TTL" },
+        fixed_ttl: { label: "Fixed dynamic-route TTL", description: "Set to 0 to disable time-based expiry." },
+        cleanup_on_shutdown: { label: "Clean up on shutdown" },
+      },
+      metrics: {
+        labels: {
+          ros_route_observe_total: "Observations",
+          ros_route_dropped_total: "Async drops",
+          ros_route_sync_error_total: "Sync failures",
+          ros_route_sync_timeout_total: "Sync timeouts",
+        },
+        help: {
+          ros_route_observe_total:
+            "The total number of domain observations submitted to the RouterOS route manager.",
+          ros_route_dropped_total:
+            "The total number of observations dropped because the asynchronous queue was unavailable.",
+          ros_route_sync_error_total:
+            "The total number of synchronous observations that failed in the RouterOS route manager.",
+          ros_route_sync_timeout_total:
+            "The total number of synchronous observations that timed out while enqueuing or waiting.",
+        },
+      },
+    },
     ros_address_list: {
       name: "RouterOS Address List",
       description: "Synchronize answering IP to RouterOS address-list",
