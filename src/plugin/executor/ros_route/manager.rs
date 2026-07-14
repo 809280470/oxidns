@@ -27,6 +27,7 @@ const ROUTE_PREFIX_V6: u8 = 128;
 const PERSISTENT_COMMENT_DOMAIN: &str = "persistent";
 const PERSISTENT_EXPIRES_AT_UNIX: u64 = u64::MAX;
 const MANAGER_QUEUE_SIZE: usize = 1024;
+const MAX_PENDING_OBSERVATIONS: usize = MANAGER_QUEUE_SIZE;
 const SWEEP_INTERVAL_SECS: u64 = 30;
 const RECONCILE_INTERVAL_SECS: u64 = 180;
 const PERSISTENT_RELOAD_INTERVAL_SECS: u64 = 60;
@@ -498,9 +499,8 @@ impl ObservationScope {
 struct PendingObservation {
     addrs: Vec<ObservedAddr>,
     observed_at_unix: u64,
-    /// Upper bound for replaying an empty negative observation. Positive
-    /// observations carry per-address TTLs and leave this unset.
-    replay_until_unix: Option<u64>,
+    /// Upper bound for replaying this complete family observation.
+    replay_until_unix: u64,
 }
 
 #[derive(Debug)]
@@ -763,16 +763,24 @@ impl RouteManager {
         self.api.healthcheck().await?;
         self.validate_gateways().await?;
         self.ensure_persistent_routes(now);
-        self.reconcile_from_router().await?;
+        let mut first_error = self.reconcile_from_router_inner().await?;
         if !self.pending_observations.is_empty() {
             self.replay_pending_observations();
             let replay_now = unix_now();
             self.prune_expired_local_state(replay_now);
-            self.sync_routes(replay_now).await?;
+            if let Err(error) = self.sync_routes(replay_now).await {
+                first_error.get_or_insert(error);
+            }
             self.pending_observations.clear();
         }
+        // Transport and table reads above are required for a valid baseline.
+        // Per-route conflicts are isolated by the sync loops, so they must not
+        // keep unrelated observations in the pre-initialization backlog.
         self.initialized = true;
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     #[inline]
@@ -1122,13 +1130,30 @@ impl RouteManager {
                 .copied()
                 .filter(|observed| family_scope.contains(observed.addr))
                 .collect::<Vec<_>>();
-            let replay_until_unix = family_addrs.is_empty().then(|| {
+            let replay_until_unix = if family_addrs.is_empty() {
                 // A negative response without an SOA is not safely cacheable,
                 // and an explicit zero TTL expires immediately.
                 observed_at_unix.saturating_add(u64::from(negative_ttl_secs.unwrap_or(0)))
-            });
+            } else {
+                family_addrs
+                    .iter()
+                    .map(|observed| self.effective_expiry(observed.ttl_secs, observed_at_unix))
+                    .max()
+                    .unwrap_or(observed_at_unix)
+            };
+            let key = (domain.clone(), family_scope);
+            if !self.pending_observations.contains_key(&key)
+                && self.pending_observations.len() >= MAX_PENDING_OBSERVATIONS
+            {
+                self.prune_pending_observations(unix_now());
+            }
+            if !self.pending_observations.contains_key(&key)
+                && self.pending_observations.len() >= MAX_PENDING_OBSERVATIONS
+            {
+                continue;
+            }
             self.pending_observations.insert(
-                (domain.clone(), family_scope),
+                key,
                 PendingObservation {
                     addrs: family_addrs,
                     observed_at_unix,
@@ -1138,16 +1163,17 @@ impl RouteManager {
         }
     }
 
+    fn prune_pending_observations(&mut self, now: u64) {
+        self.pending_observations
+            .retain(|_, observation| observation.replay_until_unix > now);
+    }
+
     fn replay_pending_observations(&mut self) {
         let now = unix_now();
         let pending = self
             .pending_observations
             .iter()
-            .filter(|(_, observation)| {
-                observation
-                    .replay_until_unix
-                    .is_none_or(|replay_until| replay_until > now)
-            })
+            .filter(|(_, observation)| observation.replay_until_unix > now)
             .map(|((domain, scope), observation)| (domain.clone(), *scope, observation.clone()))
             .collect::<Vec<_>>();
         for (domain, scope, observation) in pending {
@@ -1479,7 +1505,7 @@ impl RouteManager {
         }
     }
 
-    async fn reconcile_from_router(&mut self) -> Result<()> {
+    async fn reconcile_from_router_inner(&mut self) -> Result<Option<DnsError>> {
         // Reconcile algorithm:
         // 1) classify every exact route key as owned or foreign
         // 2) choose the best owned survivor and prune duplicates
@@ -1795,7 +1821,11 @@ impl RouteManager {
         if let Err(error) = self.sync_routes(now).await {
             first_error.get_or_insert(error);
         }
-        match first_error {
+        Ok(first_error)
+    }
+
+    async fn reconcile_from_router(&mut self) -> Result<()> {
+        match self.reconcile_from_router_inner().await? {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -2850,6 +2880,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pending_observations_are_bounded_during_initialization_outage() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 39));
+        let mut manager = RouteManager::new(Arc::new(NoopApi), manager_config(Some(300)));
+        let now = unix_now();
+
+        for index in 0..MAX_PENDING_OBSERVATIONS + 16 {
+            manager.queue_pending_observation(
+                format!("queued-{index}.example."),
+                ObservationScope::Ipv4,
+                vec![ObservedAddr {
+                    addr: ip,
+                    ttl_secs: 60,
+                }],
+                None,
+                now,
+            );
+        }
+
+        assert_eq!(manager.pending_observations.len(), MAX_PENDING_OBSERVATIONS);
+        assert!(
+            manager
+                .pending_observations
+                .contains_key(&("queued-0.example.".to_string(), ObservationScope::Ipv4,))
+        );
+        assert!(!manager.pending_observations.contains_key(&(
+            format!("queued-{}.example.", MAX_PENDING_OBSERVATIONS),
+            ObservationScope::Ipv4,
+        )));
+    }
+
+    #[test]
+    fn expired_pending_observations_release_backlog_capacity() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40));
+        let mut manager = RouteManager::new(Arc::new(NoopApi), manager_config(Some(300)));
+
+        for index in 0..MAX_PENDING_OBSERVATIONS {
+            manager.queue_pending_observation(
+                format!("expired-{index}.example."),
+                ObservationScope::Ipv4,
+                vec![ObservedAddr {
+                    addr: ip,
+                    ttl_secs: 60,
+                }],
+                None,
+                1,
+            );
+        }
+        manager.queue_pending_observation(
+            "fresh.example.".to_string(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            None,
+            unix_now(),
+        );
+
+        assert_eq!(manager.pending_observations.len(), 1);
+        assert!(
+            manager
+                .pending_observations
+                .contains_key(&("fresh.example.".to_string(), ObservationScope::Ipv4,))
+        );
+    }
+
     #[tokio::test]
     async fn recovered_timeless_domain_binding_can_be_withdrawn() {
         AppClock::start();
@@ -3287,6 +3384,59 @@ mod tests {
         assert_eq!(
             api.state.lock().expect("mock lock").upsert_attempts,
             vec![ip]
+        );
+    }
+
+    #[tokio::test]
+    async fn initialization_drains_unrelated_observations_after_route_conflict() {
+        AppClock::start();
+        let now = unix_now();
+        let conflict_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 41));
+        let unrelated_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+        let route = |id: &str, comment: &str| RouterRoute {
+            id: id.to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: format!("{conflict_ip}/32"),
+            routing_table: "via_proxy".to_string(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(comment.to_string()),
+            disabled: false,
+        };
+        let owned_comment = format!(
+            "fdns;pg=route-test;kind=dynamic;dm=conflict.example.;exp={};seen={now}",
+            now + 300
+        );
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![
+                route("*owned", &owned_comment),
+                route("*foreign", "operator-managed"),
+            ],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+        manager.queue_pending_observation(
+            "unrelated.example.".to_string(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: unrelated_ip,
+                ttl_secs: 300,
+            }],
+            None,
+            now,
+        );
+
+        assert!(manager.ensure_initialized().await.is_err());
+
+        assert!(manager.initialized);
+        assert!(manager.pending_observations.is_empty());
+        assert!(manager.domain_bindings.contains_key("unrelated.example."));
+        assert!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .upsert_attempts
+                .contains(&unrelated_ip)
         );
     }
 
