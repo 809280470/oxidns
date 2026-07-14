@@ -31,7 +31,6 @@ const MAX_PENDING_OBSERVATIONS: usize = MANAGER_QUEUE_SIZE;
 const SWEEP_INTERVAL_SECS: u64 = 30;
 const RECONCILE_INTERVAL_SECS: u64 = 180;
 const PERSISTENT_RELOAD_INTERVAL_SECS: u64 = 60;
-const SHUTDOWN_TIMEOUT_SECS: u64 = 8;
 
 const COMMENT_FIELD_PLUGIN: &str = "pg";
 const COMMENT_FIELD_DOMAIN: &str = "dm";
@@ -720,28 +719,24 @@ impl RouteManagerRuntime {
             task_center::stop_task(task_id).await;
         }
 
-        let mut shutdown_acked = false;
         let (done_tx, done_rx) = oneshot::channel::<()>();
-        if self.shutdown_tx.take().is_some_and(|tx| {
+        let shutdown_requested = self.shutdown_tx.take().is_some_and(|tx| {
             tx.send(ShutdownRequest {
                 cleanup,
                 done: done_tx,
             })
             .is_ok()
-        }) {
-            shutdown_acked =
-                tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), done_rx)
-                    .await
-                    .is_ok();
+        });
+        if shutdown_requested {
+            // `cleanup_on_shutdown` is an explicit ownership contract. Route
+            // deletion is serialized and can legitimately take longer than a
+            // short fixed deadline for a large table or a slow RouterOS API.
+            // Per-command API timeouts still bound individual operations; do
+            // not abort the worker and silently leave managed routes behind.
+            let _ = done_rx.await;
         }
         if let Some(handle) = self.worker_handle.take() {
-            if shutdown_acked {
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), handle).await;
-            } else {
-                handle.abort();
-                let _ = handle.await;
-            }
+            let _ = handle.await;
         }
     }
 }
@@ -1152,9 +1147,12 @@ impl RouteManager {
         observed_at_unix: u64,
     ) {
         let name_level_negative = scope == ObservationScope::Both && addrs.is_empty();
-        if !addrs.is_empty() {
-            // Any positive answer proves that a previously queued NXDOMAIN is
-            // stale for the whole name, including its opposite-family entry.
+        if !name_level_negative {
+            // Any later response other than NXDOMAIN proves that a previously
+            // queued name-level denial is stale for the whole name, including
+            // its opposite-family entry. NODATA only scopes its own family,
+            // but it still proves the name exists and cannot coexist with an
+            // older NXDOMAIN.
             self.pending_observations
                 .retain(|(queued_domain, _), observation| {
                     queued_domain != &domain || !observation.name_level_negative
@@ -1194,6 +1192,13 @@ impl RouteManager {
             if !self.pending_observations.contains_key(&key)
                 && self.pending_observations.len() >= MAX_PENDING_OBSERVATIONS
             {
+                warn!(
+                    plugin = %self.cfg.plugin_tag,
+                    domain = %domain,
+                    ?family_scope,
+                    capacity = MAX_PENDING_OBSERVATIONS,
+                    "ros_route pending observation backlog is full, observation dropped"
+                );
                 continue;
             }
             self.pending_observations.insert(
@@ -1921,11 +1926,34 @@ impl RouteManager {
             // address family. Initialization first recovers retained RouterOS
             // comments, then replays these replacements with their original
             // timestamps so retries cannot resurrect old IPs or extend TTLs.
-            self.queue_pending_observation(domain, scope, addrs, negative_ttl_secs, now);
+            self.queue_pending_observation(
+                domain.clone(),
+                scope,
+                addrs.clone(),
+                negative_ttl_secs,
+                now,
+            );
             if !wait_for_sync {
                 return Ok(());
             }
-            return self.ensure_initialized().await;
+
+            // A synchronous caller needs the current observation applied once
+            // even if it could not enter the bounded replay backlog or its DNS
+            // TTL is zero/has elapsed while initialization was in progress.
+            // Keep the original timestamp so this does not extend the route's
+            // effective lifetime beyond the DNS response that triggered it.
+            let initialization_result = self.ensure_initialized().await;
+            if !self.initialized {
+                return initialization_result;
+            }
+
+            let touched = self.apply_observation(domain, scope, addrs, now);
+            let sync_result = self.sync_route_keys(touched, now).await;
+            return match (initialization_result, sync_result) {
+                (_, Err(error)) => Err(error),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Ok(())) => Ok(()),
+            };
         }
         let touched = self.apply_observation(domain, scope, addrs, now);
         self.sync_route_keys(touched, now).await
@@ -3065,6 +3093,147 @@ mod tests {
             !manager
                 .pending_observations
                 .contains_key(&(domain, ObservationScope::Ipv6))
+        );
+    }
+
+    #[test]
+    fn nodata_observation_supersedes_queued_name_level_negative() {
+        let domain = "nodata-recovery.example.".to_string();
+        let mut config = manager_config(Some(0));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Both,
+            Vec::new(),
+            Some(300),
+            100,
+        );
+
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            Vec::new(),
+            Some(60),
+            101,
+        );
+
+        assert!(
+            manager
+                .pending_observations
+                .contains_key(&(domain.clone(), ObservationScope::Ipv4))
+        );
+        assert!(
+            !manager
+                .pending_observations
+                .contains_key(&(domain, ObservationScope::Ipv6))
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_non_cacheable_negative_is_applied_after_initialization() {
+        AppClock::start();
+        let domain = "sync-negative.example.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*retained".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: format!("{ip}/32"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(format!(
+                    "fdns;pg=route-test;kind=dynamic;dm={domain};exp={};seen=100",
+                    u64::MAX
+                )),
+                disabled: false,
+            }],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));
+
+        manager
+            .observe_domain(domain, ObservationScope::Ipv4, Vec::new(), None, true)
+            .await
+            .expect("current synchronous withdrawal should be applied once");
+
+        assert_eq!(
+            api.state.lock().expect("mock lock").deleted_ids,
+            vec!["*retained".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_zero_ttl_positive_is_applied_after_initialization() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 45));
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager
+            .observe_domain(
+                "sync-zero-ttl.example.".to_string(),
+                ObservationScope::Ipv4,
+                vec![ObservedAddr {
+                    addr: ip,
+                    ttl_secs: 0,
+                }],
+                None,
+                true,
+            )
+            .await
+            .expect("current synchronous positive should be applied once");
+
+        assert!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .upsert_attempts
+                .contains(&ip)
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_observation_bypasses_a_full_pending_backlog() {
+        let backlog_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 46));
+        let current_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 47));
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+        let now = unix_now();
+
+        for index in 0..MAX_PENDING_OBSERVATIONS {
+            manager.queue_pending_observation(
+                format!("backlog-{index}.example."),
+                ObservationScope::Ipv4,
+                vec![ObservedAddr {
+                    addr: backlog_ip,
+                    ttl_secs: 60,
+                }],
+                None,
+                now,
+            );
+        }
+
+        manager
+            .observe_domain(
+                "current-sync.example.".to_string(),
+                ObservationScope::Ipv4,
+                vec![ObservedAddr {
+                    addr: current_ip,
+                    ttl_secs: 60,
+                }],
+                None,
+                true,
+            )
+            .await
+            .expect("current synchronous observation should not be lost");
+
+        assert!(
+            api.state
+                .lock()
+                .expect("mock lock")
+                .upsert_attempts
+                .contains(&current_ip)
         );
     }
 

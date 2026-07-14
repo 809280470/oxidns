@@ -288,6 +288,9 @@ struct ActiveRouteInstance {
     instance_id: u64,
     namespace: RouteOwnershipNamespace,
     metrics: Arc<RosRouteMetrics>,
+    /// Used to request that the prior compatible runtime immediately restore
+    /// its desired RouterOS state when a replacement candidate rolls back.
+    command_tx: Option<mpsc::Sender<ManagerCommand>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -319,6 +322,7 @@ fn register_active_route_instance(
     instance_id: u64,
     namespace: RouteOwnershipNamespace,
     metrics: Arc<RosRouteMetrics>,
+    command_tx: Option<mpsc::Sender<ManagerCommand>>,
 ) -> Result<()> {
     register_metric_source(metrics.clone())?;
     let mut active = active_route_instances()
@@ -331,6 +335,7 @@ fn register_active_route_instance(
             instance_id,
             namespace,
             metrics,
+            command_tx,
         });
     Ok(())
 }
@@ -345,7 +350,7 @@ fn register_active_route_instance(
 /// not suppress cleanup of the old namespace. The stack also restores the
 /// previous metric source when candidate initialization later rolls back.
 fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
-    let (cleanup_allowed, metric_replacement, remove_metric) = {
+    let (cleanup_allowed, metric_replacement, remove_metric, restore_tx) = {
         let mut active = active_route_instances()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -367,17 +372,44 @@ fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
         let metric_replacement = was_metric_owner
             .then(|| instances.last().map(|instance| instance.metrics.clone()))
             .flatten();
+        // A candidate is appended after the running instance. If that newest
+        // candidate is destroyed during a failed reload, it may already have
+        // reconciled changed gateway/distance metadata. Ask the compatible
+        // surviving runtime to restore its desired state immediately instead
+        // of waiting for the periodic 180-second reconcile.
+        let restore_tx = was_metric_owner
+            .then(|| {
+                instances
+                    .iter()
+                    .rev()
+                    .find(|instance| instance.namespace == removed.namespace)
+                    .and_then(|instance| instance.command_tx.clone())
+            })
+            .flatten();
         let remove_metric = was_metric_owner && is_last;
         if is_last {
             active.remove(tag);
         }
-        (cleanup_allowed, metric_replacement, remove_metric)
+        (
+            cleanup_allowed,
+            metric_replacement,
+            remove_metric,
+            restore_tx,
+        )
     };
 
     if let Some(metrics) = metric_replacement {
         let _ = register_metric_source(metrics);
     } else if remove_metric {
         unregister_metric_source(tag);
+    }
+    if let Some(tx) = restore_tx
+        && tx.try_send(ManagerCommand::Reconcile).is_err()
+    {
+        warn!(
+            plugin = %tag,
+            "ros_route failed to enqueue immediate reconcile after reload rollback"
+        );
     }
     cleanup_allowed
 }
@@ -455,7 +487,8 @@ impl Plugin for MikrotikExecutor {
             gateway6_enabled: self.config.gateway6.is_some(),
         });
         let runtime = RouteManagerRuntime::start(self.tag.clone(), manager, persistent_reload);
-        self.command_tx = Some(runtime.sender());
+        let command_tx = runtime.sender();
+        self.command_tx = Some(command_tx.clone());
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = Some(runtime);
         }
@@ -464,6 +497,7 @@ impl Plugin for MikrotikExecutor {
             self.instance_id,
             RouteOwnershipNamespace::from_config(&self.config),
             self.metrics.clone(),
+            Some(command_tx),
         )?;
         self.active_registered.store(true, Ordering::Release);
         Ok(())
@@ -1311,20 +1345,44 @@ routing_table: "policy"
         let success_tag = format!("route-reload-success-{sequence}");
         let old_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
         let new_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
-        register_active_route_instance(&success_tag, sequence, namespace.clone(), old_metrics)
-            .expect("old runtime");
-        register_active_route_instance(&success_tag, sequence + 1, namespace.clone(), new_metrics)
-            .expect("replacement runtime");
+        register_active_route_instance(
+            &success_tag,
+            sequence,
+            namespace.clone(),
+            old_metrics,
+            None,
+        )
+        .expect("old runtime");
+        register_active_route_instance(
+            &success_tag,
+            sequence + 1,
+            namespace.clone(),
+            new_metrics,
+            None,
+        )
+        .expect("replacement runtime");
         assert!(!release_active_route_instance(&success_tag, sequence));
         assert!(release_active_route_instance(&success_tag, sequence + 1));
 
         let rollback_tag = format!("route-reload-rollback-{sequence}");
         let old_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
         let candidate_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
-        register_active_route_instance(&rollback_tag, sequence + 2, namespace.clone(), old_metrics)
-            .expect("old runtime");
-        register_active_route_instance(&rollback_tag, sequence + 3, namespace, candidate_metrics)
-            .expect("candidate runtime");
+        register_active_route_instance(
+            &rollback_tag,
+            sequence + 2,
+            namespace.clone(),
+            old_metrics,
+            None,
+        )
+        .expect("old runtime");
+        register_active_route_instance(
+            &rollback_tag,
+            sequence + 3,
+            namespace,
+            candidate_metrics,
+            None,
+        )
+        .expect("candidate runtime");
         assert!(!release_active_route_instance(&rollback_tag, sequence + 3));
         assert!(release_active_route_instance(&rollback_tag, sequence + 2));
 
@@ -1344,6 +1402,7 @@ routing_table: "policy"
             sequence + 4,
             old_namespace,
             Arc::new(RosRouteMetrics::new(migration_tag.clone())),
+            None,
         )
         .expect("old namespace");
         register_active_route_instance(
@@ -1351,9 +1410,43 @@ routing_table: "policy"
             sequence + 5,
             new_namespace,
             Arc::new(RosRouteMetrics::new(migration_tag.clone())),
+            None,
         )
         .expect("new namespace");
         assert!(release_active_route_instance(&migration_tag, sequence + 4));
         assert!(release_active_route_instance(&migration_tag, sequence + 5));
+    }
+
+    #[test]
+    fn failed_compatible_reload_requests_immediate_restore_reconcile() {
+        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
+        let tag = format!("route-reload-restore-{sequence}");
+        let namespace = RouteOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            routing_table: "policy".to_string(),
+            comment_prefix: "fdns".to_string(),
+        };
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+
+        register_active_route_instance(
+            &tag,
+            sequence,
+            namespace.clone(),
+            Arc::new(RosRouteMetrics::new(tag.clone())),
+            Some(old_tx),
+        )
+        .expect("old runtime");
+        register_active_route_instance(
+            &tag,
+            sequence + 1,
+            namespace,
+            Arc::new(RosRouteMetrics::new(tag.clone())),
+            None,
+        )
+        .expect("candidate runtime");
+
+        assert!(!release_active_route_instance(&tag, sequence + 1));
+        assert!(matches!(old_rx.try_recv(), Ok(ManagerCommand::Reconcile)));
+        assert!(release_active_route_instance(&tag, sequence));
     }
 }

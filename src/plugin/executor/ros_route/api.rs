@@ -284,6 +284,13 @@ impl MikrotikRsClient {
         Ok(None)
     }
 
+    async fn cleanup_validation_route(&self, key: &RouteKey, comment: &str) -> Result<()> {
+        if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
+            self.delete_route_by_id(&route.id, route.family).await?;
+        }
+        Ok(())
+    }
+
     async fn inspect_exact_routes(
         &self,
         key: &RouteKey,
@@ -649,7 +656,18 @@ impl MikrotikApi for MikrotikRsClient {
             .attribute(ROUTE_COMMENT_FIELD, Some(comment))
             .attribute("disabled", Some("yes"))
             .build();
-        let _ = self.send_rows("validate route config", add).await?;
+        if let Err(validation_error) = self.send_rows("validate route config", add).await {
+            // An add response can be lost after RouterOS has already created
+            // the disabled probe route. Attempt the same ownership-scoped
+            // cleanup used for later validation failures before retrying
+            // initialization, otherwise each retry may leave a new nonce row.
+            return match self.cleanup_validation_route(key, comment).await {
+                Ok(()) => Err(validation_error),
+                Err(cleanup_error) => Err(DnsError::plugin(format!(
+                    "{validation_error}; temporary validation-route cleanup also failed: {cleanup_error}"
+                ))),
+            };
+        }
 
         let validation_result = async {
             let route = self
@@ -669,13 +687,7 @@ impl MikrotikApi for MikrotikRsClient {
             // delete failed. Retry cleanup on a fresh connection before returning
             // the validation error; reconciliation also recognizes this comment
             // kind and removes any residue left by a prolonged outage.
-            let cleanup_result = async {
-                if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
-                    self.delete_route_by_id(&route.id, route.family).await?;
-                }
-                Result::<()>::Ok(())
-            }
-            .await;
+            let cleanup_result = self.cleanup_validation_route(key, comment).await;
             return match cleanup_result {
                 Ok(()) => Err(validation_error),
                 Err(cleanup_error) => Err(DnsError::plugin(format!(
