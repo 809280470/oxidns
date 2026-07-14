@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use super::api::MikrotikApi;
+use super::api::{MikrotikApi, RouterRoute};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::task as task_center;
@@ -779,6 +779,49 @@ impl RouteManager {
     }
 
     #[inline]
+    fn recovered_expiry(&self, meta: &RouteCommentMeta) -> u64 {
+        if meta.kind == RouteCommentKind::Persistent {
+            return meta.expires_at_unix;
+        }
+
+        let policy_cap = match self.cfg.fixed_ttl {
+            Some(0) => return meta.expires_at_unix,
+            Some(ttl) => meta.last_refresh_unix.saturating_add(u64::from(ttl)),
+            None => meta
+                .last_refresh_unix
+                .saturating_add(u64::from(self.cfg.max_ttl)),
+        };
+        meta.expires_at_unix.min(policy_cap)
+    }
+
+    fn recovery_candidate_rank(
+        &self,
+        key: &RouteKey,
+        meta: &RouteCommentMeta,
+        now: u64,
+    ) -> (bool, bool, u64, u64) {
+        let expects_persistent = self
+            .routes
+            .get(key)
+            .is_some_and(|route| route.domains.contains(PERSISTENT_ANCHOR_DOMAIN));
+        let expires_at = self.recovered_expiry(meta);
+        let recoverable = match meta.kind {
+            RouteCommentKind::Dynamic => expires_at > now,
+            RouteCommentKind::Persistent => expects_persistent,
+        };
+        let desired_kind = matches!(
+            (expects_persistent, meta.kind),
+            (true, RouteCommentKind::Persistent) | (false, RouteCommentKind::Dynamic)
+        );
+        (
+            recoverable,
+            desired_kind,
+            expires_at,
+            meta.last_refresh_unix,
+        )
+    }
+
+    #[inline]
     fn comment_refresh_due(route: &RouteEntry, now: u64) -> bool {
         let Some(synced_expiry) = route.synced_expires_at_unix else {
             return true;
@@ -1418,10 +1461,11 @@ impl RouteManager {
 
     async fn reconcile_from_router(&mut self) -> Result<()> {
         // Reconcile algorithm:
-        // 1) scan RouterOS rows in target table
-        // 2) recover managed rows by comment metadata
-        // 3) mark missing local entries as create/delete candidates
-        // 4) execute one sync pass
+        // 1) classify every exact route key as owned or foreign
+        // 2) choose the best owned survivor and prune duplicates
+        // 3) recover managed rows under the current TTL policy
+        // 4) mark missing local entries as create/delete candidates
+        // 5) execute one sync pass
         let now = unix_now();
         let rows = self
             .api
@@ -1431,7 +1475,9 @@ impl RouteManager {
                 self.cfg.gateway6.is_some(),
             )
             .await?;
-        let mut seen_keys = AHashSet::new();
+        let mut owned_candidates =
+            AHashMap::<RouteKey, Vec<(RouterRoute, RouteCommentMeta)>>::new();
+        let mut foreign_keys = AHashSet::new();
         let mut first_error = None;
 
         for route in rows {
@@ -1446,60 +1492,66 @@ impl RouteManager {
             if !family.is_valid_prefix(prefix) {
                 continue;
             }
-
-            let Some(comment) = route.comment.as_deref() else {
+            let Some(key) = RouteKey::new_with_prefix(ip, prefix, self.cfg.routing_table.clone())
+            else {
                 continue;
             };
-            if owned_comment_has_kind(
-                &self.cfg.comment_prefix,
-                &self.cfg.plugin_tag,
-                comment,
-                COMMENT_KIND_GATEWAY_CHECK,
-            ) {
-                if let Err(error) = self.api.delete_route_by_id(&route.id, route.family).await {
-                    warn!(
-                        plugin = %self.cfg.plugin_tag,
-                        route_id = %route.id,
-                        err = %error,
-                        "ros_route failed to remove stale gateway validation route"
-                    );
-                    first_error.get_or_insert(error);
-                }
-                continue;
-            }
-            let meta = match RouteCommentCodec::decode(
-                &self.cfg.comment_prefix,
-                &self.cfg.plugin_tag,
-                route.family,
-                &route.dst_address,
-                comment,
-            ) {
-                Ok(Some(meta)) => meta,
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(
-                        plugin = %self.cfg.plugin_tag,
-                        route_id = %route.id,
-                        err = %e,
-                        "ros_route route comment parse failed, treating as unknown residue"
-                    );
+
+            let meta = if let Some(comment) = route.comment.as_deref() {
+                if owned_comment_has_kind(
+                    &self.cfg.comment_prefix,
+                    &self.cfg.plugin_tag,
+                    comment,
+                    COMMENT_KIND_GATEWAY_CHECK,
+                ) {
+                    if let Err(error) = self.api.delete_route_by_id(&route.id, route.family).await {
+                        warn!(
+                            plugin = %self.cfg.plugin_tag,
+                            route_id = %route.id,
+                            err = %error,
+                            "ros_route failed to remove stale gateway validation route"
+                        );
+                        first_error.get_or_insert(error);
+                    }
                     continue;
                 }
+
+                match RouteCommentCodec::decode(
+                    &self.cfg.comment_prefix,
+                    &self.cfg.plugin_tag,
+                    route.family,
+                    &route.dst_address,
+                    comment,
+                ) {
+                    Ok(Some(meta)) => Some(meta),
+                    Ok(None) => None,
+                    Err(error) => {
+                        warn!(
+                            plugin = %self.cfg.plugin_tag,
+                            route_id = %route.id,
+                            err = %error,
+                            "ros_route route comment parse failed, treating route as foreign"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let Some(meta) = meta else {
+                foreign_keys.insert(key);
+                continue;
             };
             if meta.family != family || meta.ip != ip {
                 warn!(
                     plugin = %self.cfg.plugin_tag,
                     route_id = %route.id,
                     dst = %route.dst_address,
-                    "ros_route route comment metadata mismatches route dst, skipping recovery"
+                    "ros_route route comment metadata mismatches route dst, treating route as foreign"
                 );
+                foreign_keys.insert(key);
                 continue;
             }
-
-            let Some(key) = RouteKey::new_with_prefix(ip, prefix, self.cfg.routing_table.clone())
-            else {
-                continue;
-            };
 
             // A route owned by this plugin must not survive after its address
             // family is disabled in the new configuration. It cannot be
@@ -1517,20 +1569,46 @@ impl RouteManager {
                 self.routes.remove(&key);
                 continue;
             }
-            if !seen_keys.insert(key.clone()) {
-                if let Err(error) = self.api.delete_route_by_id(&route.id, route.family).await {
+
+            owned_candidates.entry(key).or_default().push((route, meta));
+        }
+
+        let mut seen_keys = AHashSet::new();
+        for (key, mut candidates) in owned_candidates {
+            let mut survivor_index = 0;
+            for index in 1..candidates.len() {
+                let candidate_rank = self.recovery_candidate_rank(&key, &candidates[index].1, now);
+                let survivor_rank =
+                    self.recovery_candidate_rank(&key, &candidates[survivor_index].1, now);
+                if candidate_rank > survivor_rank {
+                    survivor_index = index;
+                }
+            }
+            let (route, meta) = candidates.swap_remove(survivor_index);
+            for (duplicate, _) in candidates {
+                if let Err(error) = self
+                    .api
+                    .delete_route_by_id(&duplicate.id, duplicate.family)
+                    .await
+                {
                     warn!(
                         plugin = %self.cfg.plugin_tag,
-                        route_id = %route.id,
-                        dst = %route.dst_address,
+                        route_id = %duplicate.id,
+                        dst = %duplicate.dst_address,
                         err = %error,
                         "ros_route failed to remove duplicate owned route"
                     );
                     first_error.get_or_insert(error);
                 }
-                continue;
             }
+            seen_keys.insert(key.clone());
+
+            let family = key.family();
+            let ip = key.ip;
+            let prefix = key.prefix;
+            let recovered_expiry = self.recovered_expiry(&meta);
             let persistent_residue = meta.kind == RouteCommentKind::Persistent;
+            let foreign_conflict = foreign_keys.contains(&key);
 
             if let Some(existing) = self.routes.get_mut(&key) {
                 existing.router_id = Some(route.id.clone());
@@ -1543,9 +1621,9 @@ impl RouteManager {
                         continue;
                     }
                     existing.comment_domain = meta.comment_domain.clone();
-                    existing.expires_at_unix = meta.expires_at_unix;
+                    existing.expires_at_unix = recovered_expiry;
                     existing.last_refresh_unix = meta.last_refresh_unix;
-                    existing.sync_state = if meta.expires_at_unix <= now || persistent_residue {
+                    existing.sync_state = if recovered_expiry <= now || persistent_residue {
                         SyncState::PendingDelete
                     } else {
                         SyncState::Synced
@@ -1562,7 +1640,12 @@ impl RouteManager {
                         existing,
                     );
                     let comment_drift = route.comment.as_deref() != Some(expected_comment.as_str());
-                    if gateway_drift || distance_drift || comment_drift || disabled_drift {
+                    if gateway_drift
+                        || distance_drift
+                        || comment_drift
+                        || disabled_drift
+                        || foreign_conflict
+                    {
                         existing.sync_state = SyncState::Dirty;
                     }
                 } else {
@@ -1579,6 +1662,7 @@ impl RouteManager {
                         || distance_drift
                         || comment_drift
                         || disabled_drift
+                        || foreign_conflict
                         || matches!(existing.sync_state, SyncState::PendingCreate)
                     {
                         existing.sync_state = SyncState::Dirty;
@@ -1590,7 +1674,7 @@ impl RouteManager {
             let Some(gateway) = self.gateway_for(family).map(str::to_string) else {
                 continue;
             };
-            let expired = meta.expires_at_unix <= now;
+            let expired = recovered_expiry <= now;
             let recover_dynamic_binding = !expired
                 && !persistent_residue
                 && !meta.comment_domain.is_empty()
@@ -1599,7 +1683,7 @@ impl RouteManager {
             let mut domain_expiries = AHashMap::new();
             if recover_dynamic_binding {
                 domains.insert(meta.comment_domain.clone());
-                domain_expiries.insert(meta.comment_domain.clone(), meta.expires_at_unix);
+                domain_expiries.insert(meta.comment_domain.clone(), recovered_expiry);
             }
             let mut entry = RouteEntry {
                 key: key.clone(),
@@ -1609,7 +1693,7 @@ impl RouteManager {
                 comment_domain: meta.comment_domain.clone(),
                 domain_expiries,
                 ref_count: u32::from(recover_dynamic_binding),
-                expires_at_unix: meta.expires_at_unix,
+                expires_at_unix: recovered_expiry,
                 last_refresh_unix: meta.last_refresh_unix,
                 synced_expires_at_unix: Some(meta.expires_at_unix),
                 router_id: Some(route.id.clone()),
@@ -1630,7 +1714,12 @@ impl RouteManager {
                     &entry,
                 );
                 let comment_drift = route.comment.as_deref() != Some(expected_comment.as_str());
-                if gateway_drift || distance_drift || comment_drift || disabled_drift {
+                if gateway_drift
+                    || distance_drift
+                    || comment_drift
+                    || disabled_drift
+                    || foreign_conflict
+                {
                     entry.sync_state = SyncState::Dirty;
                 }
             }
@@ -1639,7 +1728,7 @@ impl RouteManager {
                 self.recover_domain_binding(
                     meta.comment_domain,
                     ip,
-                    meta.expires_at_unix,
+                    recovered_expiry,
                     meta.last_refresh_unix,
                 );
             }
@@ -2035,13 +2124,30 @@ mod tests {
             _gateway: &str,
             _distance: u8,
             _comment: &str,
-            _comment_prefix: &str,
-            _plugin_tag: &str,
+            comment_prefix: &str,
+            plugin_tag: &str,
         ) -> Result<String> {
             let mut state = self.state.lock().expect("mock lock");
             state.upsert_attempts.push(key.ip);
             if state.fail_upserts.contains(&key.ip) {
                 return Err(DnsError::plugin("mock upsert failure"));
+            }
+            let has_foreign_duplicate = state.routes.iter().any(|route| {
+                route.dst_address == key.dst_address()
+                    && route.routing_table == key.table
+                    && !matches!(
+                        RouteCommentCodec::decode(
+                            comment_prefix,
+                            plugin_tag,
+                            route.family,
+                            &route.dst_address,
+                            route.comment.as_deref().unwrap_or_default(),
+                        ),
+                        Ok(Some(_))
+                    )
+            });
+            if has_foreign_duplicate {
+                return Err(DnsError::plugin("mock foreign route conflict"));
             }
             Ok(format!("*{}", key.ip))
         }
@@ -2766,6 +2872,117 @@ mod tests {
         assert_eq!(state.routes.len(), 1);
         assert_eq!(state.routes[0].id, "*primary");
         assert_eq!(manager.routes[&key].router_id.as_deref(), Some("*primary"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_prefers_live_owned_duplicate() {
+        AppClock::start();
+        let now = unix_now();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 29));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let route = |id: &str, expires_at: u64, seen: u64| RouterRoute {
+            id: id.to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: format!("{ip}/32"),
+            routing_table: "via_proxy".to_string(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(format!(
+                "fdns;pg=route-test;kind=dynamic;dm=duplicate.example.;exp={expires_at};seen={seen}"
+            )),
+            disabled: false,
+        };
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![
+                route("*expired", now.saturating_sub(1), now.saturating_sub(600)),
+                route("*live", now + 300, now),
+            ],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        let state = api.state.lock().expect("mock lock");
+        assert_eq!(state.deleted_ids, vec!["*expired".to_string()]);
+        assert_eq!(state.routes.len(), 1);
+        assert_eq!(state.routes[0].id, "*live");
+        assert_eq!(manager.routes[&key].router_id.as_deref(), Some("*live"));
+        assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn reconcile_detects_foreign_duplicate_for_synced_owned_route() {
+        AppClock::start();
+        let now = unix_now();
+        let expires_at = now + 300;
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 30));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let route = |id: &str, comment: &str| RouterRoute {
+            id: id.to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: format!("{ip}/32"),
+            routing_table: "via_proxy".to_string(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(comment.to_string()),
+            disabled: false,
+        };
+        let owned_comment = format!(
+            "fdns;pg=route-test;kind=dynamic;dm=conflict.example.;exp={expires_at};seen={now}"
+        );
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![
+                route("*owned", &owned_comment),
+                route("*foreign", "operator-managed"),
+            ],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        assert!(manager.reconcile_from_router().await.is_err());
+
+        assert_eq!(manager.routes[&key].sync_state, SyncState::Dirty);
+        assert_eq!(
+            api.state.lock().expect("mock lock").upsert_attempts,
+            vec![ip]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_caps_recovered_timeless_route_to_current_ttl_policy() {
+        AppClock::start();
+        let now = unix_now();
+        let seen = now.saturating_sub(100);
+        let expected_expiry = seen + 300;
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![RouterRoute {
+                id: "*timeless".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: format!("{ip}/32"),
+                routing_table: "via_proxy".to_string(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(format!(
+                    "fdns;pg=route-test;kind=dynamic;dm=timeless.example.;exp={};seen={seen}",
+                    u64::MAX
+                )),
+                disabled: false,
+            }],
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        assert_eq!(manager.routes[&key].expires_at_unix, expected_expiry);
+        assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
+        assert_eq!(
+            api.state.lock().expect("mock lock").upsert_attempts,
+            vec![ip]
+        );
     }
 
     #[tokio::test]

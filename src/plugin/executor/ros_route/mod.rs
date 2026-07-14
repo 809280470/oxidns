@@ -45,6 +45,7 @@ use tracing::warn;
 
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
+use crate::core::response::{ResponseDisposition, classify_response};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
@@ -52,7 +53,7 @@ use crate::infra::observability::metrics::{
 };
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
-use crate::proto::{Rcode, RecordType};
+use crate::proto::{Message, Question, Rcode, RecordType};
 use crate::{continue_next, plugin_factory};
 
 const DEFAULT_MIN_TTL: u32 = 60;
@@ -62,6 +63,7 @@ const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
 const DEFAULT_ROUTE_DISTANCE: u8 = 100;
 const DEFAULT_COMMENT_PREFIX: &str = "fdns";
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
+const MAX_CNAME_OBSERVATION_HOPS: usize = 16;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -657,7 +659,13 @@ fn extract_observation(
 
     let response = context.response()?;
     match response.rcode() {
-        Rcode::NoError => {}
+        Rcode::NoError => match classify_response(response, Some(question)) {
+            ResponseDisposition::CompletePositive => {}
+            ResponseDisposition::DefinitiveNegative(_) => {
+                return Some((domain, scope, Vec::new()));
+            }
+            ResponseDisposition::IncompleteAlias | ResponseDisposition::Other => return None,
+        },
         // NXDOMAIN is authoritative for the name, not only the queried record
         // type, so withdraw both address families. This is essential when
         // fixed_ttl=0 because no time-based cleanup will happen later.
@@ -665,33 +673,86 @@ fn extract_observation(
         _ => return None,
     }
 
-    // Collapse duplicated A/AAAA answers by IP and keep max TTL per IP.
-    let mut dedup = AHashMap::<IpAddr, u32>::new();
-    for answer in response.answers() {
-        let Some(ip) = answer.ip_addr() else {
-            continue;
-        };
-        if !scope.contains(ip) {
-            continue;
-        }
-        let ttl_secs = answer.ttl();
-        match ip {
-            IpAddr::V4(_) if config.gateway4.is_none() => continue,
-            IpAddr::V6(_) if config.gateway6.is_none() => continue,
-            _ => {}
+    extract_address_observations(response, question, scope, config)
+        .map(|addrs| (domain, scope, addrs))
+}
+
+fn extract_address_observations(
+    response: &Message,
+    question: &Question,
+    scope: ObservationScope,
+    config: &MikrotikConfig,
+) -> Option<Vec<ObservedAddr>> {
+    let mut current = question.name();
+    let mut cname_ttl = u32::MAX;
+    let mut saw_alias = false;
+
+    for hop in 0..=MAX_CNAME_OBSERVATION_HOPS {
+        // Collapse duplicated terminal A/AAAA answers by IP and keep the
+        // largest effective TTL. Every address is capped by all preceding
+        // CNAME records so the route cannot outlive the alias chain.
+        let mut dedup = AHashMap::<IpAddr, u32>::new();
+        let mut next_name = None;
+        let mut next_ttl = u32::MAX;
+        let mut conflicting_alias = false;
+
+        for answer in response.answers() {
+            if answer.name() != current || answer.class() != question.qclass() {
+                continue;
+            }
+
+            if let Some(ip) = answer.ip_addr()
+                && scope.contains(ip)
+            {
+                let family_enabled = match ip {
+                    IpAddr::V4(_) => config.gateway4.is_some(),
+                    IpAddr::V6(_) => config.gateway6.is_some(),
+                };
+                if family_enabled {
+                    let ttl_secs = answer.ttl().min(cname_ttl);
+                    dedup
+                        .entry(ip)
+                        .and_modify(|ttl| *ttl = (*ttl).max(ttl_secs))
+                        .or_insert(ttl_secs);
+                }
+                continue;
+            }
+
+            let Some(target) = answer.cname_target() else {
+                continue;
+            };
+            if let Some(existing) = next_name {
+                conflicting_alias |= existing != target;
+            } else {
+                next_name = Some(target);
+            }
+            next_ttl = next_ttl.min(answer.ttl());
         }
 
-        dedup
-            .entry(ip)
-            .and_modify(|ttl| *ttl = (*ttl).max(ttl_secs))
-            .or_insert(ttl_secs);
+        if !dedup.is_empty() {
+            return Some(
+                dedup
+                    .into_iter()
+                    .map(|(addr, ttl_secs)| ObservedAddr { addr, ttl_secs })
+                    .collect(),
+            );
+        }
+        if conflicting_alias {
+            return None;
+        }
+        let Some(target) = next_name else {
+            return if saw_alias { None } else { Some(Vec::new()) };
+        };
+        if hop == MAX_CNAME_OBSERVATION_HOPS || target == current {
+            return None;
+        }
+
+        saw_alias = true;
+        cname_ttl = cname_ttl.min(next_ttl);
+        current = target;
     }
 
-    let addrs = dedup
-        .into_iter()
-        .map(|(addr, ttl_secs)| ObservedAddr { addr, ttl_secs })
-        .collect::<Vec<_>>();
-    Some((domain, scope, addrs))
+    None
 }
 
 fn parse_plugin_config(args: Option<Value>, emit_warnings: bool) -> Result<MikrotikConfig> {
@@ -1027,7 +1088,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::proto::{DNSClass, Message, Name, Question};
+    use crate::proto::rdata::{A, CNAME};
+    use crate::proto::{DNSClass, Message, Name, Question, RData, Record};
 
     fn observation_config() -> MikrotikConfig {
         let args = serde_yaml_ng::from_str::<Value>(
@@ -1108,6 +1170,42 @@ routing_table: "policy"
             extract_observation(&mut a_context, &config).expect("A NODATA observation");
         assert_eq!(scope, ObservationScope::Ipv4);
         assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn observation_ttl_is_capped_by_cname_chain() {
+        let config = observation_config();
+        let mut context = context_with_rcode(RecordType::A, Rcode::NoError);
+        let response = context.response_mut().expect("response");
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").expect("owner"),
+            30,
+            RData::CNAME(CNAME(
+                Name::from_ascii("edge.example.com.").expect("target"),
+            )),
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("edge.example.com.").expect("owner"),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 27))),
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("unrelated.example.com.").expect("owner"),
+            600,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 28))),
+        ));
+
+        let (_, scope, addrs) =
+            extract_observation(&mut context, &config).expect("CNAME observation");
+
+        assert_eq!(scope, ObservationScope::Ipv4);
+        assert_eq!(
+            addrs,
+            vec![ObservedAddr {
+                addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 27)),
+                ttl_secs: 30,
+            }]
+        );
     }
 
     #[test]
