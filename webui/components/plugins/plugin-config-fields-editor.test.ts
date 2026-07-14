@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { matcherPluginDefinitions } from "@/lib/plugin-definitions/matcher";
 import { executorPluginDefinitions } from "@/lib/plugin-definitions/executor";
+import { getLocalizedPluginKindDefinition } from "@/lib/plugin-definitions";
 
 import {
   createDefaultPluginConfigValues,
@@ -174,5 +175,39 @@ describe("item option arrays", () => {
     expect(
       serializePluginConfigValues(qnameDefinition.configSchema, values),
     ).toEqual(values);
+  });
+});
+
+describe("time matcher localization", () => {
+  it("uses legacy weekday aliases to localize ISO weekday values", () => {
+    const localizedDefinition = getLocalizedPluginKindDefinition(
+      "time",
+      "en-US",
+    );
+    const localizedPeriods = localizedDefinition?.configSchema.find(
+      (field) => field.key === "periods",
+    );
+
+    if (!localizedPeriods?.item || localizedPeriods.item.type !== "object") {
+      throw new Error(
+        "localized time matcher periods must use an object schema",
+      );
+    }
+
+    const weekdays = localizedPeriods.item.fields.find(
+      (field) => field.key === "weekdays",
+    );
+
+    expect(
+      weekdays?.item && "options" in weekdays.item ? weekdays.item.options : [],
+    ).toEqual([
+      { label: "Monday", value: 1, aliases: ["mon"] },
+      { label: "Tuesday", value: 2, aliases: ["tue"] },
+      { label: "Wednesday", value: 3, aliases: ["wed"] },
+      { label: "Thursday", value: 4, aliases: ["thu"] },
+      { label: "Friday", value: 5, aliases: ["fri"] },
+      { label: "Saturday", value: 6, aliases: ["sat"] },
+      { label: "Sunday", value: 7, aliases: ["sun"] },
+    ]);
   });
 });
