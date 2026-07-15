@@ -118,14 +118,9 @@ impl RouteFamily {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(super) struct DomainBinding {
-    /// Normalized domain name.
-    pub(super) domain: String,
-    /// Active IP set observed for this domain.
-    pub(super) ips: AHashSet<IpAddr>,
-    /// Per-IP expiry timestamp for this domain.
+    /// Active IP set and its per-IP expiry timestamps for this domain.
     pub(super) ip_expiries: AHashMap<IpAddr, u64>,
     /// Max expiry among `ip_expiries`.
     pub(super) expires_at_unix: u64,
@@ -197,21 +192,15 @@ pub(super) enum SyncState {
 
 #[derive(Debug, Clone)]
 pub(super) struct RouteEntry {
-    /// Unique key of the managed route.
-    pub(super) key: RouteKey,
     /// Gateway string written to RouterOS.
     pub(super) gateway: String,
     /// Route distance written to RouterOS.
     pub(super) distance: u8,
-    /// Domain set currently referencing this route.
-    pub(super) domains: AHashSet<String>,
     /// Comment `dm` field, using the first observed active domain when
     /// available.
     pub(super) comment_domain: String,
     /// Per-domain expiry timestamps for ref-count and max-exp calculations.
     pub(super) domain_expiries: AHashMap<String, u64>,
-    /// Current dynamic DNS reference count from `domains`.
-    pub(super) ref_count: u32,
     /// Whether this route is explicitly configured through `persistent_route`.
     /// Kept outside `domains` so no real qname can collide with internal state.
     pub(super) persistent: bool,
@@ -234,7 +223,12 @@ pub(super) struct RouteEntry {
 impl RouteEntry {
     #[inline]
     fn has_owners(&self) -> bool {
-        self.persistent || self.ref_count > 0
+        self.persistent || !self.domain_expiries.is_empty() || self.recovered_ownership_incomplete
+    }
+
+    #[inline]
+    fn has_dynamic_ownership(&self) -> bool {
+        !self.domain_expiries.is_empty() || self.recovered_ownership_incomplete
     }
 }
 
@@ -257,7 +251,7 @@ pub(super) enum RouteCommentKind {
 
 impl RouteCommentKind {
     fn for_route(route: &RouteEntry) -> Self {
-        match (route.persistent, route.ref_count > 0) {
+        match (route.persistent, route.has_dynamic_ownership()) {
             (true, true) => Self::Mixed,
             (true, false) => Self::Persistent,
             (false, _) => Self::Dynamic,
@@ -342,22 +336,35 @@ impl RouteCommentCodec {
             }
         }
 
-        let mut kv = AHashMap::new();
+        let mut owner = None;
+        let mut kind = None;
+        let mut encoded_domain = None;
+        let mut expiry = None;
+        let mut seen = None;
         for token in comment.split(';') {
             let token = token.trim();
             if token.is_empty() {
                 continue;
             }
-            if let Some((k, v)) = token.split_once('=') {
-                kv.insert(k.trim().to_string(), v.trim().to_string());
+            let Some((key, value)) = token.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                COMMENT_FIELD_PLUGIN => owner = Some(value),
+                COMMENT_FIELD_KIND => kind = Some(value),
+                COMMENT_FIELD_DOMAIN => encoded_domain = Some(value),
+                COMMENT_FIELD_EXP => expiry = Some(value),
+                COMMENT_FIELD_SEEN => seen = Some(value),
+                _ => {}
             }
         }
 
-        if kv.get(COMMENT_FIELD_PLUGIN).map(String::as_str) != Some(plugin_tag) {
+        if owner != Some(plugin_tag) {
             return Ok(None);
         }
 
-        let kind = match kv.get(COMMENT_FIELD_KIND).map(String::as_str) {
+        let kind = match kind {
             Some(COMMENT_KIND_DYNAMIC) => RouteCommentKind::Dynamic,
             Some(COMMENT_KIND_PERSISTENT) => RouteCommentKind::Persistent,
             Some(COMMENT_KIND_MIXED) => RouteCommentKind::Mixed,
@@ -386,19 +393,16 @@ impl RouteCommentCodec {
             )));
         }
 
-        let encoded_comment_domain = kv
-            .get(COMMENT_FIELD_DOMAIN)
+        let encoded_comment_domain = encoded_domain
             .ok_or_else(|| DnsError::plugin("ros_route comment decode failed: missing dm field"))?;
         let comment_domain = decode_comment_value(encoded_comment_domain)?;
-        let expires_at_unix = kv
-            .get(COMMENT_FIELD_EXP)
+        let expires_at_unix = expiry
             .ok_or_else(|| DnsError::plugin("ros_route comment decode failed: missing exp field"))?
             .parse::<u64>()
             .map_err(|e| {
                 DnsError::plugin(format!("ros_route comment decode failed: invalid exp: {e}"))
             })?;
-        let last_refresh_unix = kv
-            .get(COMMENT_FIELD_SEEN)
+        let last_refresh_unix = seen
             .ok_or_else(|| DnsError::plugin("ros_route comment decode failed: missing seen field"))?
             .parse::<u64>()
             .map_err(|e| {
@@ -841,6 +845,19 @@ pub(super) struct PersistentReloadConfig {
     pub(super) gateway6_enabled: bool,
 }
 
+fn submit_persistent_reload_if_changed(
+    handle: &RouteManagerHandle,
+    last_loaded: &mut AHashSet<String>,
+    desired: AHashSet<String>,
+) -> bool {
+    if desired == *last_loaded || !handle.update_persistent_ips(desired.clone()) {
+        return false;
+    }
+    *last_loaded = desired;
+    handle.request_reconcile();
+    true
+}
+
 #[derive(Debug)]
 pub(super) struct RouteManagerRuntime {
     handle: RouteManagerHandle,
@@ -938,22 +955,11 @@ impl RouteManagerRuntime {
                                 desired_ips.extend(file_ips);
 
                                 let mut last_loaded_guard = last_loaded_ips.lock().await;
-                                let manager_available = if desired_ips != *last_loaded_guard {
-                                    if maintain_handle.update_persistent_ips(desired_ips.clone()) {
-                                        *last_loaded_guard = desired_ips;
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    true
-                                };
-
-                                // Dedicated tick keeps persistent routes self-healed
-                                // without requiring new DNS observations.
-                                if manager_available {
-                                    maintain_handle.request_reconcile();
-                                }
+                                submit_persistent_reload_if_changed(
+                                    &maintain_handle,
+                                    &mut last_loaded_guard,
+                                    desired_ips,
+                                );
                             }
                             Err(e) => {
                                 warn!(
@@ -1281,7 +1287,10 @@ impl RouteManager {
                     entry.distance = self.cfg.distance;
                     changed = true;
                 }
-                if entry.domains.is_empty() && entry.comment_domain != PERSISTENT_COMMENT_DOMAIN {
+                if entry.domain_expiries.is_empty()
+                    && !entry.recovered_ownership_incomplete
+                    && entry.comment_domain != PERSISTENT_COMMENT_DOMAIN
+                {
                     entry.comment_domain = PERSISTENT_COMMENT_DOMAIN.to_string();
                     changed = true;
                 }
@@ -1310,13 +1319,10 @@ impl RouteManager {
             self.routes.insert(
                 key.clone(),
                 RouteEntry {
-                    key,
                     gateway,
                     distance: self.cfg.distance,
-                    domains: AHashSet::new(),
                     comment_domain: PERSISTENT_COMMENT_DOMAIN.to_string(),
                     domain_expiries: AHashMap::new(),
-                    ref_count: 0,
                     persistent: true,
                     expires_at_unix: PERSISTENT_EXPIRES_AT_UNIX,
                     last_refresh_unix: now,
@@ -1351,10 +1357,10 @@ impl RouteManager {
             entry.persistent = false;
             entry.last_refresh_unix = now;
             if entry.comment_domain == PERSISTENT_COMMENT_DOMAIN {
-                entry.comment_domain = select_comment_domain(&entry.domains, false);
+                entry.comment_domain = select_comment_domain(&entry.domain_expiries, false);
             }
 
-            if entry.ref_count == 0 {
+            if !entry.has_dynamic_ownership() {
                 entry.expires_at_unix = now;
                 entry.sync_state = SyncState::PendingDelete;
             } else {
@@ -1413,20 +1419,17 @@ impl RouteManager {
             return Vec::new();
         }
         let mut binding = existing_binding.unwrap_or_else(|| DomainBinding {
-            domain: domain.clone(),
-            ips: AHashSet::new(),
             ip_expiries: AHashMap::new(),
             expires_at_unix: 0,
             last_refresh_unix: now,
         });
         let removed_ips = binding
-            .ips
-            .iter()
+            .ip_expiries
+            .keys()
             .filter(|ip| replace_scope.contains(**ip) && !dedup_expiries.contains_key(ip))
             .copied()
             .collect::<Vec<_>>();
         for ip in &removed_ips {
-            binding.ips.remove(ip);
             binding.ip_expiries.remove(ip);
         }
         for ip in removed_ips {
@@ -1438,11 +1441,9 @@ impl RouteManager {
         let mut capacity_dropped = 0usize;
         for (ip, expiry) in &dedup_expiries {
             if let Some(key) = self.attach_or_refresh_route(&domain, *ip, *expiry, now) {
-                binding.ips.insert(*ip);
                 binding.ip_expiries.insert(*ip, *expiry);
                 touched_keys.insert(key);
             } else {
-                binding.ips.remove(ip);
                 binding.ip_expiries.remove(ip);
                 capacity_dropped = capacity_dropped.saturating_add(1);
             }
@@ -1457,7 +1458,7 @@ impl RouteManager {
             );
         }
 
-        if !binding.ips.is_empty() {
+        if !binding.ip_expiries.is_empty() {
             binding.expires_at_unix = binding.ip_expiries.values().copied().max().unwrap_or(now);
             binding.last_refresh_unix = now;
             self.domain_bindings.insert(domain, binding);
@@ -1660,18 +1661,18 @@ impl RouteManager {
                 return None;
             }
             let was_pending_delete = matches!(entry.sync_state, SyncState::PendingDelete);
-            let inserted = entry.domains.insert(domain.to_string());
+            let was_empty = entry.domain_expiries.is_empty();
+            let inserted = entry
+                .domain_expiries
+                .insert(domain.to_string(), expires_at)
+                .is_none();
             let comment_domain_changed = inserted
-                && (entry.ref_count == 0
+                && (was_empty
                     || entry.comment_domain.is_empty()
                     || entry.comment_domain == PERSISTENT_COMMENT_DOMAIN);
             if comment_domain_changed {
                 entry.comment_domain = domain.to_string();
             }
-            if inserted {
-                entry.ref_count = entry.ref_count.saturating_add(1);
-            }
-            entry.domain_expiries.insert(domain.to_string(), expires_at);
             let known_expiry = entry
                 .domain_expiries
                 .values()
@@ -1707,21 +1708,16 @@ impl RouteManager {
 
         let family = RouteFamily::from_ip(ip);
         let gateway = self.gateway_for(family).map(str::to_string)?;
-        let mut domains = AHashSet::new();
-        domains.insert(domain.to_string());
         let mut domain_expiries = AHashMap::new();
         domain_expiries.insert(domain.to_string(), expires_at);
 
         self.routes.insert(
             key.clone(),
             RouteEntry {
-                key: key.clone(),
                 gateway,
                 distance: self.cfg.distance,
-                domains,
                 comment_domain: domain.to_string(),
                 domain_expiries,
-                ref_count: 1,
                 persistent: false,
                 expires_at_unix: expires_at,
                 last_refresh_unix: now,
@@ -1747,16 +1743,15 @@ impl RouteManager {
         let key = RouteKey::new(ip, self.cfg.routing_table.clone());
         let entry = self.routes.get_mut(&key)?;
 
-        if !entry.domains.remove(domain) {
+        if !entry.domain_expiries.contains_key(domain) {
             return None;
         }
 
         let preserve_recovered_route = entry.recovered_ownership_incomplete
-            && entry.ref_count == 1
+            && entry.domain_expiries.len() == 1
             && entry.expires_at_unix != u64::MAX
             && entry.expires_at_unix > now;
         entry.domain_expiries.remove(domain);
-        entry.ref_count = entry.ref_count.saturating_sub(1);
         if preserve_recovered_route {
             // A RouterOS comment stores only one representative qname. After a
             // restart, withdrawing that qname is not proof that no other
@@ -1767,10 +1762,10 @@ impl RouteManager {
 
         entry.last_refresh_unix = now;
         if entry.comment_domain == domain || entry.comment_domain.is_empty() {
-            entry.comment_domain = select_comment_domain(&entry.domains, entry.persistent);
+            entry.comment_domain = select_comment_domain(&entry.domain_expiries, entry.persistent);
         }
 
-        if entry.ref_count == 0 {
+        if entry.domain_expiries.is_empty() && !entry.recovered_ownership_incomplete {
             if entry.persistent {
                 entry.comment_domain = PERSISTENT_COMMENT_DOMAIN.to_string();
                 entry.expires_at_unix = PERSISTENT_EXPIRES_AT_UNIX;
@@ -1805,7 +1800,7 @@ impl RouteManager {
 
             if let Some(binding) = self.domain_bindings.get_mut(&domain) {
                 if binding.expires_at_unix <= now {
-                    to_remove.extend(binding.ips.iter().copied());
+                    to_remove.extend(binding.ip_expiries.keys().copied());
                 } else {
                     for (ip, exp) in &binding.ip_expiries {
                         if *exp <= now {
@@ -1815,11 +1810,10 @@ impl RouteManager {
                 }
 
                 for ip in &to_remove {
-                    binding.ips.remove(ip);
                     binding.ip_expiries.remove(ip);
                 }
                 binding.expires_at_unix = binding.ip_expiries.values().copied().max().unwrap_or(0);
-                remove_binding = binding.ips.is_empty();
+                remove_binding = binding.ip_expiries.is_empty();
             }
 
             for ip in &to_remove {
@@ -1842,7 +1836,7 @@ impl RouteManager {
                 }
                 continue;
             }
-            if route.ref_count == 0 {
+            if route.domain_expiries.is_empty() {
                 if route.expires_at_unix <= now {
                     route.sync_state = SyncState::PendingDelete;
                 }
@@ -1890,13 +1884,10 @@ impl RouteManager {
             .domain_bindings
             .entry(domain.clone())
             .or_insert_with(|| DomainBinding {
-                domain,
-                ips: AHashSet::new(),
                 ip_expiries: AHashMap::new(),
                 expires_at_unix,
                 last_refresh_unix,
             });
-        binding.ips.insert(ip);
         binding.ip_expiries.insert(ip, expires_at_unix);
         binding.expires_at_unix = binding
             .ip_expiries
@@ -1943,7 +1934,7 @@ impl RouteManager {
                     pending_upserts.push((key, entry_snapshot, comment));
                 }
                 SyncState::PendingDelete => {
-                    pending_deletes.push(entry_snapshot.key);
+                    pending_deletes.push(key);
                 }
                 _ => {}
             }
@@ -1953,16 +1944,18 @@ impl RouteManager {
         let prefix = self.cfg.comment_prefix.as_str();
         let plugin_tag = self.cfg.plugin_tag.as_str();
         let results = join_all_bounded(
-            pending_upserts.iter().map(|(_, entry_snapshot, comment)| {
-                api.upsert_host_route(
-                    &entry_snapshot.key,
-                    &entry_snapshot.gateway,
-                    entry_snapshot.distance,
-                    comment,
-                    prefix,
-                    plugin_tag,
-                )
-            }),
+            pending_upserts
+                .iter()
+                .map(|(key, entry_snapshot, comment)| {
+                    api.upsert_host_route(
+                        key,
+                        &entry_snapshot.gateway,
+                        entry_snapshot.distance,
+                        comment,
+                        prefix,
+                        plugin_tag,
+                    )
+                }),
             UPSERT_PIPELINE_SIZE,
         )
         .await;
@@ -2363,9 +2356,6 @@ impl RouteManager {
                     }
                 } else {
                     if recover_dynamic_binding && dynamic_binding_capacity {
-                        if existing.domains.insert(meta.comment_domain.clone()) {
-                            existing.ref_count = existing.ref_count.saturating_add(1);
-                        }
                         existing
                             .domain_expiries
                             .insert(meta.comment_domain.clone(), recovered_expiry);
@@ -2423,20 +2413,15 @@ impl RouteManager {
                 );
                 continue;
             }
-            let mut domains = AHashSet::new();
             let mut domain_expiries = AHashMap::new();
             if recover_dynamic_binding {
-                domains.insert(meta.comment_domain.clone());
                 domain_expiries.insert(meta.comment_domain.clone(), recovered_expiry);
             }
             let mut entry = RouteEntry {
-                key: key.clone(),
                 gateway,
                 distance: self.cfg.distance,
-                domains,
                 comment_domain: meta.comment_domain.clone(),
                 domain_expiries,
-                ref_count: u32::from(recover_dynamic_binding),
                 persistent: false,
                 expires_at_unix: recovered_expiry,
                 last_refresh_unix: meta.last_refresh_unix,
@@ -2750,8 +2735,8 @@ fn validation_comment(prefix: &str, plugin_tag: &str, _family: RouteFamily, nonc
     out
 }
 
-fn select_comment_domain(domains: &AHashSet<String>, persistent: bool) -> String {
-    domains.iter().min().cloned().unwrap_or_else(|| {
+fn select_comment_domain(domain_expiries: &AHashMap<String, u64>, persistent: bool) -> String {
+    domain_expiries.keys().min().cloned().unwrap_or_else(|| {
         if persistent {
             PERSISTENT_COMMENT_DOMAIN.to_string()
         } else {
@@ -3122,6 +3107,35 @@ mod tests {
         };
         assert_eq!(ips, AHashSet::from_iter(["192.0.2.11/32".to_string()]));
     }
+
+    #[test]
+    fn unchanged_persistent_reload_submits_no_control_work() {
+        let handle = RouteManagerHandle::new_for_test();
+        let mut last = AHashSet::from_iter(["192.0.2.10/32".to_string()]);
+        assert!(!submit_persistent_reload_if_changed(
+            &handle,
+            &mut last,
+            AHashSet::from_iter(["192.0.2.10/32".to_string()]),
+        ));
+        assert!(handle.controls.try_recv().is_none());
+
+        assert!(submit_persistent_reload_if_changed(
+            &handle,
+            &mut last,
+            AHashSet::from_iter(["192.0.2.11/32".to_string()]),
+        ));
+        assert!(matches!(
+            handle.controls.try_recv(),
+            Some((
+                ControlKey::UpdatePersistentIps,
+                ControlCommand::UpdatePersistentIps { .. }
+            ))
+        ));
+        assert!(matches!(
+            handle.controls.try_recv(),
+            Some((ControlKey::Reconcile, ControlCommand::Reconcile))
+        ));
+    }
     #[derive(Debug)]
     struct NoopApi;
 
@@ -3432,11 +3446,16 @@ mod tests {
 
         assert_eq!(manager.routes.len(), 2);
         assert_eq!(manager.domain_bindings.len(), 1);
-        assert_eq!(manager.domain_bindings["capacity.example."].ips.len(), 2);
+        assert_eq!(
+            manager.domain_bindings["capacity.example."]
+                .ip_expiries
+                .len(),
+            2
+        );
 
         let shared_ip = *manager.domain_bindings["capacity.example."]
-            .ips
-            .iter()
+            .ip_expiries
+            .keys()
             .next()
             .expect("one admitted route");
         manager.apply_observation(
@@ -3461,9 +3480,97 @@ mod tests {
         assert_eq!(manager.domain_bindings.len(), 2);
         assert!(!manager.domain_bindings.contains_key("third.example."));
         assert_eq!(
-            manager.routes[&RouteKey::new(shared_ip, "via_proxy".to_string())].ref_count,
+            manager.routes[&RouteKey::new(shared_ip, "via_proxy".to_string())]
+                .domain_expiries
+                .len(),
             2
         );
+    }
+
+    #[test]
+    fn persistent_routes_do_not_consume_dynamic_capacity() {
+        let mut config = manager_config(Some(300));
+        config.max_entries = 1;
+        config.persistent_ips =
+            AHashSet::from_iter(["192.0.2.10/32".to_string(), "192.0.2.11/32".to_string()]);
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        manager.ensure_persistent_routes(100);
+        manager.apply_observation(
+            "dynamic.example.".to_string(),
+            ObservationScope::Ipv4,
+            vec![
+                ObservedAddr {
+                    addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                    ttl_secs: 300,
+                },
+                ObservedAddr {
+                    addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+                    ttl_secs: 300,
+                },
+            ],
+            100,
+        );
+
+        assert_eq!(manager.routes.len(), 3);
+        assert_eq!(manager.dynamic_route_count(), 1);
+    }
+
+    fn assert_manager_state_consistent(manager: &RouteManager) {
+        for (domain, binding) in &manager.domain_bindings {
+            assert!(!binding.ip_expiries.is_empty());
+            assert_eq!(
+                binding.expires_at_unix,
+                binding.ip_expiries.values().copied().max().unwrap()
+            );
+            for (ip, expiry) in &binding.ip_expiries {
+                let key = RouteKey::new(*ip, manager.cfg.routing_table.clone());
+                let route = manager.routes.get(&key).expect("binding route");
+                assert_eq!(route.domain_expiries.get(domain), Some(expiry));
+            }
+        }
+        for (key, route) in &manager.routes {
+            for (domain, expiry) in &route.domain_expiries {
+                let binding = manager.domain_bindings.get(domain).expect("route binding");
+                assert_eq!(binding.ip_expiries.get(&key.ip), Some(expiry));
+            }
+            if let Some(max_expiry) = route.domain_expiries.values().copied().max() {
+                if route.persistent {
+                    assert_eq!(route.expires_at_unix, PERSISTENT_EXPIRES_AT_UNIX);
+                } else if route.recovered_ownership_incomplete {
+                    assert!(route.expires_at_unix >= max_expiry);
+                } else {
+                    assert_eq!(route.expires_at_unix, max_expiry);
+                }
+                if !route.recovered_ownership_incomplete {
+                    assert!(route.domain_expiries.contains_key(&route.comment_domain));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_observation_sequence_preserves_state_invariants() {
+        let mut config = manager_config(None);
+        config.max_entries = 64;
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        for index in 0..10_000u64 {
+            let domain = format!("state-{}.example.", index % 8);
+            let addrs = if index % 5 == 0 {
+                Vec::new()
+            } else {
+                vec![ObservedAddr {
+                    addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, (index % 16 + 1) as u8)),
+                    ttl_secs: 60 + (index % 240) as u32,
+                }]
+            };
+            manager.apply_observation(domain, ObservationScope::Ipv4, addrs, 100 + index);
+            if index % 17 == 0 {
+                manager.prune_expired_local_state(100 + index);
+            }
+            assert_manager_state_consistent(&manager);
+        }
+        manager.prune_expired_local_state(20_000);
+        assert_manager_state_consistent(&manager);
     }
 
     #[test]
@@ -3533,15 +3640,12 @@ mod tests {
         }
     }
 
-    fn pending_delete_entry(key: RouteKey, route_id: &str) -> RouteEntry {
+    fn pending_delete_entry(_key: RouteKey, route_id: &str) -> RouteEntry {
         RouteEntry {
-            key,
             gateway: "192.0.2.1".to_string(),
             distance: 100,
-            domains: AHashSet::new(),
             comment_domain: String::new(),
             domain_expiries: AHashMap::new(),
-            ref_count: 0,
             persistent: false,
             expires_at_unix: 100,
             last_refresh_unix: 100,
@@ -3595,16 +3699,11 @@ mod tests {
     #[test]
     fn comment_codec_escapes_domain_field_delimiters() {
         let domain = r"escaped\;pg=foreign.example.";
-        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 19));
-        let key = RouteKey::new(ip, "via_proxy".to_string());
         let route = RouteEntry {
-            key,
             gateway: "192.0.2.1".to_string(),
             distance: 100,
-            domains: AHashSet::from_iter([domain.to_string()]),
             comment_domain: domain.to_string(),
             domain_expiries: AHashMap::from_iter([(domain.to_string(), 400)]),
-            ref_count: 1,
             persistent: false,
             expires_at_unix: 400,
             last_refresh_unix: 100,
@@ -3649,7 +3748,7 @@ mod tests {
         );
         let entry = manager.routes.get(&key).expect("route should be tracked");
         assert_eq!(entry.expires_at_unix, u64::MAX);
-        assert_eq!(entry.ref_count, 1);
+        assert_eq!(entry.domain_expiries.len(), 1);
 
         manager.apply_observation(domain.clone(), ObservationScope::Ipv4, Vec::new(), 101);
         assert!(!manager.domain_bindings.contains_key(&domain));
@@ -3657,7 +3756,7 @@ mod tests {
             .routes
             .get(&key)
             .expect("route state should remain for deletion");
-        assert_eq!(entry.ref_count, 0);
+        assert!(entry.domain_expiries.is_empty());
         assert_eq!(entry.sync_state, SyncState::PendingDelete);
     }
 
@@ -3695,9 +3794,12 @@ mod tests {
             .domain_bindings
             .get(&domain)
             .expect("dual-stack binding");
-        assert_eq!(binding.ips, AHashSet::from_iter([ipv4, ipv6]));
-        assert_eq!(manager.routes[&ipv4_key].ref_count, 1);
-        assert_eq!(manager.routes[&ipv6_key].ref_count, 1);
+        assert_eq!(
+            binding.ip_expiries.keys().copied().collect::<AHashSet<_>>(),
+            AHashSet::from_iter([ipv4, ipv6])
+        );
+        assert_eq!(manager.routes[&ipv4_key].domain_expiries.len(), 1);
+        assert_eq!(manager.routes[&ipv6_key].domain_expiries.len(), 1);
 
         manager.apply_observation(domain.clone(), ObservationScope::Ipv4, Vec::new(), 102);
 
@@ -3705,13 +3807,16 @@ mod tests {
             .domain_bindings
             .get(&domain)
             .expect("IPv6 binding remains");
-        assert_eq!(binding.ips, AHashSet::from_iter([ipv6]));
-        assert_eq!(manager.routes[&ipv4_key].ref_count, 0);
+        assert_eq!(
+            binding.ip_expiries.keys().copied().collect::<AHashSet<_>>(),
+            AHashSet::from_iter([ipv6])
+        );
+        assert!(manager.routes[&ipv4_key].domain_expiries.is_empty());
         assert_eq!(
             manager.routes[&ipv4_key].sync_state,
             SyncState::PendingDelete
         );
-        assert_eq!(manager.routes[&ipv6_key].ref_count, 1);
+        assert_eq!(manager.routes[&ipv6_key].domain_expiries.len(), 1);
         assert_ne!(
             manager.routes[&ipv6_key].sync_state,
             SyncState::PendingDelete
@@ -4111,7 +4216,8 @@ mod tests {
         let entry = manager.routes.get_mut(&key).expect("route");
         entry.router_id = Some("*stale".to_string());
         entry.sync_state = SyncState::PendingDelete;
-        entry.ref_count = 0;
+        entry.domain_expiries.clear();
+        entry.recovered_ownership_incomplete = false;
 
         manager.sync_routes(101).await.expect("safe deletion");
         assert!(!manager.routes.contains_key(&key));
@@ -4449,7 +4555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialization_replays_withdrawal_after_recovering_router_state() {
+    async fn initialization_preserves_timeless_unknown_owner_after_withdrawal() {
         AppClock::start();
         let domain = "withdraw.example.".to_string();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 26));
@@ -4491,12 +4597,10 @@ mod tests {
             .expect("initialize and replay withdrawal");
 
         assert!(manager.initialized);
-        assert!(!manager.routes.contains_key(&key));
+        assert!(manager.routes.contains_key(&key));
+        assert!(manager.routes[&key].recovered_ownership_incomplete);
         assert!(!manager.domain_bindings.contains_key(&domain));
-        assert_eq!(
-            api.state.lock().expect("mock lock").deleted_ids,
-            vec!["*retained".to_string()]
-        );
+        assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
     }
 
     #[test]
@@ -4526,7 +4630,7 @@ mod tests {
         manager.ensure_persistent_routes(102);
 
         let route = manager.routes.get(&key).expect("dynamic route remains");
-        assert_eq!(route.ref_count, 1);
+        assert_eq!(route.domain_expiries.len(), 1);
         assert_eq!(route.comment_domain, domain);
         assert_eq!(route.expires_at_unix, 401);
         assert!(!route.persistent);
@@ -4575,7 +4679,7 @@ mod tests {
 
         let route = recovered.routes.get(&key).expect("dynamic route recovered");
         assert!(!route.persistent);
-        assert_eq!(route.ref_count, 1);
+        assert_eq!(route.domain_expiries.len(), 1);
         assert_eq!(route.comment_domain, domain);
         assert!(recovered.domain_bindings.contains_key(&domain));
         assert_ne!(route.sync_state, SyncState::PendingDelete);
@@ -4603,10 +4707,9 @@ mod tests {
         manager.apply_observation(domain, ObservationScope::Ipv4, Vec::new(), 102);
 
         let route = manager.routes.get(&key).expect("persistent route remains");
-        assert_eq!(route.ref_count, 0);
+        assert!(route.domain_expiries.is_empty());
         assert_eq!(route.comment_domain, PERSISTENT_COMMENT_DOMAIN);
         assert!(route.persistent);
-        assert!(route.domains.is_empty());
         assert_eq!(route.expires_at_unix, PERSISTENT_EXPIRES_AT_UNIX);
         assert_ne!(route.sync_state, SyncState::PendingDelete);
         let comment = RouteCommentCodec::encode("fdns", "route-test", route);
@@ -4671,7 +4774,7 @@ mod tests {
 
         manager.replay_pending_observations();
 
-        assert_eq!(manager.routes[&key].ref_count, 1);
+        assert_eq!(manager.routes[&key].domain_expiries.len(), 1);
         assert_ne!(manager.routes[&key].sync_state, SyncState::PendingDelete);
     }
 
@@ -4702,7 +4805,7 @@ mod tests {
 
             manager.replay_pending_observations();
 
-            assert_eq!(manager.routes[&key].ref_count, 1);
+            assert_eq!(manager.routes[&key].domain_expiries.len(), 1);
             assert_ne!(manager.routes[&key].sync_state, SyncState::PendingDelete);
         }
     }
@@ -4799,7 +4902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synchronous_non_cacheable_negative_is_applied_after_initialization() {
+    async fn synchronous_negative_preserves_recovered_timeless_unknown_owner() {
         AppClock::start();
         let domain = "sync-negative.example.".to_string();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
@@ -4826,10 +4929,7 @@ mod tests {
             .await
             .expect("current synchronous withdrawal should be applied once");
 
-        assert_eq!(
-            api.state.lock().expect("mock lock").deleted_ids,
-            vec!["*retained".to_string()]
-        );
+        assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
     }
 
     #[tokio::test]
@@ -4974,7 +5074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_timeless_domain_binding_can_be_withdrawn() {
+    async fn recovered_timeless_unknown_owner_survives_representative_withdrawal() {
         AppClock::start();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 13));
         let api = Arc::new(MockApi::with_state(MockApiState {
@@ -5011,11 +5111,10 @@ mod tests {
             .await
             .expect("withdraw recovered timeless route");
         let key = RouteKey::new(ip, "via_proxy".to_string());
-        assert!(!manager.routes.contains_key(&key));
-        assert_eq!(
-            api.state.lock().expect("mock lock").deleted_ids,
-            vec!["*13".to_string()]
-        );
+        assert!(manager.routes.contains_key(&key));
+        assert!(manager.routes[&key].recovered_ownership_incomplete);
+        assert!(manager.routes[&key].domain_expiries.is_empty());
+        assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
     }
 
     #[tokio::test]
@@ -5050,7 +5149,7 @@ mod tests {
 
         assert!(manager.domain_bindings.contains_key(domain));
         assert_eq!(manager.routes[&key].sync_state, SyncState::Synced);
-        assert_eq!(manager.routes[&key].ref_count, 1);
+        assert_eq!(manager.routes[&key].domain_expiries.len(), 1);
         assert!(api.state.lock().expect("mock lock").deleted_ids.is_empty());
     }
 
@@ -5094,7 +5193,7 @@ mod tests {
         recovered.reconcile_from_router().await.expect("reconcile");
 
         assert!(!recovered.routes[&key].persistent);
-        assert_eq!(recovered.routes[&key].ref_count, 1);
+        assert_eq!(recovered.routes[&key].domain_expiries.len(), 1);
         assert!(recovered.domain_bindings.contains_key(&domain));
     }
 
@@ -5147,7 +5246,7 @@ mod tests {
         );
 
         let route = &manager.routes[&key];
-        assert_eq!(route.ref_count, 0);
+        assert!(route.domain_expiries.is_empty());
         assert_eq!(route.expires_at_unix, expires_at);
         assert_eq!(route.comment_domain, "first.example.");
         assert_eq!(route.sync_state, SyncState::Synced);
@@ -5222,7 +5321,11 @@ mod tests {
         manager.reconcile_from_router().await.expect("reconcile");
 
         assert!(!manager.routes.contains_key(&key));
-        assert!(manager.domain_bindings[&domain].ips.contains(&ip));
+        assert!(
+            manager.domain_bindings[&domain]
+                .ip_expiries
+                .contains_key(&ip)
+        );
         assert!(
             api.state
                 .lock()
