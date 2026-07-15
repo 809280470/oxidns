@@ -20,8 +20,8 @@
 //!
 //! Behavior goals:
 //! - maintain `/32` (IPv4) and `/128` (IPv6) host routes in configured table.
-//! - support optional always-present CIDR routes via `persistent_route`.
-//! - periodically reload persistent route files and keep route table in sync.
+//! - support optional always-present CIDR routes via `persistent`.
+//! - load persistent route files once during plugin initialization.
 //! - preserve DNS hot-path latency (`async=true` uses non-blocking queue).
 //! - provide blocking write-before-return mode (`async=false`) without
 //!   affecting DNS response result.
@@ -39,13 +39,11 @@ use ahash::AHashSet;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use tokio::fs as tokio_fs;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tracing::warn;
 
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
-use crate::core::response::{NegativeResponseKind, ResponseDisposition, classify_response};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
@@ -63,7 +61,6 @@ const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
 const DEFAULT_CONNTRACK_GUARD: bool = false;
 const DEFAULT_ROUTE_DISTANCE: u8 = 100;
 const DEFAULT_COMMENT_PREFIX: &str = "fdns";
-const DEFAULT_MAX_ENTRIES: usize = 65_536;
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -93,32 +90,30 @@ struct MikrotikConfigArgs {
     gateway4: Option<String>,
     /// IPv6 gateway value for managed IPv6 routes.
     gateway6: Option<String>,
-    /// Prefix used in RouterOS route comments to mark ForgeDNS-managed routes.
+    /// Prefix used in RouterOS route comments to mark OxiDNS-managed routes.
     /// Defaults to `fdns` when omitted.
     comment_prefix: Option<String>,
     /// Route distance written to RouterOS for managed routes.
     distance: Option<u8>,
     /// Always-present routes that should not expire with DNS TTL.
-    persistent_route: Option<PersistentRouteArgs>,
+    persistent: Option<PersistentArgs>,
     /// Minimum effective TTL clamp (seconds) for observed records.
     min_ttl: Option<u32>,
     /// Maximum effective TTL clamp (seconds) for observed records.
     max_ttl: Option<u32>,
     /// Optional fixed TTL override (seconds) for dynamic observed records.
-    /// `0` keeps a dynamic route until a later observation withdraws it.
+    /// `0` keeps a dynamic route until explicit cleanup or operator removal.
     fixed_ttl: Option<u32>,
     /// Whether to clean managed dynamic routes on shutdown.
     cleanup_on_shutdown: Option<bool>,
     /// Delay normal route removal while RouterOS connection tracking has a
     /// connection for the route destination.
     conntrack_guard: Option<bool>,
-    /// Maximum number of route entries and domain bindings retained locally.
-    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct PersistentRouteArgs {
+struct PersistentArgs {
     /// Inline always-present IPs/CIDRs. Plain IP is normalized to host route.
     ips: Option<Vec<String>>,
     /// File list that provides always-present IPs.
@@ -141,10 +136,6 @@ struct MikrotikConfig {
     gateway6: Option<String>,
     /// Always-present routes in normalized CIDR format (`ip/prefix`).
     persistent_ips: AHashSet<String>,
-    /// Inline persistent routes in normalized CIDR format.
-    persistent_inline_ips: AHashSet<String>,
-    /// Persistent route source files for periodic reload.
-    persistent_files: Vec<String>,
     /// Managed route comment prefix.
     comment_prefix: String,
     /// Route distance written to RouterOS.
@@ -159,19 +150,11 @@ struct MikrotikConfig {
     cleanup_on_shutdown: bool,
     /// Delay normal route removal while a matching RouterOS connection exists.
     conntrack_guard: bool,
-    /// Per-table admission limit for route entries and domain bindings.
-    max_entries: usize,
 }
 
 #[derive(Debug)]
 struct ExtractedObservation {
-    domain: String,
-    /// Address family that this response is allowed to replace or withdraw.
-    replace_scope: ObservationScope,
     addrs: Vec<ObservedAddr>,
-    /// RFC 2308 lifetime for a negative response. Used only to bound replay
-    /// while RouterOS initialization is unavailable.
-    negative_ttl_secs: Option<u32>,
 }
 
 impl MikrotikConfigArgs {
@@ -222,29 +205,20 @@ impl MikrotikConfigArgs {
         }
         // `0` deliberately means a dynamic route that never expires by time.
         let fixed_ttl = self.fixed_ttl;
-        let max_entries = self.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
-        if max_entries == 0 {
-            return Err(DnsError::plugin(
-                "ros_route max_entries must be greater than zero",
-            ));
-        }
-        let parsed_persistent = parse_persistent_ips(
-            self.persistent_route,
-            gateway4.is_some(),
-            gateway6.is_some(),
-        )?;
+        let parsed_persistent =
+            parse_persistent_ips(self.persistent, gateway4.is_some(), gateway6.is_some())?;
         let ignored_by_gateway = parsed_persistent.ignored_by_gateway;
         if emit_warnings && ignored_by_gateway > 0 {
             warn!(
                 ignored = ignored_by_gateway,
-                "ros_route persistent_route ignored entries without corresponding gateway family"
+                "ros_route persistent ignored entries without corresponding gateway family"
             );
         }
         let ignored_default_route = parsed_persistent.ignored_default_route;
         if emit_warnings && ignored_default_route > 0 {
             warn!(
                 ignored = ignored_default_route,
-                "ros_route persistent_route ignored default-route entries (/0)"
+                "ros_route persistent ignored default-route entries (/0)"
             );
         }
 
@@ -256,8 +230,6 @@ impl MikrotikConfigArgs {
             gateway4,
             gateway6,
             persistent_ips: parsed_persistent.all_ips,
-            persistent_inline_ips: parsed_persistent.inline_ips,
-            persistent_files: parsed_persistent.files,
             comment_prefix,
             distance,
             min_ttl,
@@ -267,7 +239,6 @@ impl MikrotikConfigArgs {
                 .cleanup_on_shutdown
                 .unwrap_or(DEFAULT_CLEANUP_ON_SHUTDOWN),
             conntrack_guard: self.conntrack_guard.unwrap_or(DEFAULT_CONNTRACK_GUARD),
-            max_entries,
         })
     }
 }
@@ -280,20 +251,21 @@ use self::api::{
     MikrotikApi, MikrotikApiTimeouts, MikrotikRsClient,
 };
 use self::manager::{
-    ObservationScope, ObserveEnqueueError, PersistentReloadConfig, RouteManager,
-    RouteManagerConfig, RouteManagerHandle, RouteManagerRuntime,
+    ObserveEnqueueError, RouteManager, RouteManagerConfig, RouteManagerHandle, RouteManagerRuntime,
+    RoutePendingWork,
 };
-use crate::plugin::executor::ros_common::lifecycle::ActiveInstanceRegistry;
-use crate::plugin::executor::ros_common::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
-use crate::plugin::executor::ros_common::{
-    ObservedAddr, collect_answer_addrs, response_question_matches_request,
-};
+use crate::infra::mikrotik::ip_prefix::IpPrefix;
+use crate::infra::mikrotik::lifecycle::{ActiveInstanceRegistry, WriterGate};
+use crate::infra::mikrotik::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
+use crate::infra::mikrotik::{ObservedAddr, collect_observed_addrs};
 
 #[derive(Debug)]
 struct MikrotikExecutor {
     tag: String,
     instance_id: u64,
     active_registered: AtomicBool,
+    writer_gate: Arc<WriterGate>,
+    manager_active: Arc<AtomicBool>,
     metrics: Arc<RosRouteMetrics>,
     config: MikrotikConfig,
     manager: Option<RouteManager>,
@@ -313,7 +285,6 @@ struct RosRouteMetrics {
     pending_observations: AtomicU64,
     managed_entries: AtomicU64,
     coalesced_total: AtomicU64,
-    capacity_rejected_total: AtomicU64,
     reconnect_total: AtomicU64,
     connect_attempt_total: AtomicU64,
     backoff_total: AtomicU64,
@@ -323,14 +294,16 @@ struct RosRouteMetrics {
     cleanup_error_total: AtomicU64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ActiveRouteInstance {
     instance_id: u64,
     namespace: RouteOwnershipNamespace,
     metrics: Arc<RosRouteMetrics>,
-    /// Used to request that the prior compatible runtime immediately restore
-    /// its desired RouterOS state when a replacement candidate rolls back.
+    /// Lifecycle channel used to pause, drain, and activate the single writer
+    /// during commit or rollback.
     manager_handle: Option<RouteManagerHandle>,
+    writer_gate: Arc<WriterGate>,
+    manager_active: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -357,24 +330,68 @@ fn active_route_instances() -> &'static ActiveInstanceRegistry<ActiveRouteInstan
     INSTANCES.get_or_init(ActiveInstanceRegistry::new)
 }
 
-fn register_active_route_instance(
+fn route_lifecycle_transition() -> &'static AsyncMutex<()> {
+    static TRANSITION: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    TRANSITION.get_or_init(|| AsyncMutex::new(()))
+}
+
+async fn register_prepared_route_instance(
     tag: &str,
     instance_id: u64,
     namespace: RouteOwnershipNamespace,
     metrics: Arc<RosRouteMetrics>,
     manager_handle: Option<RouteManagerHandle>,
-) -> Result<()> {
+) -> Result<(Arc<WriterGate>, Arc<AtomicBool>)> {
+    let _transition = route_lifecycle_transition().lock().await;
     register_metric_source(metrics.clone())?;
+    // Candidate servers may accept requests while the runtime is being built.
+    // Admit their observations into the bounded mailbox, but keep the manager
+    // paused until the runtime manager commits the candidate.
+    let writer_gate = WriterGate::new(true);
+    let manager_active = Arc::new(AtomicBool::new(false));
     active_route_instances().push(
         tag,
         ActiveRouteInstance {
             instance_id,
             namespace,
             metrics,
-            manager_handle,
+            manager_handle: manager_handle.clone(),
+            writer_gate: writer_gate.clone(),
+            manager_active: manager_active.clone(),
         },
     );
-    Ok(())
+    Ok((writer_gate, manager_active))
+}
+
+async fn commit_prepared_route_instance(tag: &str, instance_id: u64) {
+    let _transition = route_lifecycle_transition().lock().await;
+    let Some(instance) =
+        active_route_instances().find(tag, |instance| instance.instance_id == instance_id)
+    else {
+        return;
+    };
+    if instance.manager_active.load(Ordering::Acquire) {
+        return;
+    }
+    if active_route_instances()
+        .find(tag, |other| {
+            other.instance_id != instance_id
+                && other.namespace == instance.namespace
+                && other.manager_active.load(Ordering::Acquire)
+        })
+        .is_some()
+    {
+        warn!(plugin = %tag, "ros_route commit deferred because the previous manager is still active");
+        return;
+    }
+    if let Some(handle) = &instance.manager_handle {
+        match handle.activate(RoutePendingWork::default()).await {
+            Ok(()) => instance.manager_active.store(true, Ordering::Release),
+            Err(error) => {
+                warn!(plugin = %tag, err = %error, "ros_route failed to commit prepared manager")
+            }
+        }
+    }
 }
 
 /// Unregister one runtime and return whether its ownership namespace may be
@@ -386,58 +403,78 @@ fn register_active_route_instance(
 /// using a different RouterOS address, routing table, or comment prefix does
 /// not suppress cleanup of the old namespace. The stack also restores the
 /// previous metric source when candidate initialization later rolls back.
-fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
-    let Some((cleanup_allowed, metric_replacement, remove_metric, restore_tx)) =
-        active_route_instances().release(
-            tag,
-            |instance| instance.instance_id == instance_id,
-            |removed, instances, was_metric_owner| {
-                let is_last = instances.is_empty();
-                let cleanup_allowed = !instances
+async fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
+    let _transition = route_lifecycle_transition().lock().await;
+    let Some((
+        cleanup_allowed,
+        metric_replacement,
+        remove_metric,
+        removed_handle,
+        removed_writer_gate,
+        removed_manager_active,
+        transfer,
+    )) = active_route_instances().release(
+        tag,
+        |instance| instance.instance_id == instance_id,
+        |removed, instances, was_metric_owner| {
+            removed.writer_gate.deactivate();
+            let is_last = instances.is_empty();
+            let removed_active = removed.manager_active.load(Ordering::Acquire);
+            let cleanup_allowed = removed_active
+                && !instances
                     .iter()
                     .any(|instance| instance.namespace == removed.namespace);
-                let metric_replacement = was_metric_owner
-                    .then(|| instances.last().map(|instance| instance.metrics.clone()))
-                    .flatten();
-                // A candidate is appended after the running instance. If that newest
-                // candidate is destroyed during a failed reload, it may already have
-                // reconciled changed gateway/distance metadata. Ask the compatible
-                // surviving runtime to restore its desired state immediately instead
-                // of waiting for the periodic 180-second reconcile.
-                let restore_tx = was_metric_owner
-                    .then(|| {
-                        instances
-                            .iter()
-                            .rev()
-                            .find(|instance| instance.namespace == removed.namespace)
-                            .and_then(|instance| instance.manager_handle.clone())
-                    })
-                    .flatten();
-                let remove_metric = was_metric_owner && is_last;
-                (
-                    cleanup_allowed,
-                    metric_replacement,
-                    remove_metric,
-                    restore_tx,
-                )
-            },
-        )
+            let metric_replacement = was_metric_owner
+                .then(|| instances.last().map(|instance| instance.metrics.clone()))
+                .flatten();
+            let transfer = instances
+                .iter()
+                .rev()
+                .find(|instance| {
+                    instance.namespace == removed.namespace
+                        && instance.manager_active.load(Ordering::Acquire) != removed_active
+                })
+                .cloned();
+            let remove_metric = was_metric_owner && is_last;
+            (
+                cleanup_allowed,
+                metric_replacement,
+                remove_metric,
+                removed.manager_handle.clone(),
+                removed.writer_gate.clone(),
+                removed.manager_active.clone(),
+                transfer,
+            )
+        },
+    )
     else {
         return false;
     };
 
+    removed_writer_gate.wait_idle().await;
+    let pending = if let Some(handle) = removed_handle {
+        handle.quiesce().await
+    } else {
+        RoutePendingWork::default()
+    };
+    removed_manager_active.store(false, Ordering::Release);
+    if let Some(transfer) = transfer
+        && let Some(handle) = &transfer.manager_handle
+    {
+        match handle.activate(pending).await {
+            Ok(()) => {
+                transfer.manager_active.store(true, Ordering::Release);
+                handle.request_reconcile();
+            }
+            Err(error) => {
+                warn!(plugin = %tag, err = %error, "ros_route failed to transfer manager ownership")
+            }
+        }
+    }
     if let Some(metrics) = metric_replacement {
         let _ = register_metric_source(metrics);
     } else if remove_metric {
         unregister_metric_source(tag);
-    }
-    if let Some(handle) = restore_tx
-        && !handle.request_reconcile()
-    {
-        warn!(
-            plugin = %tag,
-            "ros_route failed to enqueue immediate reconcile after reload rollback"
-        );
     }
     cleanup_allowed
 }
@@ -455,7 +492,6 @@ impl RosRouteMetrics {
             pending_observations: AtomicU64::new(0),
             managed_entries: AtomicU64::new(0),
             coalesced_total: AtomicU64::new(0),
-            capacity_rejected_total: AtomicU64::new(0),
             reconnect_total: AtomicU64::new(0),
             connect_attempt_total: AtomicU64::new(0),
             backoff_total: AtomicU64::new(0),
@@ -480,7 +516,7 @@ impl MetricSource for RosRouteMetrics {
         let labels = [MetricLabel::new("plugin_tag", self.tag.as_str())];
         sink.emit(MetricSample::counter(
             "ros_route_observe_total",
-            "Total domain observations submitted to the RouterOS route manager.",
+            "Total address observations submitted to the RouterOS route manager.",
             &labels,
             self.observe_total.load(Ordering::Relaxed),
         ));
@@ -546,11 +582,6 @@ impl MetricSource for RosRouteMetrics {
                 self.coalesced_total.load(Ordering::Relaxed),
             ),
             (
-                "ros_route_capacity_rejected_total",
-                "Total route observations rejected by queue or state capacity.",
-                self.capacity_rejected_total.load(Ordering::Relaxed),
-            ),
-            (
                 "ros_route_reconnect_total",
                 "Total successful RouterOS transport reconnections.",
                 self.reconnect_total.load(Ordering::Relaxed),
@@ -596,46 +627,55 @@ impl Plugin for MikrotikExecutor {
             return Ok(());
         };
 
-        let persistent_reload = Some(PersistentReloadConfig {
-            inline_ips: self.config.persistent_inline_ips.clone(),
-            files: self.config.persistent_files.clone(),
-            initial_ips: self.config.persistent_ips.clone(),
-            gateway4_enabled: self.config.gateway4.is_some(),
-            gateway6_enabled: self.config.gateway6.is_some(),
-        });
-        let runtime = RouteManagerRuntime::start(self.tag.clone(), manager, persistent_reload);
+        let runtime = RouteManagerRuntime::start_paused(self.tag.clone(), manager);
         let manager_handle = runtime.handle();
-        if let Err(error) = register_active_route_instance(
+        let (writer_gate, manager_active) = match register_prepared_route_instance(
             &self.tag,
             self.instance_id,
             RouteOwnershipNamespace::from_config(&self.config),
             self.metrics.clone(),
             Some(manager_handle.clone()),
-        ) {
-            runtime.shutdown(false).await;
-            return Err(error);
-        }
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = runtime.shutdown(false).await;
+                return Err(error);
+            }
+        };
         let mut runtime = Some(runtime);
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = runtime.take();
         }
         if let Some(runtime) = runtime {
-            release_active_route_instance(&self.tag, self.instance_id);
-            runtime.shutdown(false).await;
+            release_active_route_instance(&self.tag, self.instance_id).await;
+            let _ = runtime.shutdown(false).await;
             return Err(DnsError::plugin(
                 "ros_route runtime lock is poisoned during initialization",
             ));
         }
         self.manager_handle = Some(manager_handle);
+        self.writer_gate = writer_gate;
+        self.manager_active = manager_active;
         self.active_registered.store(true, Ordering::Release);
         Ok(())
     }
 
+    async fn commit(&self) {
+        if self.active_registered.load(Ordering::Acquire) {
+            commit_prepared_route_instance(&self.tag, self.instance_id).await;
+        }
+    }
+
     async fn destroy(&self) -> Result<()> {
-        let is_last_instance = self.active_registered.swap(false, Ordering::AcqRel)
-            && release_active_route_instance(&self.tag, self.instance_id);
+        let is_last_instance = if self.active_registered.swap(false, Ordering::AcqRel) {
+            release_active_route_instance(&self.tag, self.instance_id).await
+        } else {
+            false
+        };
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
-            runtime
+            return runtime
                 .shutdown(self.config.cleanup_on_shutdown && is_last_instance)
                 .await;
         }
@@ -658,27 +698,27 @@ impl Executor for MikrotikExecutor {
         context: &mut DnsContext,
         next: Option<ExecutorNext>,
     ) -> Result<ExecStep> {
+        let writer_permit = self
+            .active_registered
+            .load(Ordering::Acquire)
+            .then(|| self.writer_gate.enter())
+            .flatten();
         let step = continue_next!(next, context)?;
-        if !self.active_registered.load(Ordering::Acquire) {
+        let Some(_writer_permit) = writer_permit else {
             return Ok(step);
-        }
+        };
         let Some(handle) = self.manager_handle.as_ref() else {
             return Ok(step);
         };
 
-        let Some(ExtractedObservation {
-            domain,
-            replace_scope,
-            addrs,
-            negative_ttl_secs,
-        }) = extract_observation(context, &self.config)
+        let Some(ExtractedObservation { addrs }) = extract_observation(context, &self.config)
         else {
             return Ok(step);
         };
         self.metrics.observe_total.fetch_add(1, Ordering::Relaxed);
 
         if self.config.async_mode {
-            match handle.try_observe(domain, replace_scope, addrs, negative_ttl_secs, None) {
+            match handle.try_observe(addrs, None) {
                 Ok(_) => {}
                 Err(ObserveEnqueueError::Full) => {
                     self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
@@ -700,11 +740,7 @@ impl Executor for MikrotikExecutor {
 
         let (wait_tx, wait_rx) = oneshot::channel::<Result<()>>();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS);
-        let send_outcome = tokio::time::timeout_at(
-            deadline,
-            handle.observe(domain, replace_scope, addrs, negative_ttl_secs, wait_tx),
-        )
-        .await;
+        let send_outcome = tokio::time::timeout_at(deadline, handle.observe(addrs, wait_tx)).await;
         match send_outcome {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => {
@@ -792,14 +828,17 @@ impl PluginFactory for MikrotikFactory {
             routing_table: config.routing_table.clone(),
             gateway4: config.gateway4.clone(),
             gateway6: config.gateway6.clone(),
-            persistent_ips: config.persistent_ips.clone(),
+            persistent_ips: config
+                .persistent_ips
+                .iter()
+                .map(|raw| raw.parse::<IpPrefix>())
+                .collect::<std::result::Result<AHashSet<_>, _>>()?,
             comment_prefix: config.comment_prefix.clone(),
             distance: config.distance,
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
             fixed_ttl: config.fixed_ttl,
             conntrack_guard: config.conntrack_guard,
-            max_entries: config.max_entries,
         };
         let metrics = Arc::new(RosRouteMetrics::new(plugin_config.tag.clone()));
         let manager = RouteManager::with_metrics(api, manager_cfg, metrics.clone());
@@ -808,6 +847,8 @@ impl PluginFactory for MikrotikFactory {
             tag: plugin_config.tag.clone(),
             instance_id: NEXT_ROUTE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             active_registered: AtomicBool::new(false),
+            writer_gate: WriterGate::new(false),
+            manager_active: Arc::new(AtomicBool::new(false)),
             metrics,
             config,
             manager: Some(manager),
@@ -822,69 +863,20 @@ fn extract_observation(
     config: &MikrotikConfig,
 ) -> Option<ExtractedObservation> {
     let question = context.request.first_question()?;
-    let domain = question.name().normalized().to_string();
-    let replace_scope = match question.qtype() {
-        RecordType::A => ObservationScope::Ipv4,
-        RecordType::AAAA => ObservationScope::Ipv6,
+    match question.qtype() {
+        RecordType::A | RecordType::AAAA => {}
         _ => return None,
-    };
+    }
 
     let response = context.response()?;
-    // A response for another request must never update this request's route
-    // bindings. Keep this cheap identity check even though positive answers no
-    // longer need CNAME-chain reconstruction.
-    if !response_question_matches_request(&context.request, response) {
+    if response.rcode() != Rcode::NoError {
         return None;
     }
-
-    if response.rcode() == Rcode::NoError {
-        // RouterOS observers deliberately use the simple Answer-section
-        // semantics shared with ros_address_list: every enabled A/AAAA answer
-        // is useful. The queried type controls only what may be withdrawn.
-        let addrs = collect_answer_addrs(response, |ip| match ip {
-            IpAddr::V4(_) => config.gateway4.is_some(),
-            IpAddr::V6(_) => config.gateway6.is_some(),
-        });
-        if !addrs.is_empty() {
-            return Some(ExtractedObservation {
-                domain,
-                replace_scope,
-                addrs,
-                negative_ttl_secs: None,
-            });
-        }
-    }
-
-    match classify_response(response, Some(question)) {
-        ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData) => {
-            let scope_enabled = match replace_scope {
-                ObservationScope::Ipv4 => config.gateway4.is_some(),
-                ObservationScope::Ipv6 => config.gateway6.is_some(),
-                ObservationScope::Both => config.gateway4.is_some() || config.gateway6.is_some(),
-            };
-            if !scope_enabled {
-                return None;
-            }
-            Some(ExtractedObservation {
-                domain,
-                replace_scope,
-                addrs: Vec::new(),
-                negative_ttl_secs: response.negative_ttl_from_soa(),
-            })
-        }
-        // NXDOMAIN is authoritative for the name, not only the queried record
-        // type, so withdraw both address families. This is essential when
-        // fixed_ttl=0 because no time-based cleanup will happen later.
-        ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NxDomain) => {
-            Some(ExtractedObservation {
-                domain,
-                replace_scope: ObservationScope::Both,
-                addrs: Vec::new(),
-                negative_ttl_secs: response.negative_ttl_from_soa(),
-            })
-        }
-        _ => None,
-    }
+    let addrs = collect_observed_addrs(&context.request, response, |ip| match ip {
+        IpAddr::V4(_) => config.gateway4.is_some(),
+        IpAddr::V6(_) => config.gateway6.is_some(),
+    });
+    (!addrs.is_empty()).then_some(ExtractedObservation { addrs })
 }
 
 fn parse_plugin_config(args: Option<Value>, emit_warnings: bool) -> Result<MikrotikConfig> {
@@ -959,18 +951,18 @@ struct ParsedPersistentRoutes {
 ///
 /// Entries whose IP family has no corresponding configured gateway are skipped.
 fn parse_persistent_ips(
-    persistent_route: Option<PersistentRouteArgs>,
+    persistent: Option<PersistentArgs>,
     gateway4_enabled: bool,
     gateway6_enabled: bool,
 ) -> Result<ParsedPersistentRoutes> {
     let mut parsed = ParsedPersistentRoutes::default();
-    let Some(route) = persistent_route else {
+    let Some(route) = persistent else {
         return Ok(parsed);
     };
 
     if let Some(ips) = route.ips {
         for (index, item) in ips.into_iter().enumerate() {
-            let source = format!("persistent_route.ips[{index}]");
+            let source = format!("persistent.ips[{index}]");
             let cidr = parse_persistent_ip_item(item.as_str(), source.as_str())?;
             if is_default_route_cidr(cidr.as_str()) {
                 parsed.ignored_default_route = parsed.ignored_default_route.saturating_add(1);
@@ -990,7 +982,7 @@ fn parse_persistent_ips(
         }
     }
 
-    parsed.files = parse_persistent_route_files(route.files)?;
+    parsed.files = parse_persistent_files(route.files)?;
     let (file_ips, ignored_from_files, ignored_default_from_files) =
         load_persistent_ips_from_files(
             parsed.files.as_slice(),
@@ -1006,7 +998,7 @@ fn parse_persistent_ips(
     Ok(parsed)
 }
 
-fn parse_persistent_route_files(files: Option<Vec<String>>) -> Result<Vec<String>> {
+fn parse_persistent_files(files: Option<Vec<String>>) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let Some(files) = files else {
         return Ok(out);
@@ -1015,7 +1007,7 @@ fn parse_persistent_route_files(files: Option<Vec<String>>) -> Result<Vec<String
         let file = file_raw.trim();
         if file.is_empty() {
             return Err(DnsError::plugin(format!(
-                "ros_route persistent_route.files[{index}] cannot be empty"
+                "ros_route persistent.files[{index}] cannot be empty"
             )));
         }
         out.push(file.to_string());
@@ -1075,38 +1067,7 @@ pub(super) fn load_persistent_ips_from_files(
                 "ros_route failed to read persistent route file '{file}': {e}"
             ))
         })?;
-        let source_prefix = format!("persistent_route.files[{index}]");
-        let (loaded, ignored_by_gateway_delta, ignored_default_delta) =
-            load_persistent_ips_from_content(
-                source_prefix.as_str(),
-                &content,
-                gateway4_enabled,
-                gateway6_enabled,
-            )?;
-        out.extend(loaded);
-        ignored_by_gateway = ignored_by_gateway.saturating_add(ignored_by_gateway_delta);
-        ignored_default_route = ignored_default_route.saturating_add(ignored_default_delta);
-    }
-
-    Ok((out, ignored_by_gateway, ignored_default_route))
-}
-
-pub(super) async fn load_persistent_ips_from_files_async(
-    files: &[String],
-    gateway4_enabled: bool,
-    gateway6_enabled: bool,
-) -> Result<(AHashSet<String>, usize, usize)> {
-    let mut out = AHashSet::new();
-    let mut ignored_by_gateway = 0usize;
-    let mut ignored_default_route = 0usize;
-
-    for (index, file) in files.iter().enumerate() {
-        let content = tokio_fs::read_to_string(file).await.map_err(|e| {
-            DnsError::plugin(format!(
-                "ros_route failed to read persistent route file '{file}': {e}"
-            ))
-        })?;
-        let source_prefix = format!("persistent_route.files[{index}]");
+        let source_prefix = format!("persistent.files[{index}]");
         let (loaded, ignored_by_gateway_delta, ignored_default_delta) =
             load_persistent_ips_from_content(
                 source_prefix.as_str(),
@@ -1273,11 +1234,47 @@ fixed_ttl: 0
         .expect("yaml");
         let parsed = parse_plugin_config(Some(args), false).expect("config");
         assert_eq!(parsed.fixed_ttl, Some(0));
-        assert_eq!(parsed.max_entries, DEFAULT_MAX_ENTRIES);
     }
 
     #[test]
-    fn max_entries_is_positive_and_excludes_persistent_routes() {
+    fn config_rejects_old_persistent_route_key() {
+        let args = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "127.0.0.1:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+persistent_route:
+  ips:
+    - "192.0.2.10"
+"#,
+        )
+        .expect("yaml");
+        let error = parse_plugin_config(Some(args), false).expect_err("old key");
+        assert!(error.to_string().contains("persistent_route"));
+    }
+
+    #[test]
+    fn config_keeps_plaintext_when_tls_is_omitted() {
+        let args = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "router.example:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+"#,
+        )
+        .expect("yaml");
+        let parsed = parse_plugin_config(Some(args), false).expect("config");
+        let debug = format!("{:?}", parsed.connection.expect("connection"));
+        assert!(debug.contains("tls: None"));
+        assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn removed_max_entries_is_rejected() {
         let args = serde_yaml_ng::from_str::<Value>(
             r#"
 address: "127.0.0.1:8728"
@@ -1289,49 +1286,12 @@ max_entries: 8
 "#,
         )
         .expect("yaml");
-        assert_eq!(
-            parse_plugin_config(Some(args), false)
-                .expect("config")
-                .max_entries,
-            8
-        );
-
-        let zero = serde_yaml_ng::from_str::<Value>(
-            r#"
-address: "127.0.0.1:8728"
-username: "api"
-password: "secret"
-routing_table: "policy"
-gateway4: "192.0.2.1"
-max_entries: 0
-"#,
-        )
-        .expect("yaml");
         assert!(
-            parse_plugin_config(Some(zero), false)
-                .expect_err("zero capacity")
+            parse_plugin_config(Some(args), false)
+                .expect_err("removed field")
                 .to_string()
                 .contains("max_entries")
         );
-
-        let overflow = serde_yaml_ng::from_str::<Value>(
-            r#"
-address: "127.0.0.1:8728"
-username: "api"
-password: "secret"
-routing_table: "policy"
-gateway4: "192.0.2.1"
-max_entries: 1
-persistent_route:
-  ips:
-    - "192.0.2.10"
-    - "192.0.2.11"
-"#,
-        )
-        .expect("yaml");
-        let parsed = parse_plugin_config(Some(overflow), false).expect("persistent routes");
-        assert_eq!(parsed.max_entries, 1);
-        assert_eq!(parsed.persistent_ips.len(), 2);
     }
 
     #[test]
@@ -1375,7 +1335,7 @@ routing_table: "policy"
     }
 
     #[test]
-    fn observation_ignores_non_address_queries_and_scopes_nodata() {
+    fn observation_ignores_non_address_queries_and_nodata() {
         let config = observation_config();
         let mut txt_context = context_with_nodata(RecordType::TXT);
         assert!(extract_observation(&mut txt_context, &config).is_none());
@@ -1383,11 +1343,7 @@ routing_table: "policy"
         assert!(extract_observation(&mut any_context, &config).is_none());
 
         let mut a_context = context_with_nodata(RecordType::A);
-        let observation =
-            extract_observation(&mut a_context, &config).expect("A NODATA observation");
-        assert_eq!(observation.replace_scope, ObservationScope::Ipv4);
-        assert!(observation.addrs.is_empty());
-        assert_eq!(observation.negative_ttl_secs, None);
+        assert!(extract_observation(&mut a_context, &config).is_none());
     }
 
     #[test]
@@ -1429,7 +1385,6 @@ routing_table: "policy"
 
         let observation = extract_observation(&mut context, &config).expect("CNAME observation");
 
-        assert_eq!(observation.replace_scope, ObservationScope::Ipv4);
         assert_eq!(observation.addrs.len(), 3);
         assert!(observation.addrs.contains(&ObservedAddr {
             addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 27)),
@@ -1446,16 +1401,11 @@ routing_table: "policy"
     }
 
     #[test]
-    fn nxdomain_withdraws_both_address_families() {
+    fn nxdomain_does_not_withdraw_existing_leases() {
         let config = observation_config();
         let mut context = context_with_rcode(RecordType::AAAA, Rcode::NXDomain);
 
-        let observation =
-            extract_observation(&mut context, &config).expect("AAAA NXDOMAIN observation");
-
-        assert_eq!(observation.domain, "example.com");
-        assert_eq!(observation.replace_scope, ObservationScope::Both);
-        assert!(observation.addrs.is_empty());
+        assert!(extract_observation(&mut context, &config).is_none());
     }
 
     #[test]
@@ -1474,7 +1424,7 @@ routing_table: "policy"
     }
 
     #[test]
-    fn negative_observation_carries_soa_ttl_for_queued_replay() {
+    fn negative_soa_ttl_does_not_create_a_withdrawal_observation() {
         let config = observation_config();
         let mut context = context_with_rcode(RecordType::A, Rcode::NXDomain);
         context
@@ -1494,13 +1444,11 @@ routing_table: "policy"
                 )),
             ));
 
-        let observation = extract_observation(&mut context, &config).expect("NXDOMAIN observation");
-
-        assert_eq!(observation.negative_ttl_secs, Some(30));
+        assert!(extract_observation(&mut context, &config).is_none());
     }
 
-    #[test]
-    fn same_tag_runtime_coordinates_cleanup_by_ownership_namespace() {
+    #[tokio::test]
+    async fn same_tag_runtime_coordinates_cleanup_by_ownership_namespace() {
         let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(6, Ordering::Relaxed);
         let namespace = RouteOwnershipNamespace {
             address: "192.0.2.10:8728".to_string(),
@@ -1510,46 +1458,53 @@ routing_table: "policy"
         let success_tag = format!("route-reload-success-{sequence}");
         let old_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
         let new_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
-        register_active_route_instance(
+        let (_, old_active) = register_prepared_route_instance(
             &success_tag,
             sequence,
             namespace.clone(),
             old_metrics,
             None,
         )
+        .await
         .expect("old runtime");
-        register_active_route_instance(
+        old_active.store(true, Ordering::Release);
+        let (_, replacement_active) = register_prepared_route_instance(
             &success_tag,
             sequence + 1,
             namespace.clone(),
             new_metrics,
             None,
         )
+        .await
         .expect("replacement runtime");
-        assert!(!release_active_route_instance(&success_tag, sequence));
-        assert!(release_active_route_instance(&success_tag, sequence + 1));
+        assert!(!release_active_route_instance(&success_tag, sequence).await);
+        replacement_active.store(true, Ordering::Release);
+        assert!(release_active_route_instance(&success_tag, sequence + 1).await);
 
         let rollback_tag = format!("route-reload-rollback-{sequence}");
         let old_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
         let candidate_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
-        register_active_route_instance(
+        let (_, old_active) = register_prepared_route_instance(
             &rollback_tag,
             sequence + 2,
             namespace.clone(),
             old_metrics,
             None,
         )
+        .await
         .expect("old runtime");
-        register_active_route_instance(
+        old_active.store(true, Ordering::Release);
+        register_prepared_route_instance(
             &rollback_tag,
             sequence + 3,
             namespace,
             candidate_metrics,
             None,
         )
+        .await
         .expect("candidate runtime");
-        assert!(!release_active_route_instance(&rollback_tag, sequence + 3));
-        assert!(release_active_route_instance(&rollback_tag, sequence + 2));
+        assert!(!release_active_route_instance(&rollback_tag, sequence + 3).await);
+        assert!(release_active_route_instance(&rollback_tag, sequence + 2).await);
 
         let migration_tag = format!("route-reload-migration-{sequence}");
         let old_namespace = RouteOwnershipNamespace {
@@ -1562,28 +1517,32 @@ routing_table: "policy"
             routing_table: "new-policy".to_string(),
             comment_prefix: "new-fdns".to_string(),
         };
-        register_active_route_instance(
+        let (_, old_active) = register_prepared_route_instance(
             &migration_tag,
             sequence + 4,
             old_namespace,
             Arc::new(RosRouteMetrics::new(migration_tag.clone())),
             None,
         )
+        .await
         .expect("old namespace");
-        register_active_route_instance(
+        old_active.store(true, Ordering::Release);
+        let (_, new_active) = register_prepared_route_instance(
             &migration_tag,
             sequence + 5,
             new_namespace,
             Arc::new(RosRouteMetrics::new(migration_tag.clone())),
             None,
         )
+        .await
         .expect("new namespace");
-        assert!(release_active_route_instance(&migration_tag, sequence + 4));
-        assert!(release_active_route_instance(&migration_tag, sequence + 5));
+        assert!(release_active_route_instance(&migration_tag, sequence + 4).await);
+        new_active.store(true, Ordering::Release);
+        assert!(release_active_route_instance(&migration_tag, sequence + 5).await);
     }
 
-    #[test]
-    fn failed_compatible_reload_requests_immediate_restore_reconcile() {
+    #[tokio::test]
+    async fn failed_compatible_reload_requests_immediate_restore_reconcile() {
         let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
         let tag = format!("route-reload-restore-{sequence}");
         let namespace = RouteOwnershipNamespace {
@@ -1593,25 +1552,28 @@ routing_table: "policy"
         };
         let old_handle = RouteManagerHandle::new_for_test();
 
-        register_active_route_instance(
+        let (_, old_active) = register_prepared_route_instance(
             &tag,
             sequence,
             namespace.clone(),
             Arc::new(RosRouteMetrics::new(tag.clone())),
             Some(old_handle.clone()),
         )
+        .await
         .expect("old runtime");
-        register_active_route_instance(
+        old_active.store(true, Ordering::Release);
+        register_prepared_route_instance(
             &tag,
             sequence + 1,
             namespace,
             Arc::new(RosRouteMetrics::new(tag.clone())),
             None,
         )
+        .await
         .expect("candidate runtime");
 
-        assert!(!release_active_route_instance(&tag, sequence + 1));
+        assert!(!release_active_route_instance(&tag, sequence + 1).await);
         assert!(old_handle.take_reconcile_for_test());
-        assert!(release_active_route_instance(&tag, sequence));
+        assert!(release_active_route_instance(&tag, sequence).await);
     }
 }

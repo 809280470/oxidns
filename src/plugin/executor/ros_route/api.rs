@@ -15,7 +15,7 @@ use tracing::warn;
 
 use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
-use crate::plugin::executor::ros_common::transport::{
+use crate::infra::mikrotik::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
     RouterOsTransportSnapshot,
 };
@@ -49,7 +49,7 @@ pub(super) const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 5;
 
 pub(super) type MikrotikApiTimeouts = RouterOsTimeouts;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct RouterRoute {
     /// RouterOS internal route identifier (e.g. `*123`).
     pub(super) id: String,
@@ -113,12 +113,15 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         distance: u8,
         comment: &str,
     ) -> Result<()>;
-    /// Delete route by internal id.
-    async fn delete_route_by_id(&self, id: &str, family: RouteFamily) -> Result<()>;
-    /// Return tracked connection destinations for one address family.
+    /// Re-read the RouterOS row and delete only when it still exactly matches
+    /// the snapshot that authorized the deletion.
     ///
-    /// An empty `destinations` slice requests the full destination snapshot.
-    /// Callers use that only when a CIDR route needs local prefix matching.
+    /// RouterOS exposes the final remove as an id-only command, not an atomic
+    /// compare-and-delete operation. The plugin serializes all in-process
+    /// writers for one ownership namespace; external writers must not mutate
+    /// plugin-owned rows concurrently.
+    async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool>;
+    /// Return tracked connection destinations for exact host IPs in one family.
     async fn connection_destinations(
         &self,
         family: RouteFamily,
@@ -157,6 +160,18 @@ impl Debug for MikrotikRsClient {
 }
 
 impl MikrotikRsClient {
+    async fn remove_route_by_id(&self, id: &str, family: RouteFamily) -> Result<()> {
+        let remove = CommandBuilder::new()
+            .command(route_command(family, RouteOp::Remove))
+            .attribute(ROUTER_ID_FIELD, Some(id))
+            .build();
+        match self.send_rows_transport("remove route", remove).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.is_missing_item() => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(super) fn new(config: RouterOsConnectionConfig) -> Self {
         Self {
             transport: RouterOsTransport::new(config),
@@ -210,7 +225,7 @@ impl MikrotikRsClient {
 
     async fn cleanup_validation_route(&self, key: &RouteKey, comment: &str) -> Result<()> {
         if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
-            self.delete_route_by_id(&route.id, route.family).await?;
+            self.delete_route_if_matches(&route).await?;
         }
         Ok(())
     }
@@ -241,8 +256,7 @@ impl MikrotikRsClient {
 
     async fn prune_duplicate_owned_routes(&self, duplicates: Vec<RouterRoute>) -> Result<()> {
         for duplicate in duplicates {
-            self.delete_route_by_id(&duplicate.id, duplicate.family)
-                .await?;
+            self.delete_route_if_matches(&duplicate).await?;
         }
         Ok(())
     }
@@ -504,8 +518,6 @@ impl MikrotikApi for MikrotikRsClient {
         let inspection = self
             .inspect_exact_routes(key, comment_prefix, plugin_tag)
             .await?;
-        self.prune_duplicate_owned_routes(inspection.duplicate_owned)
-            .await?;
         Ok(inspection.owned)
     }
 
@@ -627,7 +639,7 @@ impl MikrotikApi for MikrotikRsClient {
                         "ros_route validate route config succeeded but temporary route id not found",
                     )
                 })?;
-            self.delete_route_by_id(&route.id, route.family).await
+            self.delete_route_if_matches(&route).await.map(|_| ())
         }
         .await;
 
@@ -648,16 +660,45 @@ impl MikrotikApi for MikrotikRsClient {
         Ok(())
     }
 
-    async fn delete_route_by_id(&self, id: &str, family: RouteFamily) -> Result<()> {
-        let remove = CommandBuilder::new()
-            .command(route_command(family, RouteOp::Remove))
-            .attribute(ROUTER_ID_FIELD, Some(id))
+    async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool> {
+        // Re-query by every stable key component before comparing the mutable
+        // fields. Besides avoiding an accidental id-reuse deletion, filtering
+        // by table also compensates for RouterOS versions that omit
+        // `routing-table` from an id-only print reply.
+        let print = CommandBuilder::new()
+            .command(route_command(expected.family, RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
+            .query_equal(ROUTER_ID_FIELD, &expected.id)
+            .query_equal(ROUTE_TABLE_FIELD, &expected.routing_table)
+            .query_equal(ROUTE_DST_FIELD, &expected.dst_address)
             .build();
-        match self.send_rows_transport("remove route", remove).await {
-            Ok(_) => Ok(()),
-            Err(error) if error.is_missing_item() => Ok(()),
-            Err(error) => Err(error.into()),
+        let Some(row) = self
+            .send_rows("verify route before delete", print)
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(false);
+        };
+        let mut current = parse_router_route_from_reply(
+            "verify route before delete parse",
+            expected.family,
+            &row,
+        )?;
+        if current.routing_table.is_empty() {
+            current.routing_table.clone_from(&expected.routing_table);
         }
+        if current != *expected {
+            return Ok(false);
+        }
+        // The RouterOS API has no conditional remove primitive. This final
+        // id-only command is safe against OxiDNS reload races because the
+        // ownership namespace has one in-process writer. The fresh full-row
+        // comparison above is the best available guard against external
+        // changes; operators must not concurrently edit plugin-owned rows.
+        self.remove_route_by_id(&expected.id, expected.family)
+            .await?;
+        Ok(true)
     }
 
     async fn connection_destinations(
@@ -712,13 +753,10 @@ mod tests {
     fn exact_route_inspection_reports_owned_and_foreign_duplicates() {
         let inspection = classify_exact_routes(
             [
-                route(
-                    "*owned",
-                    Some("fdns;pg=route-test;kind=dynamic;dm=example.com;exp=400;seen=100"),
-                ),
+                route("*owned", Some("fdns;pg=route-test;kind=D;exp=400;seen=100")),
                 route(
                     "*owned-duplicate",
-                    Some("fdns;pg=route-test;kind=dynamic;dm=example.com;exp=400;seen=100"),
+                    Some("fdns;pg=route-test;kind=D;exp=400;seen=100"),
                 ),
                 route("*foreign", Some("operator-managed")),
             ],
@@ -783,7 +821,8 @@ mod tests {
         assert!(wire.contains("?dst-address=203.0.113.11"));
         assert!(wire.contains("?#|"));
 
-        let ipv6 = connection_destinations_command(RouteFamily::Ipv6, &[]);
+        let ipv6_addr: IpAddr = "2001:db8::1".parse().expect("ipv6");
+        let ipv6 = connection_destinations_command(RouteFamily::Ipv6, &[ipv6_addr]);
         assert!(
             String::from_utf8_lossy(ipv6.data()).contains(COMMAND_IPV6_FIREWALL_CONNECTION_PRINT)
         );

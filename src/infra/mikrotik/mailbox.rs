@@ -160,6 +160,7 @@ where
     }
 
     /// Remove one queued key without disturbing the order of other work.
+    #[cfg(any(feature = "plugin-ros-address-list", feature = "plugin-ros-route"))]
     pub(crate) fn take(&self, key: &K) -> Option<V> {
         let mut state = self
             .inner
@@ -173,35 +174,33 @@ where
         Some(value)
     }
 
-    /// Remove every queued item whose key matches a superseding observation.
-    // Used by ros_route scope supersession; it is intentionally unused in a
-    // minimal build that enables only ros_address_list.
-    #[allow(dead_code)]
-    pub(crate) fn remove_where(&self, mut predicate: impl FnMut(&K) -> bool) -> Vec<(K, V)> {
+    /// Drain queued entries selected by `matches` while preserving the order
+    /// of all entries left behind. Lifecycle handoff uses this to transfer
+    /// only RouterOS targets shared with a replacement runtime.
+    pub(crate) fn drain_where(&self, mut matches: impl FnMut(&K) -> bool) -> Vec<(K, V)> {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let removed_keys = state
-            .order
-            .iter()
-            .filter(|key| predicate(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        if removed_keys.is_empty() {
-            return Vec::new();
+        let mut drained = Vec::new();
+        let mut retained = VecDeque::with_capacity(state.order.len());
+        while let Some(key) = state.order.pop_front() {
+            if matches(&key) {
+                if let Some(value) = state.values.remove(&key) {
+                    drained.push((key, value));
+                }
+            } else {
+                retained.push_back(key);
+            }
         }
-        let removed_set = removed_keys.iter().cloned().collect::<ahash::AHashSet<_>>();
-        state.order.retain(|key| !removed_set.contains(key));
-        let removed = removed_keys
-            .into_iter()
-            .filter_map(|key| state.values.remove(&key).map(|value| (key, value)))
-            .collect::<Vec<_>>();
+        state.order = retained;
         drop(state);
-        self.inner.space_ready.notify_waiters();
-        self.inner.space_ready.notify_one();
-        removed
+        if !drained.is_empty() {
+            self.inner.space_ready.notify_waiters();
+            self.inner.space_ready.notify_one();
+        }
+        drained
     }
 
     pub(crate) async fn recv(&self) -> Option<(K, V)> {
@@ -336,6 +335,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "plugin-ros-address-list")]
     fn take_removes_only_the_selected_key() {
         let mailbox = KeyedMailbox::new(2);
         mailbox.try_push("a", Latest(1)).expect("a");
@@ -344,18 +344,5 @@ mod tests {
         assert_eq!(mailbox.take(&"a"), Some(Latest(1)));
         assert_eq!(mailbox.try_recv(), Some(("b", Latest(2))));
         assert_eq!(mailbox.try_recv(), None);
-    }
-
-    #[test]
-    fn remove_where_preserves_unmatched_order() {
-        let mailbox = KeyedMailbox::new(3);
-        mailbox.try_push("a1", Latest(1)).expect("a1");
-        mailbox.try_push("b", Latest(2)).expect("b");
-        mailbox.try_push("a2", Latest(3)).expect("a2");
-
-        let removed = mailbox.remove_where(|key| key.starts_with('a'));
-
-        assert_eq!(removed, vec![("a1", Latest(1)), ("a2", Latest(3))]);
-        assert_eq!(mailbox.try_recv(), Some(("b", Latest(2))));
     }
 }

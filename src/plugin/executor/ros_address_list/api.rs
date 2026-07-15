@@ -15,7 +15,7 @@ use super::manager::{
     AddressListFamily, AddressListKey, decode_owned_comment, parse_router_address,
 };
 use crate::infra::error::{DnsError, Result};
-use crate::plugin::executor::ros_common::transport::{
+use crate::infra::mikrotik::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
     RouterOsTransportSnapshot,
 };

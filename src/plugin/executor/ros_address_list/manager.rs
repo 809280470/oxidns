@@ -15,12 +15,12 @@
 //!   dynamic refresh cache.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -28,19 +28,22 @@ use super::RosMetrics;
 use super::api::{MikrotikApi, RouterListEntry};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
+use crate::infra::mikrotik::batching::join_all_bounded;
+use crate::infra::mikrotik::completion::BatchCompletion;
+use crate::infra::mikrotik::ip_prefix::IpPrefix;
+use crate::infra::mikrotik::lease::{LeaseBook, LeaseDeadline, LeasePolicy};
+use crate::infra::mikrotik::lifecycle::abort_and_reap;
+use crate::infra::mikrotik::mailbox::{Coalesce, KeyedMailbox, PushOutcome, TryPushError};
+use crate::infra::mikrotik::reconcile::{BackgroundReconcile, ReconcileRetry, VersionedSnapshot};
+use crate::infra::mikrotik::throttle::ErrorLogThrottle;
+use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT};
 use crate::infra::task as task_center;
-use crate::plugin::executor::ros_common::ObservedAddr;
-use crate::plugin::executor::ros_common::batching::join_all_bounded;
-use crate::plugin::executor::ros_common::mailbox::{
-    Coalesce, KeyedMailbox, PushOutcome, TryPushError,
-};
-use crate::plugin::executor::ros_common::throttle::ErrorLogThrottle;
 
 /// Host prefix used for normalized IPv4 single-address entries.
 const HOST_PREFIX_V4: u8 = 32;
 /// Host prefix used for normalized IPv6 single-address entries.
 const HOST_PREFIX_V6: u8 = 128;
-/// Maximum number of distinct domains waiting for manager processing.
+/// Maximum number of distinct address-list keys waiting for manager processing.
 const MANAGER_QUEUE_SIZE: usize = 1024;
 const CONTROL_QUEUE_SIZE: usize = 2;
 /// Periodic interval for persistent desired-set reconciliation.
@@ -49,20 +52,10 @@ const RECONCILE_INTERVAL_SECS: u64 = 180;
 const DYNAMIC_CACHE_PRUNE_INTERVAL_SECS: u64 = 60;
 /// Maximum number of RouterOS upserts issued concurrently by one observation.
 const UPSERT_PIPELINE_SIZE: usize = 16;
-/// Maximum time a dynamic key can go without a refresh attempt under steady
-/// traffic.
-const MAX_DYNAMIC_REFRESH_SUPPRESS_MS: u64 = 60_000;
-/// Minimum refresh lead time before estimated RouterOS timeout expiry.
-const MIN_DYNAMIC_REFRESH_LEAD_MS: u64 = 1_000;
-/// Maximum refresh lead time before estimated RouterOS timeout expiry.
-const MAX_DYNAMIC_REFRESH_LEAD_MS: u64 = 60_000;
-
 /// Comment field storing the owning plugin tag.
 const COMMENT_FIELD_PLUGIN: &str = "pg";
 /// Comment field storing entry kind metadata.
 const COMMENT_FIELD_KIND: &str = "kind";
-/// Comment field storing the observed domain for dynamic entries.
-const COMMENT_FIELD_DOMAIN: &str = "dm";
 /// Compact comment marker for dynamic entries.
 const COMMENT_KIND_DYNAMIC: &str = "D";
 /// Compact comment marker for persistent entries.
@@ -111,24 +104,23 @@ pub(super) struct AddressListKey {
 impl AddressListKey {
     pub(super) fn new(ip: IpAddr, list: String) -> Self {
         let family = AddressListFamily::from_ip(ip);
+        let prefix = IpPrefix::host(ip);
         Self {
             family,
             list,
-            address: ip,
-            prefix: family.host_prefix(),
+            address: prefix.address(),
+            prefix: prefix.prefix(),
         }
     }
 
     pub(super) fn new_with_prefix(ip: IpAddr, prefix: u8, list: String) -> Option<Self> {
-        let family = AddressListFamily::from_ip(ip);
-        if !family.is_valid_prefix(prefix) {
-            return None;
-        }
+        let normalized = IpPrefix::new(ip, prefix)?;
+        let family = AddressListFamily::from_ip(normalized.address());
         Some(Self {
             family,
             list,
-            address: normalize_network_ip(ip, prefix),
-            prefix,
+            address: normalized.address(),
+            prefix: normalized.prefix(),
         })
     }
 
@@ -169,54 +161,6 @@ pub(super) struct OwnedCommentMeta {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct DynamicRefreshState {
-    /// Whether the remote entry was created without RouterOS timeout.
-    timeless: bool,
-    /// Timeout value written on the last successful RouterOS update.
-    written_timeout_ms: u64,
-    /// Local estimate of when the remote timeout will naturally expire.
-    expires_at_ms: u64,
-    /// Earliest local time when another refresh is worth sending.
-    next_refresh_at_ms: u64,
-    /// Successful-write sequence used to protect writes newer than a scan.
-    generation: u64,
-}
-
-impl DynamicRefreshState {
-    /// Build a suppression window after a successful dynamic write.
-    ///
-    /// The cache deliberately refreshes before the estimated remote expiry so
-    /// periodic DNS traffic can extend entries without waiting for RouterOS to
-    /// drop them first. At the same time, the suppress window is capped so very
-    /// long TTLs do not completely stop background refreshes.
-    fn from_write(now_ms: u64, timeout_secs: u32) -> Self {
-        let timeout_ms = u64::from(timeout_secs).saturating_mul(1000);
-        let expires_at_ms = now_ms.saturating_add(timeout_ms);
-        let refresh_lead_ms = dynamic_refresh_lead_ms(timeout_ms);
-        let near_expiry_refresh_at_ms = expires_at_ms.saturating_sub(refresh_lead_ms);
-        let max_skip_refresh_at_ms = now_ms.saturating_add(MAX_DYNAMIC_REFRESH_SUPPRESS_MS);
-        Self {
-            timeless: false,
-            written_timeout_ms: timeout_ms,
-            expires_at_ms,
-            next_refresh_at_ms: near_expiry_refresh_at_ms.min(max_skip_refresh_at_ms),
-            generation: 0,
-        }
-    }
-
-    #[inline]
-    fn timeless() -> Self {
-        Self {
-            timeless: true,
-            written_timeout_ms: 0,
-            expires_at_ms: u64::MAX,
-            next_refresh_at_ms: u64::MAX,
-            generation: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DynamicTimeout {
     Timed(u32),
     Timeless,
@@ -240,67 +184,25 @@ pub(super) struct AddressListManagerConfig {
     pub(super) max_ttl: u32,
     /// Optional fixed TTL override for dynamic observations.
     pub(super) fixed_ttl: Option<u32>,
-    /// Hard upper bound for locally cached dynamic refresh states.
-    pub(super) max_entries: usize,
 }
 
 #[derive(Debug, Clone)]
 struct AddressObservation {
-    domain: String,
     /// Absolute RouterOS timeout deadline. `None` is timeless.
     expires_at_ms: Option<u64>,
+    observed_at_ms: u64,
 }
 
 #[derive(Debug)]
-struct ObservationCompletion {
-    remaining: AtomicUsize,
-    first_error: StdMutex<Option<String>>,
-    sender: StdMutex<Option<oneshot::Sender<Result<()>>>>,
+struct AddressListSnapshot {
+    captured_at_ms: u64,
+    entries: Vec<RouterListEntry>,
 }
 
-impl ObservationCompletion {
-    fn new(items: usize, sender: oneshot::Sender<Result<()>>) -> Arc<Self> {
-        Arc::new(Self {
-            remaining: AtomicUsize::new(items),
-            first_error: StdMutex::new(None),
-            sender: StdMutex::new(Some(sender)),
-        })
-    }
-
-    fn finish(&self, result: &Result<()>) {
-        if let Err(error) = result {
-            let mut first = self
-                .first_error
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if first.is_none() {
-                *first = Some(error.to_string());
-            }
-        }
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
-        }
-        let result = self
-            .first_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .map_or(Ok(()), |message| Err(DnsError::plugin(message)));
-        if let Some(sender) = self
-            .sender
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            let _ = sender.send(result);
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ObservationCommand {
     observation: AddressObservation,
-    completions: Vec<Arc<ObservationCompletion>>,
+    completions: Vec<Arc<BatchCompletion>>,
 }
 
 impl Coalesce for ObservationCommand {
@@ -324,9 +226,7 @@ impl Coalesce for ObservationCommand {
 struct AddressObservationPolicy {
     address_list4: Option<String>,
     address_list6: Option<String>,
-    min_ttl: u32,
-    max_ttl: u32,
-    fixed_ttl: Option<u32>,
+    lease: LeasePolicy,
 }
 
 impl AddressObservationPolicy {
@@ -334,9 +234,7 @@ impl AddressObservationPolicy {
         Self {
             address_list4: config.address_list4.clone(),
             address_list6: config.address_list6.clone(),
-            min_ttl: config.min_ttl,
-            max_ttl: config.max_ttl,
-            fixed_ttl: config.fixed_ttl,
+            lease: LeasePolicy::new(config.min_ttl, config.max_ttl, config.fixed_ttl),
         }
     }
 
@@ -347,12 +245,15 @@ impl AddressObservationPolicy {
         }
     }
 
-    fn commands(
+    fn commands(&self, addrs: Vec<ObservedAddr>) -> Vec<(AddressListKey, AddressObservation)> {
+        self.commands_at(addrs, now_millis())
+    }
+
+    fn commands_at(
         &self,
-        domain: String,
         addrs: Vec<ObservedAddr>,
+        now: u64,
     ) -> Vec<(AddressListKey, AddressObservation)> {
-        let now = now_millis();
         let mut observations = AHashMap::<AddressListKey, AddressObservation>::new();
         for observed in addrs {
             let family = AddressListFamily::from_ip(observed.addr);
@@ -360,15 +261,10 @@ impl AddressObservationPolicy {
                 continue;
             };
             let key = AddressListKey::new(observed.addr, list.to_string());
-            let ttl = match self.fixed_ttl {
-                Some(0) => None,
-                Some(ttl) => Some(ttl),
-                None => Some(observed.ttl_secs.max(1).clamp(self.min_ttl, self.max_ttl)),
-            };
+            let deadline = self.lease.deadline(observed.ttl_secs, now);
             let observation = AddressObservation {
-                domain: domain.clone(),
-                expires_at_ms: ttl
-                    .map(|ttl| now.saturating_add(u64::from(ttl).saturating_mul(1_000))),
+                expires_at_ms: deadline.unix_millis(),
+                observed_at_ms: now,
             };
             observations
                 .entry(key)
@@ -400,6 +296,23 @@ enum ControlCommand {
     PruneDynamicCache,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct AddressListPendingWork {
+    items: Vec<(AddressListKey, ObservationCommand)>,
+}
+
+#[derive(Debug)]
+enum LifecycleCommand {
+    Quiesce {
+        targets: AHashSet<(AddressListFamily, String)>,
+        done: oneshot::Sender<AddressListPendingWork>,
+    },
+    Activate {
+        pending: AddressListPendingWork,
+        done: oneshot::Sender<()>,
+    },
+}
+
 impl Coalesce for ControlCommand {
     fn coalesce(&mut self, newer: Self) {
         *self = newer;
@@ -407,23 +320,9 @@ impl Coalesce for ControlCommand {
 }
 
 #[derive(Debug)]
-struct ReconcileSnapshot {
-    scan_generation: u64,
-    entries: Vec<RouterListEntry>,
-}
-
-struct ReconcileCompletionNotify(Arc<Notify>);
-
-impl Drop for ReconcileCompletionNotify {
-    fn drop(&mut self) {
-        self.0.notify_one();
-    }
-}
-
-#[derive(Debug)]
 struct ShutdownRequest {
     cleanup: AddressListCleanupScope,
-    done: oneshot::Sender<()>,
+    done: oneshot::Sender<Result<()>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -465,15 +364,21 @@ pub(super) struct AddressListManagerHandle {
     controls: KeyedMailbox<ControlKey, ControlCommand>,
     policy: AddressObservationPolicy,
     metrics: Option<Arc<RosMetrics>>,
+    lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
 }
 
 impl AddressListManagerHandle {
-    fn new(config: &AddressListManagerConfig, metrics: Option<Arc<RosMetrics>>) -> Self {
+    fn new(
+        config: &AddressListManagerConfig,
+        metrics: Option<Arc<RosMetrics>>,
+        lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
+    ) -> Self {
         Self {
             observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
             policy: AddressObservationPolicy::from_config(config),
             metrics,
+            lifecycle,
         }
     }
 
@@ -490,8 +395,8 @@ impl AddressListManagerHandle {
                 min_ttl: 60,
                 max_ttl: 3600,
                 fixed_ttl: None,
-                max_entries: 65_536,
             },
+            None,
             None,
         )
     }
@@ -513,28 +418,19 @@ impl AddressListManagerHandle {
         }
     }
 
-    fn record_capacity_rejection(&self) {
-        if let Some(metrics) = &self.metrics {
-            metrics
-                .capacity_rejected_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     pub(super) fn try_observe(
         &self,
-        domain: String,
         addrs: Vec<ObservedAddr>,
         wait: Option<oneshot::Sender<Result<()>>>,
     ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
-        let commands = self.policy.commands(domain, addrs);
+        let commands = self.policy.commands(addrs);
         if commands.is_empty() {
             if let Some(waiter) = wait {
                 let _ = waiter.send(Ok(()));
             }
             return Ok(PushOutcome::Inserted);
         }
-        let completion = wait.map(|waiter| ObservationCompletion::new(commands.len(), waiter));
+        let completion = wait.map(|waiter| BatchCompletion::new(commands.len(), waiter));
         let mut outcome = PushOutcome::Coalesced;
         let mut enqueue_error = None;
         for (key, observation) in commands {
@@ -549,7 +445,6 @@ impl AddressListManagerHandle {
                 }
                 Ok(item_outcome @ PushOutcome::Coalesced) => self.record_outcome(item_outcome),
                 Err(TryPushError::Full(command)) => {
-                    self.record_capacity_rejection();
                     for completion in command.completions {
                         completion.finish(&Err(DnsError::plugin(
                             "ros_address_list observation mailbox is full",
@@ -573,16 +468,15 @@ impl AddressListManagerHandle {
 
     pub(super) async fn observe(
         &self,
-        domain: String,
         addrs: Vec<ObservedAddr>,
         wait: oneshot::Sender<Result<()>>,
     ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
-        let commands = self.policy.commands(domain, addrs);
+        let commands = self.policy.commands(addrs);
         if commands.is_empty() {
             let _ = wait.send(Ok(()));
             return Ok(PushOutcome::Inserted);
         }
-        let completion = ObservationCompletion::new(commands.len(), wait);
+        let completion = BatchCompletion::new(commands.len(), wait);
         let mut outcome = PushOutcome::Coalesced;
         let total = commands.len();
         for (index, (key, observation)) in commands.into_iter().enumerate() {
@@ -621,6 +515,39 @@ impl AddressListManagerHandle {
             .is_ok()
     }
 
+    pub(super) async fn quiesce_targets(
+        &self,
+        targets: AHashSet<(AddressListFamily, String)>,
+    ) -> AddressListPendingWork {
+        let Some(lifecycle) = &self.lifecycle else {
+            return AddressListPendingWork::default();
+        };
+        let (done, wait) = oneshot::channel();
+        if lifecycle
+            .send(LifecycleCommand::Quiesce { targets, done })
+            .await
+            .is_err()
+        {
+            return AddressListPendingWork::default();
+        }
+        wait.await.unwrap_or_default()
+    }
+
+    pub(super) async fn activate(&self, pending: AddressListPendingWork) -> Result<()> {
+        let Some(lifecycle) = &self.lifecycle else {
+            return Ok(());
+        };
+        let (done, wait) = oneshot::channel();
+        lifecycle
+            .send(LifecycleCommand::Activate { pending, done })
+            .await
+            .map_err(|_| {
+                DnsError::plugin("ros_address_list manager lifecycle channel is closed")
+            })?;
+        wait.await
+            .map_err(|_| DnsError::plugin("ros_address_list manager activation was cancelled"))
+    }
+
     fn request_prune(&self) {
         let _ = self.controls.try_push(
             ControlKey::PruneDynamicCache,
@@ -655,6 +582,7 @@ enum WorkerCommand {
     },
     Control(ControlCommand),
     ReconcileCompleted,
+    Lifecycle(LifecycleCommand),
 }
 
 #[derive(Debug)]
@@ -670,21 +598,45 @@ pub(super) struct AddressListManagerRuntime {
 }
 
 impl AddressListManagerRuntime {
+    #[cfg(test)]
     pub(super) fn start(tag: String, manager: AddressListManager) -> Self {
+        Self::start_with_state(tag, manager, true)
+    }
+
+    pub(super) fn start_paused(tag: String, manager: AddressListManager) -> Self {
+        Self::start_with_state(tag, manager, false)
+    }
+
+    fn start_with_state(tag: String, manager: AddressListManager, active: bool) -> Self {
         // All mutable state lives behind one worker to avoid cross-map locking
         // or request-path synchronization in the DNS hot path.
-        let handle = AddressListManagerHandle::new(&manager.cfg, manager.metrics.clone());
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
+        let handle = AddressListManagerHandle::new(
+            &manager.cfg,
+            manager.metrics.clone(),
+            Some(lifecycle_tx),
+        );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker_tag = tag.clone();
         let worker_handle_mailbox = handle.clone();
         let worker_handle = Some(tokio::spawn(async move {
-            run_manager_worker(worker_tag, manager, worker_handle_mailbox, shutdown_rx).await;
+            run_manager_worker(
+                worker_tag,
+                manager,
+                worker_handle_mailbox,
+                lifecycle_rx,
+                active,
+                shutdown_rx,
+            )
+            .await;
         }));
 
         // Startup reconciliation is deliberately queued onto the manager worker
         // instead of awaited during plugin init. Slow RouterOS list scans must
         // not prevent the DNS service from coming up.
-        handle.request_reconcile();
+        if active {
+            handle.request_reconcile();
+        }
 
         // Pruning is local-memory only. It never talks to RouterOS and exists
         // solely to keep the write-suppression cache bounded.
@@ -731,15 +683,32 @@ impl AddressListManagerRuntime {
         self.handle.clone()
     }
 
-    pub(super) async fn shutdown(mut self, cleanup: AddressListCleanupScope) {
-        if let Some(task_id) = self.prune_task_id.take() {
-            task_center::stop_task(task_id).await;
-        }
-        if let Some(task_id) = self.reconcile_task_id.take() {
-            task_center::stop_task(task_id).await;
+    pub(super) async fn shutdown(mut self, cleanup: AddressListCleanupScope) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let tasks = [self.prune_task_id.take(), self.reconcile_task_id.take()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        for (index, task) in tasks.iter().copied().enumerate() {
+            if tokio::time::timeout_at(deadline, task_center::stop_task(task))
+                .await
+                .is_err()
+            {
+                for remaining in &tasks[index..] {
+                    task_center::stop_task_detached(*remaining);
+                }
+                self.handle.close();
+                if let Some(worker) = self.worker_handle.take() {
+                    abort_and_reap(worker);
+                }
+                return Err(DnsError::plugin(format!(
+                    "ros_address_list shutdown exceeded {} seconds",
+                    SHUTDOWN_TIMEOUT.as_secs()
+                )));
+            }
         }
 
-        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
         let shutdown_requested = self.shutdown_tx.take().is_some_and(|tx| {
             tx.send(ShutdownRequest {
                 cleanup,
@@ -748,14 +717,32 @@ impl AddressListManagerRuntime {
             .is_ok()
         });
         self.handle.close();
-        if shutdown_requested {
-            // There is intentionally no aggregate cleanup deadline. Each API
-            // operation remains bounded by the configured transport timeout.
-            let _ = done_rx.await;
+        let result = if shutdown_requested {
+            match tokio::time::timeout_at(deadline, done_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(DnsError::plugin(
+                    "ros_address_list shutdown worker closed before reporting cleanup",
+                )),
+                Err(_) => Err(DnsError::plugin(format!(
+                    "ros_address_list shutdown exceeded {} seconds",
+                    SHUTDOWN_TIMEOUT.as_secs()
+                ))),
+            }
+        } else {
+            Ok(())
+        };
+        if let Some(mut handle) = self.worker_handle.take()
+            && tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+        {
+            abort_and_reap(handle);
+            return Err(DnsError::plugin(format!(
+                "ros_address_list shutdown exceeded {} seconds while joining worker",
+                SHUTDOWN_TIMEOUT.as_secs()
+            )));
         }
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.await;
-        }
+        result
     }
 }
 
@@ -768,21 +755,14 @@ pub(super) struct AddressListManager {
     cfg: AddressListManagerConfig,
     /// Current desired persistent set.
     persistent_items: AHashSet<AddressListKey>,
-    /// Lightweight local cache that suppresses redundant dynamic refresh
-    /// writes.
-    dynamic_refresh_cache: AHashMap<AddressListKey, DynamicRefreshState>,
-    /// Currently running background reconcile task, if any.
-    reconcile_handle: Option<JoinHandle<Result<ReconcileSnapshot>>>,
-    /// Wakes the worker as soon as a background RouterOS scan has produced a
-    /// result, avoiding timer-driven polling of the join handle.
-    reconcile_completed: Arc<Notify>,
+    /// Dynamic leases and successful-write refresh suppression.
+    leases: LeaseBook<AddressListKey>,
+    /// Single-flight background RouterOS snapshot.
+    reconcile: BackgroundReconcile<AddressListSnapshot>,
+    reconcile_retry: ReconcileRetry,
     /// An empty local state still requires one successful remote scan so stale
     /// persistent rows from a previous configuration can be removed.
     empty_state_needs_reconcile: bool,
-    /// Monotonic local write generation for race-safe background snapshots.
-    dynamic_generation: u64,
-    /// One-time startup guard.
-    initialized: bool,
 }
 
 impl AddressListManager {
@@ -791,13 +771,11 @@ impl AddressListManager {
             api,
             metrics: None,
             persistent_items: cfg.persistent_items.clone(),
-            dynamic_refresh_cache: AHashMap::new(),
-            reconcile_handle: None,
-            reconcile_completed: Arc::new(Notify::new()),
+            leases: LeaseBook::new(),
+            reconcile: BackgroundReconcile::new(),
+            reconcile_retry: ReconcileRetry::default(),
             empty_state_needs_reconcile: true,
-            dynamic_generation: 0,
             cfg,
-            initialized: false,
         }
     }
 
@@ -815,7 +793,7 @@ impl AddressListManager {
     fn refresh_managed_metric(&self) {
         if let Some(metrics) = &self.metrics {
             metrics.managed_entries.store(
-                self.dynamic_refresh_cache
+                self.leases
                     .len()
                     .saturating_add(self.persistent_items.len()) as u64,
                 Ordering::Relaxed,
@@ -843,48 +821,12 @@ impl AddressListManager {
         }
     }
 
-    async fn ensure_initialized(&mut self) -> Result<()> {
-        if self.initialized {
-            return Ok(());
-        }
-
-        // Reconcile and cleanup immediately follow with real address-list
-        // commands, so no separate identity-read permission is required.
-        self.initialized = true;
-        Ok(())
-    }
-
-    #[cfg(test)]
     #[inline]
-    fn effective_dynamic_timeout(&self, ttl_secs: u32) -> DynamicTimeout {
-        // TTL policy is centralized here so dynamic observations and tests use
-        // identical clamping semantics.
-        if let Some(ttl) = self.cfg.fixed_ttl {
-            return if ttl == 0 {
-                DynamicTimeout::Timeless
-            } else {
-                DynamicTimeout::Timed(ttl)
-            };
-        }
-        DynamicTimeout::Timed(ttl_secs.clamp(self.cfg.min_ttl, self.cfg.max_ttl))
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn list_name_for(&self, family: AddressListFamily) -> Option<&str> {
-        match family {
-            AddressListFamily::Ipv4 => self.cfg.address_list4.as_deref(),
-            AddressListFamily::Ipv6 => self.cfg.address_list6.as_deref(),
-        }
-    }
-
-    #[inline]
-    fn comment_for_dynamic(&self, domain: &str) -> String {
+    fn comment_for_dynamic(&self) -> String {
         encode_comment(
             self.cfg.comment_prefix.as_str(),
             self.cfg.plugin_tag.as_str(),
             OwnedCommentKind::Dynamic,
-            Some(domain),
         )
     }
 
@@ -894,65 +836,43 @@ impl AddressListManager {
             self.cfg.comment_prefix.as_str(),
             self.cfg.plugin_tag.as_str(),
             OwnedCommentKind::Persistent,
-            None,
         )
     }
 
-    fn should_refresh_dynamic_entry(
-        &self,
-        key: &AddressListKey,
-        timeout: DynamicTimeout,
-        now_ms: u64,
-    ) -> bool {
-        // Missing or expired cache means we have no recent successful remote write
-        // to rely on, so the entry must be refreshed immediately.
-        let Some(state) = self.dynamic_refresh_cache.get(key) else {
-            return true;
-        };
-        match timeout {
-            DynamicTimeout::Timeless => return !state.timeless,
-            DynamicTimeout::Timed(_) if state.timeless => return true,
-            DynamicTimeout::Timed(_) => {}
-        }
-        if now_ms >= state.expires_at_ms {
-            return true;
-        }
-
-        // A longer TTL is always worth pushing immediately. Shorter TTLs are
-        // intentionally ignored until the normal refresh window to avoid
-        // excessive rewrite churn on frequently queried names.
-        let DynamicTimeout::Timed(timeout_secs) = timeout else {
-            return false;
-        };
-        let timeout_ms = u64::from(timeout_secs).saturating_mul(1000);
-        timeout_ms > state.written_timeout_ms || now_ms >= state.next_refresh_at_ms
+    fn should_refresh_dynamic_entry(&self, key: &AddressListKey, now_ms: u64) -> bool {
+        self.leases
+            .get(key)
+            .is_none_or(|lease| lease.needs_sync(now_ms))
     }
 
     fn prune_dynamic_cache(&mut self, now_ms: u64) {
-        // Step 1: drop obviously stale or now-persistent entries.
-        self.dynamic_refresh_cache.retain(|key, state| {
-            state.expires_at_ms > now_ms && !self.persistent_items.contains(key)
+        self.leases.retain(|key, lease| {
+            !lease.desired().is_expired(now_ms) && !self.persistent_items.contains(key)
         });
     }
 
-    fn cache_dynamic_write(&mut self, key: AddressListKey, mut state: DynamicRefreshState) -> bool {
-        if !self.dynamic_refresh_cache.contains_key(&key)
-            && self.dynamic_refresh_cache.len() >= self.cfg.max_entries
-        {
-            return false;
-        }
+    fn cache_dynamic_write(&mut self, key: &AddressListKey, now_ms: u64) -> bool {
         self.empty_state_needs_reconcile = true;
-        self.dynamic_generation = self.dynamic_generation.wrapping_add(1);
-        state.generation = self.dynamic_generation;
-        self.dynamic_refresh_cache.insert(key, state);
+        let confirmed = self.leases.confirm_synced(key, now_ms);
         self.refresh_managed_metric();
-        true
+        confirmed
     }
 
-    async fn apply_reconcile_snapshot(
+    #[cfg(test)]
+    pub(super) async fn apply_reconcile_snapshot(
         &mut self,
         existing: Vec<RouterListEntry>,
         scan_generation: u64,
+    ) -> Result<()> {
+        self.apply_reconcile_snapshot_at(existing, scan_generation, now_millis())
+            .await
+    }
+
+    async fn apply_reconcile_snapshot_at(
+        &mut self,
+        existing: Vec<RouterListEntry>,
+        scan_generation: u64,
+        captured_at_ms: u64,
     ) -> Result<()> {
         // The background task only reads RouterOS. The single state owner
         // classifies the snapshot, mutates local state, and executes the
@@ -1040,7 +960,7 @@ impl AddressListManager {
             }
         }
 
-        let now = now_millis();
+        let now = captured_at_ms;
         let remote_dynamic = existing
             .iter()
             .filter_map(|entry| {
@@ -1051,33 +971,47 @@ impl AddressListManager {
                 )
                 .filter(|meta| meta.kind == OwnedCommentKind::Dynamic)
                 .map(|_| {
-                    let state = entry
+                    let remote = entry
                         .timeout
                         .as_deref()
                         .and_then(parse_routeros_duration_secs)
                         .filter(|seconds| *seconds > 0)
-                        .map_or_else(DynamicRefreshState::timeless, |seconds| {
-                            DynamicRefreshState::from_write(now, seconds)
+                        .map_or(LeaseDeadline::Timeless, |seconds| {
+                            LeaseDeadline::At(
+                                now.saturating_add(u64::from(seconds).saturating_mul(1_000)),
+                            )
                         });
-                    (entry.key.clone(), state)
+                    let desired =
+                        LeasePolicy::new(self.cfg.min_ttl, self.cfg.max_ttl, self.cfg.fixed_ttl)
+                            .cap_recovered(remote, now);
+                    (entry.key.clone(), (desired, remote))
                 })
             })
             .collect::<AHashMap<_, _>>();
 
         // A snapshot may race successful writes. Newer generations win;
         // everything else follows actual RouterOS state, including timeless
-        // rows and remote counts above max_entries.
-        self.dynamic_refresh_cache.retain(|key, state| {
-            state.generation > scan_generation || remote_dynamic.contains_key(key)
+        // rows observed after the scan started.
+        self.leases.retain(|key, lease| {
+            lease.desired_revision() > scan_generation || remote_dynamic.contains_key(key)
         });
-        for (key, mut remote_state) in remote_dynamic {
+        let missing_newer = self
+            .leases
+            .keys_with_revision_after(scan_generation)
+            .into_iter()
+            .filter(|key| !remote_dynamic.contains_key(key))
+            .collect::<Vec<_>>();
+        for key in missing_newer {
+            self.leases.mark_unsynced(&key);
+        }
+        for (key, (desired, remote)) in remote_dynamic {
             let keep_newer = self
-                .dynamic_refresh_cache
+                .leases
                 .get(&key)
-                .is_some_and(|state| state.generation > scan_generation);
+                .is_some_and(|lease| lease.desired_revision() > scan_generation);
             if !keep_newer {
-                remote_state.generation = scan_generation;
-                self.dynamic_refresh_cache.insert(key, remote_state);
+                self.leases
+                    .recover_with_synced(key, desired, remote, now, scan_generation, now);
             }
         }
         self.prune_dynamic_cache(now);
@@ -1085,7 +1019,7 @@ impl AddressListManager {
         if let Some(error) = first_error {
             return Err(error);
         }
-        if self.persistent_items.is_empty() && self.dynamic_refresh_cache.is_empty() {
+        if self.persistent_items.is_empty() && self.leases.is_empty() {
             self.empty_state_needs_reconcile = false;
         }
         Ok(())
@@ -1109,7 +1043,7 @@ impl AddressListManager {
     }
 
     fn spawn_background_reconcile(&mut self, tag: String) {
-        if self.reconcile_handle.is_some() {
+        if self.reconcile.is_running() {
             debug!(
                 plugin = %tag,
                 "ros_address_list reconcile already running or awaiting apply, skipping duplicate request"
@@ -1118,7 +1052,7 @@ impl AddressListManager {
         }
 
         if self.persistent_items.is_empty()
-            && self.dynamic_refresh_cache.is_empty()
+            && self.leases.is_empty()
             && !self.empty_state_needs_reconcile
         {
             debug!(
@@ -1131,62 +1065,50 @@ impl AddressListManager {
         let api = self.api.clone();
         let list4 = self.cfg.address_list4.clone();
         let list6 = self.cfg.address_list6.clone();
-        let scan_generation = self.dynamic_generation;
-        let reconcile_completed = self.reconcile_completed.clone();
-        self.reconcile_handle = Some(tokio::spawn(async move {
-            let _completion = ReconcileCompletionNotify(reconcile_completed);
-            api.list_entries(list4.as_deref(), list6.as_deref())
-                .await
-                .map(|entries| ReconcileSnapshot {
-                    scan_generation,
-                    entries,
-                })
-        }));
+        self.reconcile.start(self.leases.revision(), async move {
+            let entries = api.list_entries(list4.as_deref(), list6.as_deref()).await?;
+            Ok(AddressListSnapshot {
+                captured_at_ms: now_millis(),
+                entries,
+            })
+        });
     }
 
     async fn wait_for_background_reconcile(&self) {
-        self.reconcile_completed.notified().await;
+        self.reconcile.wait().await;
     }
 
     #[cfg(test)]
     async fn harvest_background_reconcile(&mut self, tag: &str) {
-        if !self
-            .reconcile_handle
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-        {
-            return;
-        }
-        let Some(handle) = self.reconcile_handle.take() else {
+        let Some(result) = self.reconcile.take_finished().await else {
             return;
         };
-        self.apply_background_reconcile_result(tag, handle.await)
-            .await;
+        self.apply_background_reconcile_result(tag, result).await;
     }
 
     async fn await_background_reconcile(&mut self, tag: &str) {
-        let Some(handle) = self.reconcile_handle.take() else {
+        let Some(result) = self.reconcile.take().await else {
             return;
         };
-        self.apply_background_reconcile_result(tag, handle.await)
-            .await;
+        self.apply_background_reconcile_result(tag, result).await;
     }
 
     async fn apply_background_reconcile_result(
         &mut self,
         tag: &str,
-        result: std::result::Result<Result<ReconcileSnapshot>, tokio::task::JoinError>,
+        result: std::result::Result<
+            Result<VersionedSnapshot<AddressListSnapshot>>,
+            tokio::task::JoinError,
+        >,
     ) {
         match result {
-            Ok(Ok(ReconcileSnapshot {
-                scan_generation,
-                entries,
-            })) => {
+            Ok(Ok(VersionedSnapshot { generation, value })) => {
                 match self
-                    .apply_reconcile_snapshot(entries, scan_generation)
+                    .apply_reconcile_snapshot_at(value.entries, generation, value.captured_at_ms)
                     .await
                 {
                     Ok(()) => {
+                        self.reconcile_retry.reset();
                         if let Some(metrics) = &self.metrics {
                             metrics
                                 .last_reconcile_success_timestamp_seconds
@@ -1207,6 +1129,7 @@ impl AddressListManager {
                             err = %error,
                             "ros_address_list background reconcile diff failed"
                         );
+                        self.schedule_reconcile_retry().await;
                     }
                 }
             }
@@ -1222,6 +1145,7 @@ impl AddressListManager {
                     err = %error,
                     "ros_address_list background reconcile failed"
                 );
+                self.schedule_reconcile_retry().await;
             }
             Err(error) if error.is_cancelled() => {}
             Err(error) => {
@@ -1230,147 +1154,39 @@ impl AddressListManager {
                     err = %error,
                     "ros_address_list background reconcile task failed"
                 );
+                self.schedule_reconcile_retry().await;
             }
         }
     }
 
-    #[cfg(test)]
-    async fn observe_domain_inner(
-        &mut self,
-        domain: String,
-        addrs: Vec<ObservedAddr>,
-        now_ms: u64,
-    ) -> Result<()> {
-        // Keep the local suppression cache healthy before evaluating refreshes.
-        let mut dedup = AHashMap::<AddressListKey, DynamicTimeout>::new();
-        for observed in addrs {
-            let family = AddressListFamily::from_ip(observed.addr);
-            let Some(list) = self.list_name_for(family) else {
-                continue;
-            };
-            let key = AddressListKey::new(observed.addr, list.to_string());
-            if self.persistent_items.contains(&key) {
-                continue;
-            }
-            let timeout = self.effective_dynamic_timeout(observed.ttl_secs.max(1));
-            dedup
-                .entry(key)
-                .and_modify(|existing| {
-                    if let (DynamicTimeout::Timed(existing_ttl), DynamicTimeout::Timed(ttl)) =
-                        (existing, timeout)
-                    {
-                        *existing_ttl = (*existing_ttl).max(ttl);
-                    }
-                })
-                .or_insert(timeout);
-        }
-
-        if dedup.is_empty() {
-            return Ok(());
-        }
-
-        // Phase 1: collect entries that actually need a remote write, along with
-        // their pre-formatted timeout strings so the borrow checker lets us hand
-        // shared references to the concurrent futures below.
-        let mut reserved_new = AHashSet::new();
-        let to_refresh: Vec<(AddressListKey, DynamicTimeout, Option<String>)> = dedup
-            .into_iter()
-            .filter_map(|(key, timeout)| {
-                if !self.dynamic_refresh_cache.contains_key(&key)
-                    && self.dynamic_refresh_cache.len() + reserved_new.len() >= self.cfg.max_entries
-                {
-                    return None;
-                }
-                if !self.should_refresh_dynamic_entry(&key, timeout, now_ms) {
-                    return None;
-                }
-                let timeout_value = match timeout {
-                    DynamicTimeout::Timed(ttl) => Some(format!("{ttl}s")),
-                    DynamicTimeout::Timeless => None,
-                };
-                if !self.dynamic_refresh_cache.contains_key(&key) {
-                    reserved_new.insert(key.clone());
-                }
-                Some((key, timeout, timeout_value))
-            })
-            .collect();
-
-        if to_refresh.is_empty() {
-            return Ok(());
-        }
-
-        let comment = self.comment_for_dynamic(domain.as_str());
-
-        // Phase 2: pipeline upserts in bounded batches. The dependency uses a
-        // bounded response channel per command, so an unbounded join_all would
-        // let unusually large CDN answers create excessive in-flight work.
-        let api = self.api.clone();
-        let comment_str = comment.as_str();
-        let comment_prefix = self.cfg.comment_prefix.clone();
-        let plugin_tag = self.cfg.plugin_tag.clone();
-        let results = join_all_bounded(
-            to_refresh.iter().map(|(key, timeout, timeout_value)| {
-                api.upsert_owned_entry(
-                    key,
-                    timeout_value.as_deref(),
-                    comment_str,
-                    comment_prefix.as_str(),
-                    plugin_tag.as_str(),
-                    matches!(timeout, DynamicTimeout::Timed(_)),
-                )
-            }),
-            UPSERT_PIPELINE_SIZE,
-        )
-        .await;
-
-        let mut first_error: Option<DnsError> = None;
-        // Phase 3: update suppression state per result so one failure does
-        // not discard successful writes from the same response.
-        for ((key, timeout, _), result) in to_refresh.iter().zip(results) {
-            match result {
-                Ok(Some(())) => {
-                    let state = match timeout {
-                        DynamicTimeout::Timed(ttl) => DynamicRefreshState::from_write(now_ms, *ttl),
-                        DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
-                    };
-                    let _ = self.cache_dynamic_write(key.clone(), state);
-                }
-                Ok(None) => {
-                    self.dynamic_refresh_cache.remove(key);
-                    warn!(
-                        plugin = %self.cfg.plugin_tag,
-                        list = %key.list,
-                        address = %key.normalized_value(),
-                        "ros_address_list dynamic entry conflicts with foreign address-list entry, skipping"
-                    );
-                }
-                Err(err) => {
-                    self.dynamic_refresh_cache.remove(key);
-                    first_error.get_or_insert(err);
-                }
-            }
-        }
-
-        if let Some(err) = first_error {
-            return Err(err);
-        }
-        Ok(())
+    async fn schedule_reconcile_retry(&mut self) {
+        self.reconcile_retry
+            .schedule(self.transport_retry_delay().await);
     }
 
     #[cfg(test)]
     pub(super) async fn observe_domain(
         &mut self,
-        domain: String,
+        _domain: String,
         addrs: Vec<ObservedAddr>,
     ) -> Result<()> {
-        self.observe_domain_inner(domain, addrs, now_millis()).await
+        self.observe_at_for_test(addrs, now_millis()).await
     }
 
     async fn observe_address_batch(
         &mut self,
         observations: &[(AddressListKey, AddressObservation)],
     ) -> Vec<Result<()>> {
-        self.prune_dynamic_cache(now_millis());
+        self.observe_address_batch_at(observations, now_millis())
+            .await
+    }
+
+    async fn observe_address_batch_at(
+        &mut self,
+        observations: &[(AddressListKey, AddressObservation)],
+        now: u64,
+    ) -> Vec<Result<()>> {
+        self.prune_dynamic_cache(now);
 
         struct Prepared {
             index: usize,
@@ -1380,48 +1196,27 @@ impl AddressListManager {
             comment: String,
         }
 
-        let now = now_millis();
         let mut outcomes = std::iter::repeat_with(|| None)
             .take(observations.len())
             .collect::<Vec<Option<Result<()>>>>();
         let mut prepared = Vec::new();
-        let mut reserved_new = AHashSet::new();
         for (index, (key, observation)) in observations.iter().enumerate() {
             if self.persistent_items.contains(key) {
                 outcomes[index] = Some(Ok(()));
                 continue;
             }
-            if !self.dynamic_refresh_cache.contains_key(key)
-                && !reserved_new.contains(key)
-                && self.dynamic_refresh_cache.len() + reserved_new.len() >= self.cfg.max_entries
-            {
-                if let Some(metrics) = &self.metrics {
-                    metrics
-                        .capacity_rejected_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                outcomes[index] = Some(Err(DnsError::plugin(format!(
-                    "ros_address_list dynamic state capacity {} reached",
-                    self.cfg.max_entries
-                ))));
+            let deadline = observation
+                .expires_at_ms
+                .map_or(LeaseDeadline::Timeless, LeaseDeadline::At);
+            if deadline.is_expired(now) {
+                outcomes[index] = Some(Ok(()));
                 continue;
             }
-            let timeout = match observation.expires_at_ms {
-                None => DynamicTimeout::Timeless,
-                Some(expires_at_ms) if expires_at_ms <= now => {
-                    outcomes[index] = Some(Ok(()));
-                    continue;
-                }
-                Some(expires_at_ms) => {
-                    let remaining_ms = expires_at_ms.saturating_sub(now);
-                    let seconds = remaining_ms
-                        .saturating_add(999)
-                        .saturating_div(1_000)
-                        .clamp(1, u64::from(u32::MAX)) as u32;
-                    DynamicTimeout::Timed(seconds)
-                }
-            };
-            if !self.should_refresh_dynamic_entry(key, timeout, now) {
+            self.leases.observe(key.clone(), deadline, now);
+            let timeout = deadline
+                .remaining_secs(now)
+                .map_or(DynamicTimeout::Timeless, DynamicTimeout::Timed);
+            if !self.should_refresh_dynamic_entry(key, now) {
                 outcomes[index] = Some(Ok(()));
                 continue;
             }
@@ -1433,11 +1228,8 @@ impl AddressListManager {
                     DynamicTimeout::Timed(ttl) => Some(format!("{ttl}s")),
                     DynamicTimeout::Timeless => None,
                 },
-                comment: self.comment_for_dynamic(&observation.domain),
+                comment: self.comment_for_dynamic(),
             });
-            if !self.dynamic_refresh_cache.contains_key(key) {
-                reserved_new.insert(key.clone());
-            }
         }
 
         let api = self.api.clone();
@@ -1461,25 +1253,15 @@ impl AddressListManager {
         for (item, result) in prepared.into_iter().zip(results) {
             outcomes[item.index] = Some(match result {
                 Ok(Some(())) => {
-                    let state = match item.timeout {
-                        DynamicTimeout::Timed(ttl) => DynamicRefreshState::from_write(now, ttl),
-                        DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
-                    };
-                    if self.cache_dynamic_write(item.key, state) {
-                        Ok(())
-                    } else {
-                        Err(DnsError::plugin(format!(
-                            "ros_address_list dynamic state capacity {} reached",
-                            self.cfg.max_entries
-                        )))
-                    }
+                    self.cache_dynamic_write(&item.key, now);
+                    Ok(())
                 }
                 Ok(None) => {
-                    self.dynamic_refresh_cache.remove(&item.key);
+                    self.leases.remove(&item.key);
                     Ok(())
                 }
                 Err(error) => {
-                    self.dynamic_refresh_cache.remove(&item.key);
+                    self.leases.remove(&item.key);
                     Err(error)
                 }
             });
@@ -1496,7 +1278,6 @@ impl AddressListManager {
         &mut self,
         items: AHashSet<AddressListKey>,
     ) -> Result<()> {
-        self.ensure_initialized().await?;
         // Persistent ownership takes precedence over any cached dynamic state.
         self.persistent_items = items;
         self.empty_state_needs_reconcile = true;
@@ -1508,16 +1289,15 @@ impl AddressListManager {
                 self.cfg.address_list6.as_deref(),
             )
             .await?;
-        self.apply_reconcile_snapshot(entries, self.dynamic_generation)
+        self.apply_reconcile_snapshot(entries, self.leases.revision())
             .await
     }
 
     #[cfg(test)]
     pub(super) async fn reconcile(&mut self) -> Result<()> {
-        self.ensure_initialized().await?;
         self.prune_dynamic_cache(now_millis());
         if self.persistent_items.is_empty()
-            && self.dynamic_refresh_cache.is_empty()
+            && self.leases.is_empty()
             && !self.empty_state_needs_reconcile
         {
             return Ok(());
@@ -1529,7 +1309,7 @@ impl AddressListManager {
                 self.cfg.address_list6.as_deref(),
             )
             .await?;
-        self.apply_reconcile_snapshot(entries, self.dynamic_generation)
+        self.apply_reconcile_snapshot(entries, self.leases.revision())
             .await
     }
 
@@ -1581,13 +1361,10 @@ impl AddressListManager {
     }
 
     pub(super) async fn shutdown(&mut self, cleanup: AddressListCleanupScope) -> Result<()> {
-        if let Some(handle) = self.reconcile_handle.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        self.reconcile.cancel().await;
 
         if cleanup.is_empty() {
-            self.dynamic_refresh_cache.clear();
+            self.leases.clear();
             return Ok(());
         }
 
@@ -1595,7 +1372,6 @@ impl AddressListManager {
         // transport timeouts.
         self.api.begin_shutdown_cleanup();
         // Cleanup only touches entries that match this plugin's comment ownership.
-        self.ensure_initialized().await?;
         let entries = self
             .api
             .list_entries(
@@ -1643,7 +1419,7 @@ impl AddressListManager {
             }
             warn!(plugin = %self.cfg.plugin_tag, failures, "ros_address_list shutdown cleanup completed with failures");
         }
-        self.dynamic_refresh_cache.clear();
+        self.leases.clear();
         self.refresh_managed_metric();
         self.refresh_transport_metrics().await;
         first_error.map_or(Ok(()), Err)
@@ -1651,28 +1427,40 @@ impl AddressListManager {
 
     #[cfg(test)]
     pub(super) fn dynamic_cache_len(&self) -> usize {
-        self.dynamic_refresh_cache.len()
+        self.leases.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn lease_revision_for_test(&self) -> u64 {
+        self.leases.revision()
     }
 
     #[cfg(test)]
     pub(super) async fn observe_domain_at_for_test(
         &mut self,
-        domain: String,
+        _domain: String,
         addrs: Vec<ObservedAddr>,
         now_ms: u64,
     ) -> Result<()> {
-        self.observe_domain_inner(domain, addrs, now_ms).await
+        self.observe_at_for_test(addrs, now_ms).await
+    }
+
+    #[cfg(test)]
+    async fn observe_at_for_test(&mut self, addrs: Vec<ObservedAddr>, now_ms: u64) -> Result<()> {
+        let observations =
+            AddressObservationPolicy::from_config(&self.cfg).commands_at(addrs, now_ms);
+        self.observe_address_batch_at(&observations, now_ms)
+            .await
+            .into_iter()
+            .find_map(std::result::Result::err)
+            .map_or(Ok(()), Err)
     }
 
     #[cfg(test)]
     pub(super) async fn background_reconcile_for_test(&mut self) {
         let tag = self.cfg.plugin_tag.clone();
         self.spawn_background_reconcile(tag.clone());
-        while self
-            .reconcile_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
+        while self.reconcile.is_running() && !self.reconcile.is_finished() {
             tokio::task::yield_now().await;
         }
         self.harvest_background_reconcile(tag.as_str()).await;
@@ -1685,12 +1473,7 @@ impl AddressListManager {
     }
 }
 
-pub(super) fn encode_comment(
-    prefix: &str,
-    plugin_tag: &str,
-    kind: OwnedCommentKind,
-    domain: Option<&str>,
-) -> String {
+pub(super) fn encode_comment(prefix: &str, plugin_tag: &str, kind: OwnedCommentKind) -> String {
     // Comments intentionally stay compact because they live on RouterOS objects
     // and are parsed frequently during reconciliation and cleanup.
     let mut out = String::new();
@@ -1705,12 +1488,6 @@ pub(super) fn encode_comment(
     out.push_str(COMMENT_FIELD_KIND);
     out.push('=');
     out.push_str(kind.as_str());
-    if let Some(domain) = domain {
-        out.push(';');
-        out.push_str(COMMENT_FIELD_DOMAIN);
-        out.push('=');
-        out.push_str(domain);
-    }
     out
 }
 
@@ -1765,6 +1542,8 @@ async fn run_manager_worker(
     tag: String,
     mut manager: AddressListManager,
     handle: AddressListManagerHandle,
+    mut lifecycle_rx: mpsc::Receiver<LifecycleCommand>,
+    mut active: bool,
     mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
 ) {
     // Every state transition is serialized here. Request-path code only pushes
@@ -1783,22 +1562,27 @@ async fn run_manager_worker(
                 None => std::future::pending::<()>().await,
             }
         };
+        let reconcile_retry_at = manager.reconcile_retry.deadline();
+        let reconcile_retry_wakeup = async move {
+            match reconcile_retry_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         let command = tokio::select! {
             biased;
             shutdown = &mut shutdown_rx => {
                 if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
-                    if let Err(e) = manager.shutdown(cleanup).await {
-                        warn!(plugin = %tag, err = %e, "ros_address_list shutdown cleanup failed");
-                    }
-                    let _ = done.send(());
+                    let _ = done.send(manager.shutdown(cleanup).await);
                 }
                 break;
             }
-            () = manager.wait_for_background_reconcile() => {
+            lifecycle = lifecycle_rx.recv() => lifecycle.map(WorkerCommand::Lifecycle),
+            () = manager.wait_for_background_reconcile(), if active => {
                 Some(WorkerCommand::ReconcileCompleted)
             }
-            control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
-            () = retry_wakeup => {
+            control = handle.controls.recv(), if active => control.map(|(_, command)| WorkerCommand::Control(command)),
+            () = retry_wakeup, if active => {
                 let now = tokio::time::Instant::now();
                 let due_keys = retry_observations
                     .iter()
@@ -1824,7 +1608,11 @@ async fn run_manager_worker(
                     from_retry: true,
                 })
             }
-            observation = handle.observations.recv() => {
+            () = reconcile_retry_wakeup, if active => {
+                manager.reconcile_retry.mark_due();
+                Some(WorkerCommand::Control(ControlCommand::Reconcile))
+            }
+            observation = handle.observations.recv(), if active => {
                 observation.map(|first| {
                     let mut batch = vec![first];
                     while batch.len() < UPSERT_PIPELINE_SIZE {
@@ -1844,6 +1632,83 @@ async fn run_manager_worker(
             break;
         };
         match command {
+            WorkerCommand::Lifecycle(LifecycleCommand::Quiesce { targets, done }) => {
+                active = false;
+                manager.reconcile.cancel().await;
+                let mut merged = AHashMap::<AddressListKey, ObservationCommand>::new();
+                for (key, command) in handle
+                    .observations
+                    .drain_where(|key| targets.contains(&(key.family, key.list.clone())))
+                {
+                    merged
+                        .entry(key)
+                        .and_modify(|current| current.coalesce(command.clone()))
+                        .or_insert(command);
+                }
+                let retry_keys = retry_observations
+                    .keys()
+                    .filter(|key| targets.contains(&(key.family, key.list.clone())))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in retry_keys {
+                    if let Some((_, command)) = retry_observations.remove(&key) {
+                        merged
+                            .entry(key)
+                            .and_modify(|current| current.coalesce(command.clone()))
+                            .or_insert(command);
+                    }
+                }
+                let _ = done.send(AddressListPendingWork {
+                    items: merged.into_iter().collect(),
+                });
+            }
+            WorkerCommand::Lifecycle(LifecycleCommand::Activate { pending, done }) => {
+                let now = now_millis();
+                let policy = LeasePolicy::new(
+                    manager.cfg.min_ttl,
+                    manager.cfg.max_ttl,
+                    manager.cfg.fixed_ttl,
+                );
+                for (key, mut command) in pending.items {
+                    let deadline = match command.observation.expires_at_ms {
+                        Some(deadline) => LeaseDeadline::At(deadline),
+                        None => LeaseDeadline::Timeless,
+                    };
+                    let deadline =
+                        policy.cap_recovered(deadline, command.observation.observed_at_ms);
+                    if deadline.is_expired(now) {
+                        for completion in command.completions {
+                            completion.finish(&Ok(()));
+                        }
+                        continue;
+                    }
+                    command.observation.expires_at_ms = deadline.unix_millis();
+                    match handle.observations.try_push(key.clone(), command) {
+                        Ok(_) => {}
+                        Err(TryPushError::Full(command)) => defer_address_observation(
+                            &mut retry_observations,
+                            tokio::time::Instant::now(),
+                            key,
+                            command,
+                            manager.metrics.as_deref(),
+                        ),
+                        Err(TryPushError::Closed(command)) => {
+                            let result = Err(DnsError::plugin(
+                                "ros_address_list handoff observation mailbox is closed",
+                            ));
+                            for completion in command.completions {
+                                completion.finish(&result);
+                            }
+                            if let Some(metrics) = &manager.metrics {
+                                metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                active = true;
+                handle.request_reconcile();
+                let _ = done.send(());
+            }
             WorkerCommand::Observe {
                 mut batch,
                 from_retry,
@@ -1956,17 +1821,8 @@ fn defer_address_observation(
         completion.finish(&error);
     }
     if let Some(metrics) = metrics {
-        metrics
-            .capacity_rejected_total
-            .fetch_add(1, Ordering::Relaxed);
         metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
     }
-}
-
-fn dynamic_refresh_lead_ms(timeout_ms: u64) -> u64 {
-    // Refresh slightly ahead of the estimated remote expiry while keeping both
-    // extremely short and extremely long TTLs within practical bounds.
-    (timeout_ms / 4).clamp(MIN_DYNAMIC_REFRESH_LEAD_MS, MAX_DYNAMIC_REFRESH_LEAD_MS)
 }
 
 fn parse_routeros_duration_secs(raw: &str) -> Option<u32> {
@@ -2007,29 +1863,6 @@ fn now_millis() -> u64 {
     AppClock::elapsed_millis()
 }
 
-fn normalize_network_ip(ip: IpAddr, prefix: u8) -> IpAddr {
-    match ip {
-        IpAddr::V4(addr) => {
-            let raw = u32::from(addr);
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (HOST_PREFIX_V4 - prefix)
-            };
-            IpAddr::V4((raw & mask).into())
-        }
-        IpAddr::V6(addr) => {
-            let raw = u128::from(addr);
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u128::MAX << (HOST_PREFIX_V6 - prefix)
-            };
-            IpAddr::V6((raw & mask).into())
-        }
-    }
-}
-
 pub(super) fn parse_router_address(family: AddressListFamily, raw: &str) -> Option<(IpAddr, u8)> {
     let value = raw.trim();
     if value.is_empty() {
@@ -2041,7 +1874,8 @@ pub(super) fn parse_router_address(family: AddressListFamily, raw: &str) -> Opti
         if AddressListFamily::from_ip(ip) != family || !family.is_valid_prefix(prefix) {
             return None;
         }
-        return Some((normalize_network_ip(ip, prefix), prefix));
+        let normalized = IpPrefix::new(ip, prefix)?;
+        return Some((normalized.address(), normalized.prefix()));
     }
 
     let ip = value.parse::<IpAddr>().ok()?;
@@ -2072,7 +1906,6 @@ mod observation_tests {
         for index in 0..10_000 {
             handle
                 .try_observe(
-                    format!("domain-{index}.example."),
                     vec![ObservedAddr {
                         addr,
                         ttl_secs: 60 + (index % 300) as u32,
@@ -2085,9 +1918,8 @@ mod observation_tests {
         assert_eq!(handle.observations.len(), 1);
         let (key, command) = handle.observations.recv().await.expect("observation");
         assert_eq!(key.address, addr);
-        // The coalesced value keeps the longest absolute expiry, not merely
-        // the last domain that happened to observe the same RouterOS row.
-        assert_eq!(command.observation.domain, "domain-9899.example.");
+        // The coalesced value keeps the longest absolute expiry.
+        assert!(command.observation.expires_at_ms.is_some());
     }
 
     #[tokio::test]
@@ -2102,24 +1934,16 @@ mod observation_tests {
             min_ttl: 60,
             max_ttl: 3600,
             fixed_ttl: Some(0),
-            max_entries: 65_536,
         };
-        let handle = AddressListManagerHandle::new(&config, None);
+        let handle = AddressListManagerHandle::new(&config, None, None);
         let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         handle
-            .try_observe(
-                "timeless.example.".to_string(),
-                vec![ObservedAddr { addr, ttl_secs: 60 }],
-                None,
-            )
+            .try_observe(vec![ObservedAddr { addr, ttl_secs: 60 }], None)
             .expect("timeless observation");
 
         config.fixed_ttl = Some(300);
         let (key, observation) = AddressObservationPolicy::from_config(&config)
-            .commands(
-                "timed.example.".to_string(),
-                vec![ObservedAddr { addr, ttl_secs: 60 }],
-            )
+            .commands(vec![ObservedAddr { addr, ttl_secs: 60 }])
             .pop()
             .expect("timed command");
         handle
@@ -2134,7 +1958,6 @@ mod observation_tests {
             .expect("coalesced timed observation");
 
         let (_, command) = handle.observations.recv().await.expect("observation");
-        assert_eq!(command.observation.domain, "timeless.example.");
         assert_eq!(command.observation.expires_at_ms, None);
     }
 }

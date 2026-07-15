@@ -1729,7 +1729,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     icon: "Route",
     metrics: {
       metricLabels: {
-        ros_route_observe_total: "观测域名",
+        ros_route_observe_total: "地址观测",
         ros_route_dropped_total: "异步丢弃",
         ros_route_sync_error_total: "同步失败",
         ros_route_sync_timeout_total: "同步超时",
@@ -1738,7 +1738,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_route_pending_observations: "待处理观测",
         ros_route_managed_entries: "受管路由",
         ros_route_coalesced_total: "合并观测",
-        ros_route_capacity_rejected_total: "容量拒绝",
         ros_route_reconnect_total: "重连",
         ros_route_connect_attempt_total: "连接尝试",
         ros_route_backoff_total: "退避",
@@ -1748,7 +1747,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_route_cleanup_error_total: "清理失败",
       },
       metricHelp: {
-        ros_route_observe_total: "提交给 RouterOS 路由管理器的域名观测总数。",
+        ros_route_observe_total: "提交给 RouterOS 路由管理器的地址观测总数。",
         ros_route_dropped_total:
           "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
         ros_route_sync_error_total:
@@ -1823,7 +1822,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         default: "fdns",
       },
       {
-        key: "persistent_route",
+        key: "persistent",
         label: "常驻路由",
         type: "object",
         fields: [
@@ -1860,14 +1859,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         type: "switch",
         default: false,
         description:
-          "删除普通路由前检查 RouterOS conntrack；有目标连接时延后删除。",
-      },
-      {
-        key: "max_entries",
-        label: "本地状态上限",
-        type: "number",
-        default: 65536,
-        description: "分别限制本地路由条目和域名绑定数量；必须大于 0。",
+          "删除到期动态主机路由前检查 RouterOS conntrack；有目标连接时延后删除。",
       },
       {
         key: "cleanup_on_shutdown",
@@ -1885,14 +1877,13 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     icon: "Network",
     metrics: {
       metricLabels: {
-        ros_address_list_observe_total: "观测域名",
+        ros_address_list_observe_total: "地址观测",
         ros_address_list_dropped_total: "异步丢弃",
         ros_address_list_sync_error_total: "同步失败",
         ros_address_list_sync_timeout_total: "同步超时",
         ros_address_list_pending_observations: "待处理观测",
         ros_address_list_managed_entries: "受管条目",
         ros_address_list_coalesced_total: "合并观测",
-        ros_address_list_capacity_rejected_total: "容量拒绝",
         ros_address_list_reconnect_total: "重连",
         ros_address_list_connect_attempt_total: "连接尝试",
         ros_address_list_backoff_total: "退避",
@@ -1904,7 +1895,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       metricHelp: {
         ros_address_list_observe_total:
-          "提交给 RouterOS address-list 管理器的域名观测总数。",
+          "提交给 RouterOS address-list 管理器的地址观测总数。",
         ros_address_list_dropped_total:
           "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
         ros_address_list_sync_error_total:
@@ -2058,13 +2049,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         description: "为所有动态写入项指定固定 TTL。",
         label: "动态项固定 TTL",
         type: "number",
-      },
-      {
-        key: "max_entries",
-        description: "限制本地已知动态地址键数量；persistent 不计入。",
-        label: "动态状态上限",
-        type: "number",
-        default: 65536,
       },
       {
         key: "cleanup_on_shutdown",

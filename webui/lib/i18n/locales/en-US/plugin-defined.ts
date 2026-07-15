@@ -1666,28 +1666,23 @@ export const enUSPluginDefined = {
         gateway6: { label: "IPv6 gateway", placeholder: "fe80::2%ether1" },
         distance: { label: "Route distance" },
         comment_prefix: { label: "Comment prefix" },
-        persistent_route: { label: "Persistent routes" },
-        "persistent_route.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
-        "persistent_route.ips[]": { label: "Value", placeholder: "1.1.1.1" },
-        "persistent_route.files": { label: "Files", placeholder: "/etc/oxidns/persistent_routes.txt" },
-        "persistent_route.files[]": { label: "Value", placeholder: "/etc/oxidns/persistent_routes.txt" },
+        persistent: { label: "Persistent routes" },
+        "persistent.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
+        "persistent.ips[]": { label: "Value", placeholder: "1.1.1.1" },
+        "persistent.files": { label: "Files", placeholder: "/etc/oxidns/persistent_routes.txt" },
+        "persistent.files[]": { label: "Value", placeholder: "/etc/oxidns/persistent_routes.txt" },
         min_ttl: { label: "Minimum dynamic-route TTL" },
         max_ttl: { label: "Maximum dynamic-route TTL" },
         fixed_ttl: { label: "Fixed dynamic-route TTL", description: "Set to 0 to disable time-based expiry." },
         conntrack_guard: {
           label: "Connection tracking guard",
-          description: "Check RouterOS conntrack before normal route deletion and defer when a target connection exists.",
-        },
-        max_entries: {
-          label: "Local state limit",
-          description:
-            "Limit route entries and domain bindings independently; must be greater than 0.",
+          description: "Check exact target IPs before deleting expired dynamic host routes and defer when a connection exists.",
         },
         cleanup_on_shutdown: { label: "Clean up on shutdown" },
       },
       metrics: {
         labels: {
-          ros_route_observe_total: "Observations",
+          ros_route_observe_total: "Address observations",
           ros_route_dropped_total: "Async drops",
           ros_route_sync_error_total: "Sync failures",
           ros_route_sync_timeout_total: "Sync timeouts",
@@ -1696,7 +1691,7 @@ export const enUSPluginDefined = {
         },
         help: {
           ros_route_observe_total:
-            "The total number of domain observations submitted to the RouterOS route manager.",
+            "The total number of address observations submitted to the RouterOS route manager.",
           ros_route_dropped_total:
             "The total number of observations dropped because the asynchronous queue was unavailable.",
           ros_route_sync_error_total:
@@ -1809,14 +1804,14 @@ export const enUSPluginDefined = {
       },
       metrics: {
         labels: {
-          ros_address_list_observe_total: "Observation domain name",
+          ros_address_list_observe_total: "Address observations",
           ros_address_list_dropped_total: "Asynchronous discard",
           ros_address_list_sync_error_total: "Sync failed",
           ros_address_list_sync_timeout_total: "Sync timeout",
         },
         help: {
           ros_address_list_observe_total:
-            "The total number of domain name observations submitted to the RouterOS address-list manager.",
+            "The total number of address observations submitted to the RouterOS address-list manager.",
           ros_address_list_dropped_total:
             "The total number of observations dropped in asynchronous mode because the queue was full or the channel was closed.",
           ros_address_list_sync_error_total:

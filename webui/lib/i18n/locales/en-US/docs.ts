@@ -385,16 +385,14 @@ export const enUSDocs = {
     gateway6: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
     distance: "- Type: `u8`; Default: `100`\n- RouterOS static-route distance.",
     comment_prefix: "- Type: `string`; Default: `fdns`\n- Route-comment ownership prefix; it and the plugin tag cannot contain `;` or `=`.",
-    "persistent_route.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes.",
-    "persistent_route.files": "- Type: `array<string>`\n- Persistent route files reloaded every minute.",
+    "persistent.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes.",
+    "persistent.files": "- Type: `array<string>`\n- Persistent route files read only during plugin initialization; reload the plugin or application to apply changes.",
     min_ttl: "- Type: `u32`; Default: `60`\n- Minimum clamp for dynamic DNS-route TTLs.",
     max_ttl: "- Type: `u32`; Default: `3600`\n- Maximum clamp for dynamic DNS-route TTLs.",
-    fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry.",
+    fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry. Missing IPs in later answers are not withdrawn.",
     conntrack_guard:
-      "- Type: `bool`; Default: `false`\n- Checks RouterOS conntrack before normal route deletion; any tracked connection to the destination defers deletion and retries after 30 seconds. Shutdown and internal maintenance cleanup are unchanged.",
-    max_entries:
-      "- Type: `usize`; Default: `65536`\n- Independently limits retained route entries and domain bindings and must be greater than `0`. Initial persistent routes or a merged file reload above the limit are rejected.",
-    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin on shutdown.",
+      "- Type: `bool`; Default: `false`\n- Checks exact destination IPs before deleting expired dynamic `/32` and `/128` routes. Active connections or query failures defer deletion for 30 seconds. Persistent and shutdown cleanup bypass the guard.",
+    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin on shutdown, with a 30-second total cleanup budget. Set it to `false` when production restarts or rolling deployments require policy continuity.",
   },
   ros_address_list: {
     address:

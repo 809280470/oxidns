@@ -381,16 +381,14 @@ export const zhCNDocs = {
     gateway6: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv6 路由下一跳。",
     distance: "- 类型：`u8`；默认：`100`\n- RouterOS 静态路由 distance。",
     comment_prefix: "- 类型：`string`；默认：`fdns`\n- 路由注释归属前缀；该值及插件 tag 不能包含 `;` 或 `=`。",
-    "persistent_route.ips": "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由。",
-    "persistent_route.files": "- 类型：`array<string>`\n- 每分钟重载的固定路由文件。",
+    "persistent.ips": "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由。",
+    "persistent.files": "- 类型：`array<string>`\n- 仅在插件初始化时读取的固定路由文件；内容变化需重载插件或应用。",
     min_ttl: "- 类型：`u32`；默认：`60`\n- 动态 DNS 路由 TTL 的最小钳制值。",
     max_ttl: "- 类型：`u32`；默认：`3600`\n- 动态 DNS 路由 TTL 的最大钳制值。",
-    fixed_ttl: "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL；设为 `0` 时不按时间过期。",
+    fixed_ttl: "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL；设为 `0` 时不按时间过期，后续应答缺少该 IP 不会主动撤销。",
     conntrack_guard:
-      "- 类型：`bool`；默认：`false`\n- 删除普通路由前检查 RouterOS conntrack；目标地址仍有任意跟踪连接时延后删除并在 30 秒后重试。关闭清理和内部维护清理不受影响。",
-    max_entries:
-      "- 类型：`usize`；默认：`65536`\n- 分别限制管理器保留的路由条目数和域名绑定数，必须大于 `0`。常驻路由初始配置或文件重载合并结果超过该值时会拒绝更新。",
-    cleanup_on_shutdown: "- 类型：`bool`；默认：`true`\n- 关闭时清理本插件拥有的动态和固定路由。",
+      "- 类型：`bool`；默认：`false`\n- 仅在删除到期动态 `/32`、`/128` 主机路由前检查精确目标 IP；存在连接或查询失败时延后 30 秒。persistent 删除和关闭清理不受影响。",
+    cleanup_on_shutdown: "- 类型：`bool`；默认：`true`\n- 关闭时清理本插件拥有的动态和固定路由，清理总预算为 30 秒。生产重启或滚动发布需要策略连续性时建议设为 `false`。",
   },
   ros_address_list: {
     address:

@@ -1513,27 +1513,23 @@ export const zhCNPluginDefined = {
         gateway6: { label: "IPv6 网关", placeholder: "fe80::2%ether1" },
         distance: { label: "路由距离" },
         comment_prefix: { label: "注释前缀" },
-        persistent_route: { label: "常驻路由" },
-        "persistent_route.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
-        "persistent_route.ips[]": { label: "输入值", placeholder: "1.1.1.1" },
-        "persistent_route.files": { label: "文件", placeholder: "/etc/oxidns/persistent_routes.txt" },
-        "persistent_route.files[]": { label: "输入值", placeholder: "/etc/oxidns/persistent_routes.txt" },
+        persistent: { label: "常驻路由" },
+        "persistent.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
+        "persistent.ips[]": { label: "输入值", placeholder: "1.1.1.1" },
+        "persistent.files": { label: "文件", placeholder: "/etc/oxidns/persistent_routes.txt" },
+        "persistent.files[]": { label: "输入值", placeholder: "/etc/oxidns/persistent_routes.txt" },
         min_ttl: { label: "动态路由最小 TTL" },
         max_ttl: { label: "动态路由最大 TTL" },
         fixed_ttl: { label: "动态路由固定 TTL", description: "填 0 表示动态路由不按时间过期。" },
         conntrack_guard: {
           label: "连接跟踪保护",
-          description: "删除普通路由前检查 RouterOS conntrack；有目标连接时延后删除。",
-        },
-        max_entries: {
-          label: "本地状态上限",
-          description: "分别限制本地路由条目和域名绑定数量；必须大于 0。",
+          description: "删除到期动态主机路由前检查精确目标 IP；有连接时延后删除。",
         },
         cleanup_on_shutdown: { label: "关闭时清理" },
       },
       metrics: {
         labels: {
-          ros_route_observe_total: "观测域名",
+          ros_route_observe_total: "地址观测",
           ros_route_dropped_total: "异步丢弃",
           ros_route_sync_error_total: "同步失败",
           ros_route_sync_timeout_total: "同步超时",
@@ -1541,7 +1537,7 @@ export const zhCNPluginDefined = {
           ros_route_connection_check_error_total: "连接检查失败",
         },
         help: {
-          ros_route_observe_total: "提交给 RouterOS 路由管理器的域名观测总数。",
+          ros_route_observe_total: "提交给 RouterOS 路由管理器的地址观测总数。",
           ros_route_dropped_total: "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
           ros_route_sync_error_total: "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
           ros_route_sync_timeout_total: "同步模式下入队或等待超时的观测总数。",
@@ -1638,14 +1634,14 @@ export const zhCNPluginDefined = {
       },
       metrics: {
         labels: {
-          ros_address_list_observe_total: "观测域名",
+          ros_address_list_observe_total: "地址观测",
           ros_address_list_dropped_total: "异步丢弃",
           ros_address_list_sync_error_total: "同步失败",
           ros_address_list_sync_timeout_total: "同步超时",
         },
         help: {
           ros_address_list_observe_total:
-            "提交给 RouterOS address-list 管理器的域名观测总数。",
+            "提交给 RouterOS address-list 管理器的地址观测总数。",
           ros_address_list_dropped_total:
             "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
           ros_address_list_sync_error_total:

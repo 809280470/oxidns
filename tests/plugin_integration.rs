@@ -693,7 +693,7 @@ plugins:
 
 #[cfg(feature = "plugin-ros-address-list")]
 #[tokio::test]
-async fn test_ros_address_list_plugin_init_accepts_tls_and_capacity_config() -> Result<()> {
+async fn test_ros_address_list_plugin_init_accepts_tls_and_deprecated_max_entries() -> Result<()> {
     let yaml = r#"
 plugins:
   - tag: ros_address_list_policy

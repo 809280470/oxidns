@@ -72,8 +72,6 @@ pub mod response;
 pub mod reverse_lookup;
 #[cfg(feature = "plugin-ros-address-list")]
 pub mod ros_address_list;
-#[cfg(any(feature = "plugin-ros-address-list", feature = "plugin-ros-route"))]
-pub(crate) mod ros_common;
 #[cfg(feature = "plugin-ros-route")]
 pub mod ros_route;
 #[cfg(feature = "plugin-script")]
