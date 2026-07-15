@@ -1071,6 +1071,7 @@ mod tests {
         next_id: u64,
         fail_next_upsert: bool,
         fail_healthcheck: bool,
+        list_entries_calls: u64,
         list_entries_delay: Option<Duration>,
         convert_persistent_to_dynamic_after_list: bool,
         convert_owned_to_foreign_after_list: bool,
@@ -1107,6 +1108,13 @@ mod tests {
             self.state
                 .lock()
                 .map(|state| state.entries.len())
+                .unwrap_or_default()
+        }
+
+        fn list_entries_calls(&self) -> u64 {
+            self.state
+                .lock()
+                .map(|state| state.list_entries_calls)
                 .unwrap_or_default()
         }
     }
@@ -1162,10 +1170,11 @@ mod tests {
             list6: Option<&str>,
         ) -> Result<Vec<RouterListEntry>> {
             let (fail_scan, delay) = {
-                let state = self
+                let mut state = self
                     .state
                     .lock()
                     .map_err(|_| DnsError::plugin("mock api lock poisoned"))?;
+                state.list_entries_calls = state.list_entries_calls.saturating_add(1);
                 (state.fail_healthcheck, state.list_entries_delay)
             };
             if fail_scan {
@@ -1411,7 +1420,7 @@ mod tests {
             .collect();
         let mut manager = AddressListManager::new(api.clone(), cfg);
 
-        manager.reconcile().await.unwrap();
+        manager.background_reconcile_for_test().await;
 
         assert_eq!(api.attempts.load(Ordering::Relaxed), 17);
         assert_eq!(api.max_active.load(Ordering::Acquire), 16);
@@ -1987,6 +1996,57 @@ persistent:
         let state = api.state.lock().unwrap();
         assert_eq!(state.upsert_v4, 0);
         assert_eq!(state.update_ops, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_reconcile_removes_stale_persistent_then_skips_redundant_scan() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let key = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(100, 64, 1, 10)),
+            "oxidns_ipv4".to_string(),
+        );
+        api.seed_entry(RouterListEntry {
+            id: "*stale-persistent".to_string(),
+            key,
+            timeout: None,
+            comment: Some(encode_comment(
+                "oxidns",
+                "mk",
+                OwnedCommentKind::Persistent,
+                None,
+            )),
+        });
+        let mut manager = AddressListManager::new(api.clone(), default_cfg("mk"));
+
+        manager.background_reconcile_for_test().await;
+
+        assert_eq!(api.entry_count(), 0);
+        assert_eq!(api.list_entries_calls(), 1);
+
+        manager.background_reconcile_for_test().await;
+        assert_eq!(api.list_entries_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_is_applied_as_soon_as_background_scan_finishes() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let mut cfg = default_cfg("startup-reconcile");
+        cfg.persistent_items.insert(AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(100, 64, 1, 11)),
+            "oxidns_ipv4".to_string(),
+        ));
+        let manager = AddressListManager::new(api.clone(), cfg);
+        let runtime = AddressListManagerRuntime::start("startup-reconcile".to_string(), manager);
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while api.entry_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup reconcile result should be applied without waiting for a timer tick");
+
+        runtime.shutdown(AddressListCleanupScope::none()).await;
     }
 
     #[tokio::test]

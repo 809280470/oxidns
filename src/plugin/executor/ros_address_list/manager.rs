@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -412,6 +412,14 @@ struct ReconcileSnapshot {
     entries: Vec<RouterListEntry>,
 }
 
+struct ReconcileCompletionNotify(Arc<Notify>);
+
+impl Drop for ReconcileCompletionNotify {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 #[derive(Debug)]
 struct ShutdownRequest {
     cleanup: AddressListCleanupScope,
@@ -646,6 +654,7 @@ enum WorkerCommand {
         from_retry: bool,
     },
     Control(ControlCommand),
+    ReconcileCompleted,
 }
 
 #[derive(Debug)]
@@ -764,6 +773,12 @@ pub(super) struct AddressListManager {
     dynamic_refresh_cache: AHashMap<AddressListKey, DynamicRefreshState>,
     /// Currently running background reconcile task, if any.
     reconcile_handle: Option<JoinHandle<Result<ReconcileSnapshot>>>,
+    /// Wakes the worker as soon as a background RouterOS scan has produced a
+    /// result, avoiding timer-driven polling of the join handle.
+    reconcile_completed: Arc<Notify>,
+    /// An empty local state still requires one successful remote scan so stale
+    /// persistent rows from a previous configuration can be removed.
+    empty_state_needs_reconcile: bool,
     /// Monotonic local write generation for race-safe background snapshots.
     dynamic_generation: u64,
     /// One-time startup guard.
@@ -778,6 +793,8 @@ impl AddressListManager {
             persistent_items: cfg.persistent_items.clone(),
             dynamic_refresh_cache: AHashMap::new(),
             reconcile_handle: None,
+            reconcile_completed: Arc::new(Notify::new()),
+            empty_state_needs_reconcile: true,
             dynamic_generation: 0,
             cfg,
             initialized: false,
@@ -924,6 +941,7 @@ impl AddressListManager {
         {
             return false;
         }
+        self.empty_state_needs_reconcile = true;
         self.dynamic_generation = self.dynamic_generation.wrapping_add(1);
         state.generation = self.dynamic_generation;
         self.dynamic_refresh_cache.insert(key, state);
@@ -1064,7 +1082,13 @@ impl AddressListManager {
         }
         self.prune_dynamic_cache(now);
         self.refresh_managed_metric();
-        first_error.map_or(Ok(()), Err)
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if self.persistent_items.is_empty() && self.dynamic_refresh_cache.is_empty() {
+            self.empty_state_needs_reconcile = false;
+        }
+        Ok(())
     }
 
     async fn is_stale_persistent_entry_still_deletable(
@@ -1085,22 +1109,21 @@ impl AddressListManager {
     }
 
     fn spawn_background_reconcile(&mut self, tag: String) {
-        if self
-            .reconcile_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
+        if self.reconcile_handle.is_some() {
             debug!(
                 plugin = %tag,
-                "ros_address_list reconcile already running, skipping duplicate request"
+                "ros_address_list reconcile already running or awaiting apply, skipping duplicate request"
             );
             return;
         }
 
-        if self.persistent_items.is_empty() && self.dynamic_refresh_cache.is_empty() {
+        if self.persistent_items.is_empty()
+            && self.dynamic_refresh_cache.is_empty()
+            && !self.empty_state_needs_reconcile
+        {
             debug!(
                 plugin = %tag,
-                "ros_address_list reconcile has no desired or observed state, skipping remote scan"
+                "ros_address_list reconcile already confirmed empty state, skipping remote scan"
             );
             return;
         }
@@ -1109,7 +1132,9 @@ impl AddressListManager {
         let list4 = self.cfg.address_list4.clone();
         let list6 = self.cfg.address_list6.clone();
         let scan_generation = self.dynamic_generation;
+        let reconcile_completed = self.reconcile_completed.clone();
         self.reconcile_handle = Some(tokio::spawn(async move {
+            let _completion = ReconcileCompletionNotify(reconcile_completed);
             api.list_entries(list4.as_deref(), list6.as_deref())
                 .await
                 .map(|entries| ReconcileSnapshot {
@@ -1119,6 +1144,11 @@ impl AddressListManager {
         }));
     }
 
+    async fn wait_for_background_reconcile(&self) {
+        self.reconcile_completed.notified().await;
+    }
+
+    #[cfg(test)]
     async fn harvest_background_reconcile(&mut self, tag: &str) {
         if !self
             .reconcile_handle
@@ -1130,7 +1160,24 @@ impl AddressListManager {
         let Some(handle) = self.reconcile_handle.take() else {
             return;
         };
-        match handle.await {
+        self.apply_background_reconcile_result(tag, handle.await)
+            .await;
+    }
+
+    async fn await_background_reconcile(&mut self, tag: &str) {
+        let Some(handle) = self.reconcile_handle.take() else {
+            return;
+        };
+        self.apply_background_reconcile_result(tag, handle.await)
+            .await;
+    }
+
+    async fn apply_background_reconcile_result(
+        &mut self,
+        tag: &str,
+        result: std::result::Result<Result<ReconcileSnapshot>, tokio::task::JoinError>,
+    ) {
+        match result {
             Ok(Ok(ReconcileSnapshot {
                 scan_generation,
                 entries,
@@ -1316,8 +1363,6 @@ impl AddressListManager {
         domain: String,
         addrs: Vec<ObservedAddr>,
     ) -> Result<()> {
-        let tag = self.cfg.plugin_tag.clone();
-        self.harvest_background_reconcile(tag.as_str()).await;
         self.observe_domain_inner(domain, addrs, now_millis()).await
     }
 
@@ -1325,8 +1370,6 @@ impl AddressListManager {
         &mut self,
         observations: &[(AddressListKey, AddressObservation)],
     ) -> Vec<Result<()>> {
-        let tag = self.cfg.plugin_tag.clone();
-        self.harvest_background_reconcile(tag.as_str()).await;
         self.prune_dynamic_cache(now_millis());
 
         struct Prepared {
@@ -1456,6 +1499,7 @@ impl AddressListManager {
         self.ensure_initialized().await?;
         // Persistent ownership takes precedence over any cached dynamic state.
         self.persistent_items = items;
+        self.empty_state_needs_reconcile = true;
         self.prune_dynamic_cache(now_millis());
         let entries = self
             .api
@@ -1472,7 +1516,10 @@ impl AddressListManager {
     pub(super) async fn reconcile(&mut self) -> Result<()> {
         self.ensure_initialized().await?;
         self.prune_dynamic_cache(now_millis());
-        if self.persistent_items.is_empty() && self.dynamic_refresh_cache.is_empty() {
+        if self.persistent_items.is_empty()
+            && self.dynamic_refresh_cache.is_empty()
+            && !self.empty_state_needs_reconcile
+        {
             return Ok(());
         }
         let entries = self
@@ -1487,8 +1534,6 @@ impl AddressListManager {
     }
 
     pub(super) async fn prune_dynamic_cache_now(&mut self) -> Result<()> {
-        let tag = self.cfg.plugin_tag.clone();
-        self.harvest_background_reconcile(tag.as_str()).await;
         self.prune_dynamic_cache(now_millis());
         self.refresh_managed_metric();
         Ok(())
@@ -1749,6 +1794,9 @@ async fn run_manager_worker(
                 }
                 break;
             }
+            () = manager.wait_for_background_reconcile() => {
+                Some(WorkerCommand::ReconcileCompleted)
+            }
             control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
             () = retry_wakeup => {
                 let now = tokio::time::Instant::now();
@@ -1857,7 +1905,6 @@ async fn run_manager_worker(
             }
             WorkerCommand::Control(command) => match command {
                 ControlCommand::Reconcile => {
-                    manager.harvest_background_reconcile(tag.as_str()).await;
                     manager.spawn_background_reconcile(tag.clone());
                 }
                 ControlCommand::PruneDynamicCache => {
@@ -1872,6 +1919,9 @@ async fn run_manager_worker(
                     }
                 }
             },
+            WorkerCommand::ReconcileCompleted => {
+                manager.await_background_reconcile(tag.as_str()).await;
+            }
         }
         handle.refresh_pending_metric_with(retry_observations.len());
     }
