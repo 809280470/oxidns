@@ -124,6 +124,11 @@ fn enabled_public_features() -> Vec<&'static str> {
     );
     push_feature(
         &mut features,
+        cfg!(feature = "plugin-ros-address-list"),
+        "plugin-ros-address-list",
+    );
+    push_feature(
+        &mut features,
         cfg!(feature = "plugin-ros-route"),
         "plugin-ros-route",
     );

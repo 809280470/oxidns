@@ -691,7 +691,7 @@ plugins:
     Ok(())
 }
 
-#[cfg(feature = "plugin-mikrotik")]
+#[cfg(feature = "plugin-ros-address-list")]
 #[tokio::test]
 async fn test_ros_address_list_plugin_init_accepts_tls_and_capacity_config() -> Result<()> {
     let yaml = r#"

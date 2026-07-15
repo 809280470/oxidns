@@ -193,7 +193,6 @@ full = [
     "resolver-doh3",
     "upstream-doh3",
     "plugin-mikrotik",
-    "plugin-ros-route",
     "plugin-ipset",
 ]
 
@@ -257,8 +256,11 @@ upstream-doh3 = ["upstream-doh", "_dns-client-doh3"]
 
 # --- Granular plugin features ----------------------------------------------
 
+# All MikroTik RouterOS executors.
+plugin-mikrotik = ["plugin-ros-address-list", "plugin-ros-route"]
+
 # `ros_address_list` executor (MikroTik RouterOS API integration).
-plugin-mikrotik = ["dep:mikrotik-rs", "mikrotik-rs/tokio-tls", "_tls-client"]
+plugin-ros-address-list = ["dep:mikrotik-rs", "mikrotik-rs/tokio-tls", "_tls-client"]
 
 # `ros_route` executor (MikroTik RouterOS dynamic-route integration).
 plugin-ros-route = ["dep:mikrotik-rs", "mikrotik-rs/tokio-tls", "_tls-client"]

@@ -69,7 +69,7 @@ OxiDNS uses a three-layer Cargo feature system. Every new plugin must be placed 
 **Bundle scope:**
 - `minimal` — UDP/TCP listeners and upstreams, `sequence`, `forward`, `cache`, `fallback`, `hosts`, `redirect`, `dual_selector`, `ecs_handler`, `ttl`, `drop_resp`, `black_hole`, `debug_print`, `reload`, all matchers, `domain_set`, `ip_set`. No hyper/rustls/quinn/h2/h3/zoneparser.
 - `standard` — `minimal` + management API, WebUI, metrics, DoT/DoH/DoQ, most executor and provider plugins. No MikroTik, no ipset/nftset.
-- `full` (default) — `standard` + DoH3, `plugin-mikrotik`, `plugin-ipset`.
+- `full` (default) — `standard` + DoH3, `plugin-mikrotik` (both RouterOS executors), `plugin-ipset`.
 
 ### Always-on core plugins (no feature gate)
 

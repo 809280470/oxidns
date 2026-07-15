@@ -140,7 +140,8 @@ upstream-dot`,而不是直接崩溃。
 
 | Feature | 插件 | 主要依赖 |
 |---|---|---|
-| `plugin-mikrotik` | `ros_address_list` | `mikrotik-rs` |
+| `plugin-mikrotik` | `ros_address_list` + `ros_route` 聚合 feature | `mikrotik-rs` |
+| `plugin-ros-address-list` | `ros_address_list` | `mikrotik-rs` |
 | `plugin-ros-route` | `ros_route` | `mikrotik-rs` |
 | `plugin-query-recorder` | `query_recorder` | `rusqlite`(bundled SQLite) |
 | `plugin-ipset` | `ipset` + `nftset` | `ripset`(Linux only) |
@@ -309,8 +310,11 @@ cargo build --release --no-default-features --features minimal
 # 家用路由器(含 API、DoT/DoH/DoQ、geo、adguard 等)
 cargo build --release --no-default-features --features standard
 
-# 只在 minimal 上加 MikroTik 集成
+# 只在 minimal 上同时加入两个 MikroTik 插件
 cargo build --release --no-default-features --features "minimal,plugin-mikrotik"
+
+# 也可以只加入其中一个插件
+cargo build --release --no-default-features --features "minimal,plugin-ros-address-list"
 
 # 只要纯转发 + 管理 API,不要任何重型插件
 cargo build --release --no-default-features --features "minimal,api"

@@ -68,6 +68,7 @@ pub(crate) fn secure_client_config() -> ClientConfig {
 
 /// Build a secure client configuration with extra trust anchors in addition
 /// to the bundled WebPKI roots.
+#[cfg(any(feature = "plugin-ros-address-list", feature = "plugin-ros-route"))]
 pub(crate) fn secure_client_config_with_additional_roots(
     additional_roots: impl IntoIterator<Item = CertificateDer<'static>>,
 ) -> Result<ClientConfig, rustls::Error> {
