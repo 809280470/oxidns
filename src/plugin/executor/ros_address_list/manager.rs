@@ -45,8 +45,6 @@ const RECONCILE_INTERVAL_SECS: u64 = 180;
 const DYNAMIC_CACHE_PRUNE_INTERVAL_SECS: u64 = 60;
 /// Maximum time allowed for graceful manager shutdown coordination.
 const SHUTDOWN_TIMEOUT_SECS: u64 = 8;
-/// Hard upper bound for locally cached dynamic refresh states.
-const MAX_DYNAMIC_CACHE_ENTRIES: usize = 65_536;
 /// Maximum number of RouterOS upserts issued concurrently by one observation.
 const UPSERT_PIPELINE_SIZE: usize = 16;
 /// Maximum time a dynamic key can go without a refresh attempt under steady
@@ -178,6 +176,8 @@ struct DynamicRefreshState {
     expires_at_ms: u64,
     /// Earliest local time when another refresh is worth sending.
     next_refresh_at_ms: u64,
+    /// Successful-write sequence used to protect writes newer than a scan.
+    generation: u64,
 }
 
 impl DynamicRefreshState {
@@ -198,6 +198,7 @@ impl DynamicRefreshState {
             written_timeout_ms: timeout_ms,
             expires_at_ms,
             next_refresh_at_ms: near_expiry_refresh_at_ms.min(max_skip_refresh_at_ms),
+            generation: 0,
         }
     }
 
@@ -208,6 +209,7 @@ impl DynamicRefreshState {
             written_timeout_ms: 0,
             expires_at_ms: u64::MAX,
             next_refresh_at_ms: u64::MAX,
+            generation: 0,
         }
     }
 }
@@ -236,6 +238,8 @@ pub(super) struct AddressListManagerConfig {
     pub(super) max_ttl: u32,
     /// Optional fixed TTL override for dynamic observations.
     pub(super) fixed_ttl: Option<u32>,
+    /// Hard upper bound for locally cached dynamic refresh states.
+    pub(super) max_entries: usize,
 }
 
 #[derive(Debug)]
@@ -267,6 +271,12 @@ impl Coalesce for ControlCommand {
     fn coalesce(&mut self, newer: Self) {
         *self = newer;
     }
+}
+
+#[derive(Debug)]
+struct ReconcileSnapshot {
+    scan_generation: u64,
+    remote_dynamic: AHashSet<AddressListKey>,
 }
 
 #[derive(Debug)]
@@ -331,10 +341,10 @@ impl AddressListManagerHandle {
             .map_err(|_| ObserveEnqueueError::Closed)
     }
 
-    fn request_reconcile(&self) {
-        let _ = self
-            .controls
-            .try_push(ControlKey::Reconcile, ControlCommand::Reconcile);
+    pub(super) fn request_reconcile(&self) -> bool {
+        self.controls
+            .try_push(ControlKey::Reconcile, ControlCommand::Reconcile)
+            .is_ok()
     }
 
     fn request_prune(&self) {
@@ -352,6 +362,14 @@ impl AddressListManagerHandle {
     #[cfg(test)]
     pub(super) fn queued_observations(&self) -> usize {
         self.observations.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_reconcile_for_test(&self) -> bool {
+        matches!(
+            self.controls.try_recv(),
+            Some((ControlKey::Reconcile, ControlCommand::Reconcile))
+        )
     }
 }
 
@@ -379,8 +397,6 @@ impl AddressListManagerRuntime {
         // or request-path synchronization in the DNS hot path.
         let handle = AddressListManagerHandle::new();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let reconcile_enabled = !manager.cfg.persistent_items.is_empty();
-
         let worker_tag = tag.clone();
         let worker_handle_mailbox = handle.clone();
         let worker_handle = Some(tokio::spawn(async move {
@@ -406,10 +422,12 @@ impl AddressListManagerRuntime {
             },
         ));
 
-        // Reconcile is only useful when persistent behavior is configured.
-        let reconcile_task_id = reconcile_enabled.then(|| {
+        // Reconcile also invalidates dynamic suppression state after users
+        // manually remove RouterOS rows, so it runs even without persistent
+        // entries.
+        let reconcile_task_id = {
             let reconcile_handle = handle.clone();
-            task_center::spawn_fixed(
+            Some(task_center::spawn_fixed(
                 format!("ros_address_list:{tag}:reconcile"),
                 Duration::from_secs(RECONCILE_INTERVAL_SECS),
                 move || {
@@ -418,8 +436,8 @@ impl AddressListManagerRuntime {
                         reconcile_handle.request_reconcile();
                     }
                 },
-            )
-        });
+            ))
+        };
 
         Self {
             handle,
@@ -480,7 +498,9 @@ pub(super) struct AddressListManager {
     /// writes.
     dynamic_refresh_cache: AHashMap<AddressListKey, DynamicRefreshState>,
     /// Currently running background reconcile task, if any.
-    reconcile_handle: Option<JoinHandle<()>>,
+    reconcile_handle: Option<JoinHandle<Result<ReconcileSnapshot>>>,
+    /// Monotonic local write generation for race-safe background snapshots.
+    dynamic_generation: u64,
     /// One-time startup guard.
     initialized: bool,
 }
@@ -492,6 +512,7 @@ impl AddressListManager {
             persistent_items: cfg.persistent_items.clone(),
             dynamic_refresh_cache: AHashMap::new(),
             reconcile_handle: None,
+            dynamic_generation: 0,
             cfg,
             initialized: false,
         }
@@ -586,28 +607,33 @@ impl AddressListManager {
             state.expires_at_ms > now_ms && !self.persistent_items.contains(key)
         });
 
-        if self.dynamic_refresh_cache.len() <= MAX_DYNAMIC_CACHE_ENTRIES {
+        if self.dynamic_refresh_cache.len() <= self.cfg.max_entries {
             return;
         }
 
-        // Step 2: if the cache still exceeds the hard cap, evict entries that
-        // will expire the soonest because they provide the least suppression value.
-        let overflow = self
-            .dynamic_refresh_cache
-            .len()
-            .saturating_sub(MAX_DYNAMIC_CACHE_ENTRIES);
-        let mut eviction_order = self
-            .dynamic_refresh_cache
-            .iter()
-            .map(|(key, state)| (key.clone(), state.expires_at_ms))
-            .collect::<Vec<_>>();
-        eviction_order.sort_by_key(|(_, expires_at_ms)| *expires_at_ms);
-        for (key, _) in eviction_order.into_iter().take(overflow) {
+        // The cache only suppresses redundant writes, so arbitrary eviction is
+        // safe and avoids sorting a large map on maintenance paths.
+        while self.dynamic_refresh_cache.len() > self.cfg.max_entries {
+            let Some(key) = self.dynamic_refresh_cache.keys().next().cloned() else {
+                break;
+            };
             self.dynamic_refresh_cache.remove(&key);
         }
     }
 
-    async fn reconcile_persistent_inner(&mut self) -> Result<()> {
+    fn cache_dynamic_write(&mut self, key: AddressListKey, mut state: DynamicRefreshState) {
+        if !self.dynamic_refresh_cache.contains_key(&key)
+            && self.dynamic_refresh_cache.len() >= self.cfg.max_entries
+            && let Some(evicted) = self.dynamic_refresh_cache.keys().next().cloned()
+        {
+            self.dynamic_refresh_cache.remove(&evicted);
+        }
+        self.dynamic_generation = self.dynamic_generation.wrapping_add(1);
+        state.generation = self.dynamic_generation;
+        self.dynamic_refresh_cache.insert(key, state);
+    }
+
+    async fn reconcile_persistent_inner(&mut self) -> Result<AHashSet<AddressListKey>> {
         // Persistent reconcile treats RouterOS as a converged desired-set target:
         // ensure every configured persistent item exists, then remove stale owned
         // persistent entries that are no longer desired.
@@ -618,12 +644,25 @@ impl AddressListManager {
                 self.cfg.address_list6.as_deref(),
             )
             .await?;
+        let remote_dynamic = existing
+            .iter()
+            .filter(|entry| {
+                decode_owned_comment(
+                    self.cfg.comment_prefix.as_str(),
+                    self.cfg.plugin_tag.as_str(),
+                    entry.comment.as_deref(),
+                )
+                .is_some_and(|meta| meta.kind == OwnedCommentKind::Dynamic)
+            })
+            .map(|entry| entry.key.clone())
+            .collect::<AHashSet<_>>();
 
         let desired_comment = self.comment_for_persistent();
-        for key in &self.persistent_items {
-            match self
-                .api
-                .upsert_owned_entry(
+        let persistent = self.persistent_items.iter().collect::<Vec<_>>();
+        let mut first_error = None;
+        for batch in persistent.chunks(UPSERT_PIPELINE_SIZE) {
+            let results = futures::future::join_all(batch.iter().map(|key| {
+                self.api.upsert_owned_entry(
                     key,
                     None,
                     desired_comment.as_str(),
@@ -631,18 +670,27 @@ impl AddressListManager {
                     self.cfg.plugin_tag.as_str(),
                     false,
                 )
-                .await?
-            {
-                Some(_) => {}
-                None => {
-                    warn!(
-                        plugin = %self.cfg.plugin_tag,
-                        list = %key.list,
-                        address = %key.normalized_value(),
-                        "ros_address_list persistent entry conflicts with foreign address-list entry, skipping"
-                    );
+            }))
+            .await;
+            for (key, result) in batch.iter().zip(results) {
+                match result {
+                    Ok(Some(())) => {}
+                    Ok(None) => {
+                        warn!(
+                            plugin = %self.cfg.plugin_tag,
+                            list = %key.list,
+                            address = %key.normalized_value(),
+                            "ros_address_list persistent entry conflicts with foreign address-list entry, skipping"
+                        );
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
 
         for entry in existing {
@@ -670,7 +718,7 @@ impl AddressListManager {
                 .await?;
         }
 
-        Ok(())
+        Ok(remote_dynamic)
     }
 
     async fn is_stale_persistent_entry_still_deletable(
@@ -706,18 +754,56 @@ impl AddressListManager {
         let api = self.api.clone();
         let mut cfg = self.cfg.clone();
         cfg.persistent_items = self.persistent_items.clone();
+        let scan_generation = self.dynamic_generation;
         self.reconcile_handle = Some(tokio::spawn(async move {
             let mut manager = AddressListManager::new(api, cfg);
-            if let Err(e) = manager.reconcile().await {
-                warn!(
-                    plugin = %tag,
-                    err = %e,
-                    "ros_address_list background reconcile failed"
-                );
-            } else {
+            manager
+                .reconcile_persistent_inner()
+                .await
+                .map(|remote_dynamic| ReconcileSnapshot {
+                    scan_generation,
+                    remote_dynamic,
+                })
+        }));
+    }
+
+    async fn harvest_background_reconcile(&mut self, tag: &str) {
+        if !self
+            .reconcile_handle
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return;
+        }
+        let Some(handle) = self.reconcile_handle.take() else {
+            return;
+        };
+        match handle.await {
+            Ok(Ok(ReconcileSnapshot {
+                scan_generation,
+                remote_dynamic,
+            })) => {
+                self.dynamic_refresh_cache.retain(|key, state| {
+                    state.generation > scan_generation || remote_dynamic.contains(key)
+                });
                 debug!(plugin = %tag, "ros_address_list background reconcile completed");
             }
-        }));
+            Ok(Err(error)) => {
+                warn!(
+                    plugin = %tag,
+                    err = %error,
+                    "ros_address_list background reconcile failed"
+                );
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                warn!(
+                    plugin = %tag,
+                    err = %error,
+                    "ros_address_list background reconcile task failed"
+                );
+            }
+        }
     }
 
     async fn observe_domain_inner(
@@ -780,10 +866,10 @@ impl AddressListManager {
         // Phase 2: pipeline upserts in bounded batches. The dependency uses a
         // bounded response channel per command, so an unbounded join_all would
         // let unusually large CDN answers create excessive in-flight work.
-        let api = self.api.as_ref();
+        let api = self.api.clone();
         let comment_str = comment.as_str();
-        let prefix = self.cfg.comment_prefix.as_str();
-        let tag = self.cfg.plugin_tag.as_str();
+        let comment_prefix = self.cfg.comment_prefix.clone();
+        let plugin_tag = self.cfg.plugin_tag.clone();
         let mut first_error: Option<DnsError> = None;
         for batch in to_refresh.chunks(UPSERT_PIPELINE_SIZE) {
             let results =
@@ -792,8 +878,8 @@ impl AddressListManager {
                         key,
                         timeout_value.as_deref(),
                         comment_str,
-                        prefix,
-                        tag,
+                        comment_prefix.as_str(),
+                        plugin_tag.as_str(),
                         matches!(timeout, DynamicTimeout::Timed(_)),
                     )
                 }))
@@ -810,7 +896,7 @@ impl AddressListManager {
                             }
                             DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
                         };
-                        self.dynamic_refresh_cache.insert(key.clone(), state);
+                        self.cache_dynamic_write(key.clone(), state);
                     }
                     Ok(None) => {
                         self.dynamic_refresh_cache.remove(key);
@@ -840,6 +926,8 @@ impl AddressListManager {
         domain: String,
         addrs: Vec<ObservedAddr>,
     ) -> Result<()> {
+        let tag = self.cfg.plugin_tag.clone();
+        self.harvest_background_reconcile(tag.as_str()).await;
         self.observe_domain_inner(domain, addrs, now_millis()).await
     }
 
@@ -852,16 +940,25 @@ impl AddressListManager {
         // Persistent ownership takes precedence over any cached dynamic state.
         self.persistent_items = items;
         self.prune_dynamic_cache(now_millis());
-        self.reconcile_persistent_inner().await
+        let remote_dynamic = self.reconcile_persistent_inner().await?;
+        self.dynamic_refresh_cache
+            .retain(|key, _| remote_dynamic.contains(key));
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn reconcile(&mut self) -> Result<()> {
         self.ensure_initialized().await?;
         self.prune_dynamic_cache(now_millis());
-        self.reconcile_persistent_inner().await
+        let remote_dynamic = self.reconcile_persistent_inner().await?;
+        self.dynamic_refresh_cache
+            .retain(|key, _| remote_dynamic.contains(key));
+        Ok(())
     }
 
     pub(super) async fn prune_dynamic_cache_now(&mut self) -> Result<()> {
+        let tag = self.cfg.plugin_tag.clone();
+        self.harvest_background_reconcile(tag.as_str()).await;
         self.prune_dynamic_cache(now_millis());
         Ok(())
     }
@@ -886,21 +983,33 @@ impl AddressListManager {
                 self.cfg.address_list6.as_deref(),
             )
             .await?;
-        for entry in entries {
-            if decode_owned_comment(
-                self.cfg.comment_prefix.as_str(),
-                self.cfg.plugin_tag.as_str(),
-                entry.comment.as_deref(),
+        let owned = entries
+            .into_iter()
+            .filter(|entry| {
+                decode_owned_comment(
+                    self.cfg.comment_prefix.as_str(),
+                    self.cfg.plugin_tag.as_str(),
+                    entry.comment.as_deref(),
+                )
+                .is_some()
+            })
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for batch in owned.chunks(UPSERT_PIPELINE_SIZE) {
+            let results = futures::future::join_all(
+                batch
+                    .iter()
+                    .map(|entry| self.api.delete_entry_by_id(&entry.id, entry.key.family)),
             )
-            .is_some()
-            {
-                self.api
-                    .delete_entry_by_id(&entry.id, entry.key.family)
-                    .await?;
+            .await;
+            for result in results {
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
             }
         }
         self.dynamic_refresh_cache.clear();
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     #[cfg(test)]
@@ -916,6 +1025,20 @@ impl AddressListManager {
         now_ms: u64,
     ) -> Result<()> {
         self.observe_domain_inner(domain, addrs, now_ms).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn background_reconcile_for_test(&mut self) {
+        let tag = self.cfg.plugin_tag.clone();
+        self.spawn_background_reconcile(tag.clone());
+        while self
+            .reconcile_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+        self.harvest_background_reconcile(tag.as_str()).await;
     }
 
     #[cfg(test)]
@@ -1072,6 +1195,7 @@ async fn run_manager_worker(
                 prefer_control = false;
                 match command {
                     ControlCommand::Reconcile => {
+                        manager.harvest_background_reconcile(tag.as_str()).await;
                         manager.spawn_background_reconcile(tag.clone());
                     }
                     ControlCommand::PruneDynamicCache => {

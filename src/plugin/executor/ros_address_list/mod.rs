@@ -31,13 +31,11 @@
 
 use std::fs;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-#[cfg(test)]
-use ahash::AHashMap;
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
@@ -81,6 +79,7 @@ const DEFAULT_ASYNC_MODE: bool = true;
 const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
 /// Default comment prefix used to mark OxiDNS-owned RouterOS rows.
 const DEFAULT_COMMENT_PREFIX: &str = "fdns";
+const DEFAULT_MAX_ENTRIES: usize = 65_536;
 /// Maximum time sync mode waits for one observe command to finish.
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
 
@@ -123,6 +122,8 @@ struct MikrotikConfigArgs {
     fixed_ttl: Option<u32>,
     /// Whether to clean managed address-list entries on shutdown.
     cleanup_on_shutdown: Option<bool>,
+    /// Maximum number of dynamic refresh states retained locally.
+    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -136,6 +137,8 @@ struct PersistentArgs {
 
 #[derive(Debug, Clone)]
 struct MikrotikConfig {
+    /// RouterOS API endpoint, retained for reload ownership coordination.
+    address: String,
     /// Connection settings consumed when the API transport is constructed.
     connection: Option<RouterOsConnectionConfig>,
     /// Async mode switch for post stage writes.
@@ -157,6 +160,8 @@ struct MikrotikConfig {
     fixed_ttl: Option<u32>,
     /// Whether shutdown should remove owned entries from RouterOS.
     cleanup_on_shutdown: bool,
+    /// Hard upper bound for the local dynamic refresh cache.
+    max_entries: usize,
 }
 
 impl MikrotikConfigArgs {
@@ -209,6 +214,12 @@ impl MikrotikConfigArgs {
             )));
         }
         let fixed_ttl = self.fixed_ttl;
+        let max_entries = self.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
+        if max_entries == 0 {
+            return Err(DnsError::plugin(
+                "ros_address_list max_entries must be greater than zero",
+            ));
+        }
 
         let parsed_persistent = parse_persistent_items(
             self.persistent,
@@ -223,6 +234,7 @@ impl MikrotikConfigArgs {
         }
 
         Ok(MikrotikConfig {
+            address,
             connection: Some(connection),
             async_mode: self.async_mode.unwrap_or(DEFAULT_ASYNC_MODE),
             address_list4,
@@ -235,6 +247,7 @@ impl MikrotikConfigArgs {
             cleanup_on_shutdown: self
                 .cleanup_on_shutdown
                 .unwrap_or(DEFAULT_CLEANUP_ON_SHUTDOWN),
+            max_entries,
         })
     }
 }
@@ -246,6 +259,125 @@ struct RosMetrics {
     dropped_total: AtomicU64,
     sync_error_total: AtomicU64,
     sync_timeout_total: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ActiveAddressListInstance {
+    instance_id: u64,
+    namespace: AddressListOwnershipNamespace,
+    metrics: Arc<RosMetrics>,
+    manager_handle: Option<AddressListManagerHandle>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AddressListOwnershipNamespace {
+    address: String,
+    address_list4: Option<String>,
+    address_list6: Option<String>,
+    comment_prefix: String,
+}
+
+impl AddressListOwnershipNamespace {
+    fn from_config(config: &MikrotikConfig) -> Self {
+        Self {
+            address: config.address.clone(),
+            address_list4: config.address_list4.clone(),
+            address_list6: config.address_list6.clone(),
+            comment_prefix: config.comment_prefix.clone(),
+        }
+    }
+}
+
+static NEXT_ADDRESS_LIST_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn active_address_list_instances()
+-> &'static Mutex<AHashMap<String, Vec<ActiveAddressListInstance>>> {
+    static INSTANCES: OnceLock<Mutex<AHashMap<String, Vec<ActiveAddressListInstance>>>> =
+        OnceLock::new();
+    INSTANCES.get_or_init(|| Mutex::new(AHashMap::new()))
+}
+
+fn register_active_address_list_instance(
+    tag: &str,
+    instance_id: u64,
+    namespace: AddressListOwnershipNamespace,
+    metrics: Arc<RosMetrics>,
+    manager_handle: Option<AddressListManagerHandle>,
+) -> Result<()> {
+    register_metric_source(metrics.clone())?;
+    let mut active = active_address_list_instances()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    active
+        .entry(tag.to_string())
+        .or_default()
+        .push(ActiveAddressListInstance {
+            instance_id,
+            namespace,
+            metrics,
+            manager_handle,
+        });
+    Ok(())
+}
+
+fn release_active_address_list_instance(tag: &str, instance_id: u64) -> bool {
+    let (cleanup_allowed, metric_replacement, remove_metric, restore_handle) = {
+        let mut active = active_address_list_instances()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(instances) = active.get_mut(tag) else {
+            return false;
+        };
+        let Some(index) = instances
+            .iter()
+            .position(|instance| instance.instance_id == instance_id)
+        else {
+            return false;
+        };
+        let was_metric_owner = index + 1 == instances.len();
+        let removed = instances.remove(index);
+        let is_last = instances.is_empty();
+        let cleanup_allowed = !instances
+            .iter()
+            .any(|instance| instance.namespace == removed.namespace);
+        let metric_replacement = was_metric_owner
+            .then(|| instances.last().map(|instance| instance.metrics.clone()))
+            .flatten();
+        let restore_handle = was_metric_owner
+            .then(|| {
+                instances
+                    .iter()
+                    .rev()
+                    .find(|instance| instance.namespace == removed.namespace)
+                    .and_then(|instance| instance.manager_handle.clone())
+            })
+            .flatten();
+        let remove_metric = was_metric_owner && is_last;
+        if is_last {
+            active.remove(tag);
+        }
+        (
+            cleanup_allowed,
+            metric_replacement,
+            remove_metric,
+            restore_handle,
+        )
+    };
+
+    if let Some(metrics) = metric_replacement {
+        let _ = register_metric_source(metrics);
+    } else if remove_metric {
+        unregister_metric_source(tag);
+    }
+    if let Some(handle) = restore_handle
+        && !handle.request_reconcile()
+    {
+        warn!(
+            plugin = %tag,
+            "ros_address_list failed to enqueue immediate reconcile after reload rollback"
+        );
+    }
+    cleanup_allowed
 }
 
 impl RosMetrics {
@@ -302,6 +434,8 @@ impl MetricSource for RosMetrics {
 struct MikrotikExecutor {
     /// Plugin tag from the global registry.
     tag: String,
+    instance_id: u64,
+    active_registered: AtomicBool,
     /// Shared observability counters.
     metrics: Arc<RosMetrics>,
     /// Fully validated immutable runtime config.
@@ -321,8 +455,6 @@ impl Plugin for MikrotikExecutor {
     }
 
     async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
-        register_metric_source(self.metrics.clone())?;
-
         // `init()` may be called more than once by the plugin framework.
         // Keep it idempotent and only build the runtime once.
         if self.manager.is_none() || self.manager_handle.is_some() {
@@ -334,17 +466,40 @@ impl Plugin for MikrotikExecutor {
         };
 
         let runtime = AddressListManagerRuntime::start(self.tag.clone(), manager);
-        self.manager_handle = Some(runtime.handle());
-        if let Ok(mut slot) = self.runtime.lock() {
-            *slot = Some(runtime);
+        let manager_handle = runtime.handle();
+        if let Err(error) = register_active_address_list_instance(
+            &self.tag,
+            self.instance_id,
+            AddressListOwnershipNamespace::from_config(&self.config),
+            self.metrics.clone(),
+            Some(manager_handle.clone()),
+        ) {
+            runtime.shutdown(false).await;
+            return Err(error);
         }
+        let mut runtime = Some(runtime);
+        if let Ok(mut slot) = self.runtime.lock() {
+            *slot = runtime.take();
+        }
+        if let Some(runtime) = runtime {
+            release_active_address_list_instance(&self.tag, self.instance_id);
+            runtime.shutdown(false).await;
+            return Err(DnsError::plugin(
+                "ros_address_list runtime lock is poisoned during initialization",
+            ));
+        }
+        self.manager_handle = Some(manager_handle);
+        self.active_registered.store(true, Ordering::Release);
         Ok(())
     }
 
     async fn destroy(&self) -> Result<()> {
-        unregister_metric_source(&self.tag);
+        let cleanup_allowed = self.active_registered.swap(false, Ordering::AcqRel)
+            && release_active_address_list_instance(&self.tag, self.instance_id);
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
-            runtime.shutdown(self.config.cleanup_on_shutdown).await;
+            runtime
+                .shutdown(self.config.cleanup_on_shutdown && cleanup_allowed)
+                .await;
         }
         Ok(())
     }
@@ -369,6 +524,9 @@ impl Executor for MikrotikExecutor {
     ) -> Result<ExecStep> {
         let step = continue_next!(next, context)?;
         // If the runtime never started, the plugin stays side-effect free.
+        if !self.active_registered.load(Ordering::Acquire) {
+            return Ok(step);
+        }
         let Some(handle) = self.manager_handle.as_ref() else {
             return Ok(step);
         };
@@ -498,11 +656,14 @@ impl PluginFactory for MikrotikFactory {
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
             fixed_ttl: config.fixed_ttl,
+            max_entries: config.max_entries,
         };
         let manager = AddressListManager::new(api, manager_cfg);
 
         Ok(UninitializedPlugin::Executor(Box::new(MikrotikExecutor {
             tag: plugin_config.tag.clone(),
+            instance_id: NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            active_registered: AtomicBool::new(false),
             metrics: Arc::new(RosMetrics::new(plugin_config.tag.clone())),
             config,
             manager: Some(manager),
@@ -1053,6 +1214,7 @@ mod tests {
             min_ttl: DEFAULT_MIN_TTL,
             max_ttl: DEFAULT_MAX_TTL,
             fixed_ttl: None,
+            max_entries: DEFAULT_MAX_ENTRIES,
         }
     }
 
@@ -1078,6 +1240,7 @@ mod tests {
     #[test]
     fn observation_with_mismatched_response_question_is_ignored() {
         let config = MikrotikConfig {
+            address: "127.0.0.1:8728".to_string(),
             connection: None,
             async_mode: true,
             address_list4: Some("oxidns_ipv4".to_string()),
@@ -1088,6 +1251,7 @@ mod tests {
             max_ttl: DEFAULT_MAX_TTL,
             fixed_ttl: None,
             cleanup_on_shutdown: false,
+            max_entries: DEFAULT_MAX_ENTRIES,
         };
         let mut context = make_context();
         let mut response = response_with_records(vec![a_record(Ipv4Addr::new(192, 0, 2, 1), 60)]);
@@ -1116,6 +1280,26 @@ mod tests {
             .observe_domain("pipeline.example.".to_string(), addrs)
             .await
             .expect("pipeline writes");
+
+        assert_eq!(api.attempts.load(Ordering::Relaxed), 17);
+        assert_eq!(api.max_active.load(Ordering::Acquire), 16);
+    }
+
+    #[tokio::test]
+    async fn persistent_reconcile_uses_bounded_pipeline() {
+        let api = Arc::new(PipelineMikrotikApi::default());
+        let mut cfg = default_cfg("persistent-pipeline");
+        cfg.persistent_items = (1..=17)
+            .map(|last| {
+                AddressListKey::new(
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, last)),
+                    "oxidns_ipv4".to_string(),
+                )
+            })
+            .collect();
+        let mut manager = AddressListManager::new(api.clone(), cfg);
+
+        manager.reconcile().await.unwrap();
 
         assert_eq!(api.attempts.load(Ordering::Relaxed), 17);
         assert_eq!(api.max_active.load(Ordering::Acquire), 16);
@@ -1172,6 +1356,7 @@ mod tests {
     ) -> MikrotikExecutor {
         AppClock::start();
         let config = MikrotikConfig {
+            address: "127.0.0.1:8728".to_string(),
             connection: None,
             async_mode,
             address_list4: address_list4.map(|v| v.to_string()),
@@ -1182,6 +1367,7 @@ mod tests {
             max_ttl: DEFAULT_MAX_TTL,
             fixed_ttl: None,
             cleanup_on_shutdown,
+            max_entries: DEFAULT_MAX_ENTRIES,
         };
         let manager_cfg = AddressListManagerConfig {
             plugin_tag: tag.to_string(),
@@ -1192,9 +1378,12 @@ mod tests {
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
             fixed_ttl: config.fixed_ttl,
+            max_entries: config.max_entries,
         };
         MikrotikExecutor {
             tag: tag.to_string(),
+            instance_id: NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            active_registered: AtomicBool::new(false),
             metrics: Arc::new(RosMetrics::new(tag.to_string())),
             config,
             manager: Some(AddressListManager::new(api, manager_cfg)),
@@ -1274,6 +1463,7 @@ address_list4: "oxidns_ipv4"
         .unwrap();
         let parsed = parse_plugin_config(Some(cfg), false).unwrap();
         assert_eq!(parsed.comment_prefix, DEFAULT_COMMENT_PREFIX);
+        assert_eq!(parsed.max_entries, DEFAULT_MAX_ENTRIES);
         assert_eq!(
             parsed.connection.as_ref().expect("connection").timeouts,
             MikrotikApiTimeouts::default()
@@ -1352,6 +1542,37 @@ address_list4: "oxidns_ipv4"
         .unwrap();
         let err = parse_plugin_config(Some(cfg), false).unwrap_err();
         assert!(err.to_string().contains("receive_timeout"));
+    }
+
+    #[test]
+    fn config_validation_accepts_positive_max_entries_and_rejects_zero() {
+        let cfg = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "1.1.1.1:8728"
+username: "user"
+password: "pass"
+address_list4: "oxidns_ipv4"
+max_entries: 2048
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_plugin_config(Some(cfg), false).unwrap().max_entries,
+            2048
+        );
+
+        let cfg = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "1.1.1.1:8728"
+username: "user"
+password: "pass"
+address_list4: "oxidns_ipv4"
+max_entries: 0
+"#,
+        )
+        .unwrap();
+        let error = parse_plugin_config(Some(cfg), false).unwrap_err();
+        assert!(error.to_string().contains("max_entries"));
     }
 
     #[test]
@@ -1789,6 +2010,66 @@ persistent:
     }
 
     #[tokio::test]
+    async fn dynamic_refresh_cache_never_exceeds_configured_capacity() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let mut cfg = default_cfg("cache-cap");
+        cfg.max_entries = 2;
+        let mut manager = AddressListManager::new(api, cfg);
+        let addrs = (1..=3)
+            .map(|last| ObservedAddr {
+                addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, last)),
+                ttl_secs: 300,
+            })
+            .collect();
+
+        manager
+            .observe_domain_at_for_test("capacity.example".to_string(), addrs, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.dynamic_cache_len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconcile_accepts_manual_dynamic_deletion_until_next_observation() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let mut manager = AddressListManager::new(api.clone(), default_cfg("manual-delete"));
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+        let key = AddressListKey::new(ip, "oxidns_ipv4".to_string());
+        let observed = vec![ObservedAddr {
+            addr: ip,
+            ttl_secs: 300,
+        }];
+
+        manager
+            .observe_domain_at_for_test("manual.example".to_string(), observed.clone(), 0)
+            .await
+            .unwrap();
+        assert_eq!(manager.dynamic_cache_len(), 1);
+        api.state
+            .lock()
+            .unwrap()
+            .entries
+            .remove(&MockMikrotikApi::storage_key(&key));
+
+        manager.background_reconcile_for_test().await;
+        assert_eq!(manager.dynamic_cache_len(), 0);
+
+        manager
+            .observe_domain_at_for_test("manual.example".to_string(), observed, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(manager.dynamic_cache_len(), 1);
+        assert!(
+            api.state
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&MockMikrotikApi::storage_key(&key))
+        );
+    }
+
+    #[tokio::test]
     async fn execute_returns_next() {
         let api = Arc::new(MockMikrotikApi::default()) as Arc<dyn MikrotikApi>;
         let mut executor =
@@ -1953,9 +2234,110 @@ persistent:
         let _ = executor.destroy().await;
     }
 
+    #[test]
+    fn same_tag_instances_coordinate_cleanup_and_reload_restore() {
+        let sequence = NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
+        let tag = format!("address-list-reload-{sequence}");
+        let namespace = AddressListOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            address_list4: Some("managed-v4".to_string()),
+            address_list6: None,
+            comment_prefix: "fdns".to_string(),
+        };
+        let old_handle = AddressListManagerHandle::new();
+
+        register_active_address_list_instance(
+            tag.as_str(),
+            sequence,
+            namespace.clone(),
+            Arc::new(RosMetrics::new(tag.clone())),
+            Some(old_handle.clone()),
+        )
+        .expect("old runtime");
+        register_active_address_list_instance(
+            tag.as_str(),
+            sequence + 1,
+            namespace,
+            Arc::new(RosMetrics::new(tag.clone())),
+            None,
+        )
+        .expect("replacement runtime");
+
+        assert!(!release_active_address_list_instance(
+            tag.as_str(),
+            sequence + 1
+        ));
+        assert!(old_handle.take_reconcile_for_test());
+        assert!(release_active_address_list_instance(tag.as_str(), sequence));
+    }
+
+    #[tokio::test]
+    async fn compatible_reload_defers_cleanup_to_last_address_list_instance() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let tag = format!(
+            "address-list-cleanup-{}",
+            NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let key = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 88)),
+            "oxidns_ipv4".to_string(),
+        );
+        api.seed_entry(RouterListEntry {
+            id: "*reload-owned".to_string(),
+            key: key.clone(),
+            timeout: Some("300s".to_string()),
+            comment: Some(encode_comment(
+                "oxidns",
+                tag.as_str(),
+                OwnedCommentKind::Dynamic,
+                Some("reload.example"),
+            )),
+        });
+        let mut old = build_executor_for_test(
+            tag.as_str(),
+            true,
+            true,
+            Some("oxidns_ipv4"),
+            None,
+            api.clone(),
+        );
+        let mut replacement = build_executor_for_test(
+            tag.as_str(),
+            true,
+            true,
+            Some("oxidns_ipv4"),
+            None,
+            api.clone(),
+        );
+        old.init_for_test().await.unwrap();
+        replacement.init_for_test().await.unwrap();
+
+        old.destroy().await.unwrap();
+        assert!(
+            api.state
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&MockMikrotikApi::storage_key(&key))
+        );
+
+        replacement.destroy().await.unwrap();
+        assert!(
+            !api.state
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&MockMikrotikApi::storage_key(&key))
+        );
+    }
+
     #[tokio::test]
     async fn shutdown_cleanup_removes_only_owned_entries() {
         let api = Arc::new(MockMikrotikApi::default());
+        let tag = format!(
+            "mk-cleanup-{}",
+            NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+        );
         let owned_key = AddressListKey::new(
             IpAddr::V4(Ipv4Addr::new(11, 11, 11, 11)),
             "oxidns_ipv4".to_string(),
@@ -1966,7 +2348,7 @@ persistent:
             timeout: Some("300s".to_string()),
             comment: Some(encode_comment(
                 "oxidns",
-                "mk",
+                tag.as_str(),
                 OwnedCommentKind::Dynamic,
                 Some("example.com"),
             )),
@@ -1982,7 +2364,7 @@ persistent:
         });
 
         let mut executor = build_executor_for_test(
-            "mk",
+            tag.as_str(),
             true,
             true,
             Some("oxidns_ipv4"),
