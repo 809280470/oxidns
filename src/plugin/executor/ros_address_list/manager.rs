@@ -414,8 +414,35 @@ struct ReconcileSnapshot {
 
 #[derive(Debug)]
 struct ShutdownRequest {
-    cleanup: bool,
+    cleanup: AddressListCleanupScope,
     done: oneshot::Sender<()>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(super) struct AddressListCleanupScope {
+    pub(super) ipv4: bool,
+    pub(super) ipv6: bool,
+}
+
+impl AddressListCleanupScope {
+    pub(super) const fn none() -> Self {
+        Self {
+            ipv4: false,
+            ipv6: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn all() -> Self {
+        Self {
+            ipv4: true,
+            ipv6: true,
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        !self.ipv4 && !self.ipv6
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -614,7 +641,10 @@ impl AddressListManagerHandle {
 
 #[derive(Debug)]
 enum WorkerCommand {
-    Observe(Vec<(AddressListKey, ObservationCommand)>),
+    Observe {
+        batch: Vec<(AddressListKey, ObservationCommand)>,
+        from_retry: bool,
+    },
     Control(ControlCommand),
 }
 
@@ -692,7 +722,7 @@ impl AddressListManagerRuntime {
         self.handle.clone()
     }
 
-    pub(super) async fn shutdown(mut self, cleanup: bool) {
+    pub(super) async fn shutdown(mut self, cleanup: AddressListCleanupScope) {
         if let Some(task_id) = self.prune_task_id.take() {
             task_center::stop_task(task_id).await;
         }
@@ -1505,13 +1535,13 @@ impl AddressListManager {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&mut self, cleanup: bool) -> Result<()> {
+    pub(super) async fn shutdown(&mut self, cleanup: AddressListCleanupScope) -> Result<()> {
         if let Some(handle) = self.reconcile_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
 
-        if !cleanup {
+        if cleanup.is_empty() {
             self.dynamic_refresh_cache.clear();
             return Ok(());
         }
@@ -1524,8 +1554,14 @@ impl AddressListManager {
         let entries = self
             .api
             .list_entries(
-                self.cfg.address_list4.as_deref(),
-                self.cfg.address_list6.as_deref(),
+                cleanup
+                    .ipv4
+                    .then_some(self.cfg.address_list4.as_deref())
+                    .flatten(),
+                cleanup
+                    .ipv6
+                    .then_some(self.cfg.address_list6.as_deref())
+                    .flatten(),
             )
             .await?;
         let owned = entries
@@ -1690,11 +1726,11 @@ async fn run_manager_worker(
     // commands into the mailbox and never mutates manager state directly.
     let error_logs = ErrorLogThrottle::default();
     let mut retry_observations =
-        Vec::<(tokio::time::Instant, AddressListKey, ObservationCommand)>::new();
+        AHashMap::<AddressListKey, (tokio::time::Instant, ObservationCommand)>::new();
     loop {
         let next_retry = retry_observations
-            .iter()
-            .map(|(retry_at, _, _)| *retry_at)
+            .values()
+            .map(|(retry_at, _)| *retry_at)
             .min();
         let retry_wakeup = async {
             match next_retry {
@@ -1716,22 +1752,31 @@ async fn run_manager_worker(
             control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
             () = retry_wakeup => {
                 let now = tokio::time::Instant::now();
-                let mut due = Vec::new();
-                let mut pending = Vec::new();
-                for (retry_at, key, mut command) in retry_observations.drain(..) {
-                    if retry_at <= now && due.len() < UPSERT_PIPELINE_SIZE {
-                        if let Some(newer) = handle.observations.take(&key) {
-                            command.coalesce(newer);
-                        }
-                        due.push((key, command));
-                    } else {
-                        pending.push((retry_at, key, command));
-                    }
-                }
-                retry_observations = pending;
-                (!due.is_empty()).then_some(WorkerCommand::Observe(due))
+                let due_keys = retry_observations
+                    .iter()
+                    .filter(|(_, (retry_at, _))| *retry_at <= now)
+                    .take(UPSERT_PIPELINE_SIZE)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                let due = due_keys
+                    .into_iter()
+                    .filter_map(|key| {
+                        retry_observations
+                            .remove(&key)
+                            .map(|(_, mut command)| {
+                                if let Some(newer) = handle.observations.take(&key) {
+                                    command.coalesce(newer);
+                                }
+                                (key, command)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                (!due.is_empty()).then_some(WorkerCommand::Observe {
+                    batch: due,
+                    from_retry: true,
+                })
             }
-            observation = handle.observations.recv(), if retry_observations.is_empty() => {
+            observation = handle.observations.recv() => {
                 observation.map(|first| {
                     let mut batch = vec![first];
                     while batch.len() < UPSERT_PIPELINE_SIZE {
@@ -1740,7 +1785,10 @@ async fn run_manager_worker(
                         };
                         batch.push(next);
                     }
-                    WorkerCommand::Observe(batch)
+                    WorkerCommand::Observe {
+                        batch,
+                        from_retry: false,
+                    }
                 })
             }
         };
@@ -1748,7 +1796,28 @@ async fn run_manager_worker(
             break;
         };
         match command {
-            WorkerCommand::Observe(mut batch) => {
+            WorkerCommand::Observe {
+                mut batch,
+                from_retry,
+            } => {
+                if !from_retry
+                    && let Some(retry_at) = retry_observations
+                        .values()
+                        .map(|(retry_at, _)| *retry_at)
+                        .min()
+                {
+                    for (key, command) in batch.drain(..) {
+                        defer_address_observation(
+                            &mut retry_observations,
+                            retry_at,
+                            key,
+                            command,
+                            handle.metrics.as_deref(),
+                        );
+                    }
+                    handle.refresh_pending_metric_with(retry_observations.len());
+                    continue;
+                }
                 let observations = batch
                     .iter()
                     .map(|(key, command)| (key.clone(), command.observation.clone()))
@@ -1775,11 +1844,13 @@ async fn run_manager_worker(
                         if let Some(delay) = retry_delay
                             && !error.to_string().contains("state capacity")
                         {
-                            retry_observations.push((
+                            defer_address_observation(
+                                &mut retry_observations,
                                 tokio::time::Instant::now() + delay,
                                 key,
                                 command,
-                            ));
+                                handle.metrics.as_deref(),
+                            );
                         }
                     }
                 }
@@ -1806,6 +1877,40 @@ async fn run_manager_worker(
     }
 
     debug!(plugin = %tag, "ros_address_list manager worker exited");
+}
+
+fn defer_address_observation(
+    retries: &mut AHashMap<AddressListKey, (tokio::time::Instant, ObservationCommand)>,
+    retry_at: tokio::time::Instant,
+    key: AddressListKey,
+    command: ObservationCommand,
+    metrics: Option<&RosMetrics>,
+) {
+    if let Some((scheduled_at, existing)) = retries.get_mut(&key) {
+        *scheduled_at = (*scheduled_at).min(retry_at);
+        existing.coalesce(command);
+        if let Some(metrics) = metrics {
+            metrics.coalesced_total.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    if retries.len() < MANAGER_QUEUE_SIZE {
+        retries.insert(key, (retry_at, command));
+        return;
+    }
+
+    let error = Err(DnsError::plugin(
+        "ros_address_list retry observation capacity reached",
+    ));
+    for completion in command.completions {
+        completion.finish(&error);
+    }
+    if let Some(metrics) = metrics {
+        metrics
+            .capacity_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn dynamic_refresh_lead_ms(timeout_ms: u64) -> u64 {

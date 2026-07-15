@@ -477,7 +477,11 @@ impl RouterOsTransport {
 
     async fn record_success(&self, generation: u64) {
         let mut state = self.state.lock().await;
-        if state.generation == generation {
+        // A pipelined command can complete after another command from the same
+        // connection generation has already failed and invalidated `device`.
+        // That stale success must not clear the newly scheduled reconnect
+        // backoff or the degraded state.
+        if state.generation == generation && state.device.is_some() {
             state.consecutive_failures = 0;
             state.retry_at = None;
         }
@@ -784,5 +788,23 @@ mod tests {
         assert_eq!(snapshot.backoff_total, 0);
         assert!(!snapshot.degraded);
         assert!(snapshot.retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn late_success_from_invalidated_generation_preserves_backoff() {
+        let transport = RouterOsTransport::new(RouterOsConnectionConfig::plaintext_for_test());
+        {
+            let mut state = transport.state.lock().await;
+            state.generation = 7;
+            state.consecutive_failures = 2;
+            state.retry_at = Some(Instant::now() + Duration::from_secs(10));
+            state.device = None;
+        }
+
+        transport.record_success(7).await;
+
+        let snapshot = transport.snapshot().await;
+        assert!(snapshot.degraded);
+        assert!(snapshot.retry_after.is_some());
     }
 }

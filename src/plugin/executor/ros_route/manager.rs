@@ -875,7 +875,11 @@ impl RouteManagerHandle {
 
 #[derive(Debug)]
 enum WorkerCommand {
-    Observe(ObservationKey, ObservationCommand),
+    Observe {
+        key: ObservationKey,
+        command: ObservationCommand,
+        from_retry: bool,
+    },
     Control(ControlCommand),
 }
 
@@ -2454,7 +2458,16 @@ impl RouteManager {
                         existing.sync_state = SyncState::Dirty;
                     }
                 } else {
-                    if recover_dynamic_binding && dynamic_binding_capacity {
+                    // A steady-state reconcile must not turn ownership that is
+                    // already complete in this process into conservative
+                    // restart-recovery state. Only recover the representative
+                    // comment owner when this entry has no known dynamic owner
+                    // (for example, a persistent anchor discovered during
+                    // bootstrap) or was already recovered incompletely.
+                    let needs_dynamic_recovery = existing.recovered_ownership_incomplete
+                        || existing.domain_expiries.is_empty();
+                    if recover_dynamic_binding && dynamic_binding_capacity && needs_dynamic_recovery
+                    {
                         existing
                             .domain_expiries
                             .insert(meta.comment_domain.clone(), recovered_expiry);
@@ -2938,11 +2951,16 @@ async fn run_manager_worker(
     // Single-owner event loop for route state.
     // All cross-map updates are serialized here to keep transitions deterministic.
     let error_logs = ErrorLogThrottle::default();
-    let mut retry_observation = None::<(tokio::time::Instant, ObservationKey, ObservationCommand)>;
+    let mut retry_observations =
+        AHashMap::<ObservationKey, (tokio::time::Instant, ObservationCommand)>::new();
     loop {
+        let next_retry = retry_observations
+            .values()
+            .map(|(retry_at, _)| *retry_at)
+            .min();
         let retry_wakeup = async {
-            match retry_observation.as_ref() {
-                Some((retry_at, _, _)) => tokio::time::sleep_until(*retry_at).await,
+            match next_retry {
+                Some(retry_at) => tokio::time::sleep_until(retry_at).await,
                 None => std::future::pending::<()>().await,
             }
         };
@@ -2959,15 +2977,40 @@ async fn run_manager_worker(
             }
             control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
             () = retry_wakeup => {
-                retry_observation.take().map(|(_, key, mut command)| {
-                    if let Some(newer) = handle.observations.take(&key) {
-                        command.coalesce(newer);
-                    }
-                    WorkerCommand::Observe(key, command)
+                let now = tokio::time::Instant::now();
+                // Fold observations queued during backoff into the deferred set
+                // before replaying it. This preserves name-level/family-level
+                // supersession and prevents stale retries from winning the race.
+                while let Some((key, command)) = handle.observations.try_recv() {
+                    defer_route_observation(
+                        &mut retry_observations,
+                        now,
+                        key,
+                        command,
+                        handle.metrics.as_deref(),
+                    );
+                }
+                let due_key = retry_observations
+                    .iter()
+                    .filter(|(_, (retry_at, _))| *retry_at <= now)
+                    .min_by_key(|(_, (retry_at, _))| *retry_at)
+                    .map(|(key, _)| key.clone());
+                due_key.and_then(|key| {
+                    retry_observations.remove(&key).map(|(_, command)| {
+                        WorkerCommand::Observe {
+                            key,
+                            command,
+                            from_retry: true,
+                        }
+                    })
                 })
             }
-            observation = handle.observations.recv(), if retry_observation.is_none() => {
-                observation.map(|(key, command)| WorkerCommand::Observe(key, command))
+            observation = handle.observations.recv() => {
+                observation.map(|(key, command)| WorkerCommand::Observe {
+                    key,
+                    command,
+                    from_retry: false,
+                })
             }
         };
         let Some(command) = command else {
@@ -2975,7 +3018,27 @@ async fn run_manager_worker(
         };
 
         match command {
-            WorkerCommand::Observe(key, mut command) => {
+            WorkerCommand::Observe {
+                key,
+                mut command,
+                from_retry,
+            } => {
+                if !from_retry
+                    && let Some(retry_at) = retry_observations
+                        .values()
+                        .map(|(retry_at, _)| *retry_at)
+                        .min()
+                {
+                    defer_route_observation(
+                        &mut retry_observations,
+                        retry_at,
+                        key,
+                        command,
+                        handle.metrics.as_deref(),
+                    );
+                    handle.refresh_pending_metric_with(retry_observations.len());
+                    continue;
+                }
                 let wait_for_sync = !command.waiters.is_empty();
                 let result = manager
                     .observe_queued(key.domain.clone(), &command, wait_for_sync)
@@ -3001,8 +3064,13 @@ async fn run_manager_worker(
                         }
                     }
                     if let Some(delay) = retry_delay {
-                        retry_observation =
-                            Some((tokio::time::Instant::now() + delay, key, command));
+                        defer_route_observation(
+                            &mut retry_observations,
+                            tokio::time::Instant::now() + delay,
+                            key,
+                            command,
+                            handle.metrics.as_deref(),
+                        );
                     }
                 } else {
                     for waiter in command.waiters {
@@ -3046,10 +3114,74 @@ async fn run_manager_worker(
                 },
             },
         }
-        handle.refresh_pending_metric_with(usize::from(retry_observation.is_some()));
+        handle.refresh_pending_metric_with(retry_observations.len());
     }
 
     debug!(plugin = %tag, "ros_route manager worker exited");
+}
+
+fn defer_route_observation(
+    retries: &mut AHashMap<ObservationKey, (tokio::time::Instant, ObservationCommand)>,
+    retry_at: tokio::time::Instant,
+    key: ObservationKey,
+    mut command: ObservationCommand,
+    metrics: Option<&RosRouteMetrics>,
+) {
+    let superseded = if key.replace_scope == ObservationScope::Both {
+        retries
+            .keys()
+            .filter(|queued| queued.domain == key.domain)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        let name_level_key = ObservationKey {
+            domain: key.domain.clone(),
+            replace_scope: ObservationScope::Both,
+        };
+        retries
+            .contains_key(&name_level_key)
+            .then_some(name_level_key)
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    for superseded_key in superseded {
+        if let Some((_, mut superseded_command)) = retries.remove(&superseded_key) {
+            command.waiters.append(&mut superseded_command.waiters);
+            if let Some(metrics) = metrics {
+                metrics
+                    .coalesced_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    if let Some((scheduled_at, existing)) = retries.get_mut(&key) {
+        *scheduled_at = (*scheduled_at).min(retry_at);
+        existing.coalesce(command);
+        if let Some(metrics) = metrics {
+            metrics
+                .coalesced_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return;
+    }
+    if retries.len() < MANAGER_QUEUE_SIZE {
+        retries.insert(key, (retry_at, command));
+        return;
+    }
+
+    let message = "ros_route retry observation capacity reached";
+    for waiter in command.waiters {
+        let _ = waiter.send(Err(DnsError::plugin(message)));
+    }
+    if let Some(metrics) = metrics {
+        metrics
+            .capacity_rejected_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .dropped_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn parse_dst_address(dst: &str) -> Option<(IpAddr, u8)> {
@@ -3224,6 +3356,80 @@ mod tests {
             )
             .expect("name-level negative");
         assert_eq!(handle.observations.len(), 1);
+    }
+
+    #[test]
+    fn deferred_name_level_observation_supersedes_family_retries() {
+        AppClock::start();
+        let policy = RouteObservationPolicy {
+            min_ttl: 60,
+            max_ttl: 3_600,
+            fixed_ttl: None,
+        };
+        let retry_at = tokio::time::Instant::now();
+        let mut retries = AHashMap::new();
+        defer_route_observation(
+            &mut retries,
+            retry_at,
+            ObservationKey {
+                domain: "missing.example.".to_string(),
+                replace_scope: ObservationScope::Ipv4,
+            },
+            policy.command(ObservationScope::Ipv4, Vec::new(), Some(60), None),
+            None,
+        );
+        defer_route_observation(
+            &mut retries,
+            retry_at,
+            ObservationKey {
+                domain: "missing.example.".to_string(),
+                replace_scope: ObservationScope::Both,
+            },
+            policy.command(ObservationScope::Both, Vec::new(), Some(60), None),
+            None,
+        );
+
+        assert_eq!(retries.len(), 1);
+        assert!(retries.keys().all(|key| {
+            key.domain == "missing.example." && key.replace_scope == ObservationScope::Both
+        }));
+    }
+
+    #[test]
+    fn deferred_family_observation_supersedes_name_level_retry() {
+        AppClock::start();
+        let policy = RouteObservationPolicy {
+            min_ttl: 60,
+            max_ttl: 3_600,
+            fixed_ttl: None,
+        };
+        let retry_at = tokio::time::Instant::now();
+        let mut retries = AHashMap::new();
+        defer_route_observation(
+            &mut retries,
+            retry_at,
+            ObservationKey {
+                domain: "dual.example.".to_string(),
+                replace_scope: ObservationScope::Both,
+            },
+            policy.command(ObservationScope::Both, Vec::new(), Some(60), None),
+            None,
+        );
+        defer_route_observation(
+            &mut retries,
+            retry_at,
+            ObservationKey {
+                domain: "dual.example.".to_string(),
+                replace_scope: ObservationScope::Ipv4,
+            },
+            policy.command(ObservationScope::Ipv4, Vec::new(), Some(60), None),
+            None,
+        );
+
+        assert_eq!(retries.len(), 1);
+        assert!(retries.keys().all(|key| {
+            key.domain == "dual.example." && key.replace_scope == ObservationScope::Ipv4
+        }));
     }
 
     #[test]
@@ -3949,6 +4155,55 @@ mod tests {
             .expect("route state should remain for deletion");
         assert!(entry.domain_expiries.is_empty());
         assert_eq!(entry.sync_state, SyncState::PendingDelete);
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_make_known_timeless_ownership_incomplete() {
+        AppClock::start();
+        let now = unix_now();
+        let domain = "known-owner.example.".to_string();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 57));
+        let key = RouteKey::new(ip, "via_proxy".to_string());
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));
+
+        manager.apply_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ip,
+                ttl_secs: 60,
+            }],
+            now,
+        );
+        let comment = {
+            let entry = manager.routes.get_mut(&key).expect("dynamic route");
+            entry.router_id = Some("*known-owner".to_string());
+            entry.synced_expires_at_unix = Some(u64::MAX);
+            entry.sync_state = SyncState::Synced;
+            RouteCommentCodec::encode("fdns", "route-test", entry)
+        };
+        api.state
+            .lock()
+            .expect("mock lock")
+            .routes
+            .push(RouterRoute {
+                id: "*known-owner".to_string(),
+                family: RouteFamily::Ipv4,
+                dst_address: key.dst_address(),
+                routing_table: key.table.clone(),
+                gateway: Some("192.0.2.1".to_string()),
+                distance: Some(100),
+                comment: Some(comment),
+                disabled: false,
+            });
+
+        manager.reconcile_from_router().await.expect("reconcile");
+
+        assert!(!manager.routes[&key].recovered_ownership_incomplete);
+        manager.apply_observation(domain.clone(), ObservationScope::Ipv4, Vec::new(), now + 1);
+        assert!(!manager.domain_bindings.contains_key(&domain));
+        assert_eq!(manager.routes[&key].sync_state, SyncState::PendingDelete);
     }
 
     #[test]

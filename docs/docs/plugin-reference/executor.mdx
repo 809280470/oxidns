@@ -2550,10 +2550,7 @@ old-static.example.com static.example.net
     username: "api-user"
     # API 密码
     password: "secret"
-    # 省略 tls 时使用明文 API（通常 8728）；启用后使用 API-SSL（通常 8729）
-    tls:
-      server_name: "router.example"
-      ca: "/etc/oxidns/routeros-ca.pem"
+    # 默认使用明文 API（通常 8728）；配置 tls 后才启用 API-SSL（通常 8729）
     # RouterOS API 连接超时，单位秒
     connect_timeout: 5
     # RouterOS API 发送命令超时，单位秒
@@ -2591,6 +2588,20 @@ old-static.example.com static.example.net
         - "/etc/oxidns/persistent_ips.txt"
 ```
 
+启用 API-SSL 时，将端口改为实际的 TLS 端口（通常为 `8729`），并显式添加 `tls`：
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # 可选；覆盖从 address 推断出的证书服务器名称
+    server_name: "router.example"
+    # 可选；自签名证书或私有 CA 的 PEM 文件
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # 可选，默认 false；设为 true 时跳过证书验证，且不能同时配置 ca
+    insecure: false
+```
+
 ### 配置项
 
 #### `address`
@@ -2614,7 +2625,10 @@ old-static.example.com static.example.net
 #### `tls`
 
 - 类型：`object`；必填：否；默认值：无（明文 API）
-- 作用：启用 RouterOS API-SSL。`server_name` 可覆盖证书名称，`ca` 加载自签名/私有 CA；只有无法建立可信证书链时才使用 `insecure: true`，且 `insecure` 不能与 `ca` 同时配置。
+- 作用：启用 RouterOS API-SSL。
+- `tls.server_name`：可选字符串；覆盖从 `address` 推断出的证书服务器名称。
+- `tls.ca`：可选字符串；指定自签名证书或私有 CA 的 PEM 文件路径。
+- `tls.insecure`：可选布尔值，默认 `false`；设为 `true` 时跳过证书验证，且不能同时配置 `tls.ca`。
 - 安全建议：明文 API 通常使用 `8728`，API-SSL 通常使用 `8729`；端口仍以 RouterOS 实际配置为准。
 
 #### `connect_timeout`
@@ -2751,9 +2765,7 @@ old-static.example.com static.example.net
     address: "192.168.88.1:8728"
     username: "api-user"
     password: "secret"
-    tls:
-      server_name: "router.example"
-      ca: "/etc/oxidns/routeros-ca.pem"
+    # 默认使用明文 API；配置 tls 后才启用 API-SSL
     routing_table: "via_proxy"
     gateway4: "192.168.88.2@main"
     gateway6: "fe80::2%ether1"
@@ -2765,6 +2777,20 @@ old-static.example.com static.example.net
       ips: ["198.51.100.0/24"]
 ```
 
+启用 API-SSL 时可使用完整的 TLS 子配置：
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # 可选；覆盖从 address 推断出的证书服务器名称
+    server_name: "router.example"
+    # 可选；自签名证书或私有 CA 的 PEM 文件
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # 可选，默认 false；设为 true 时跳过证书验证，且不能同时配置 ca
+    insecure: false
+```
+
 - `routing_table`、`gateway4`/`gateway6` 定义写入目标；路由表、routing rule 和默认路由需预先在 RouterOS 配好。
 - `min_ttl`/`max_ttl` 默认分别为 `60`/`3600` 秒。`fixed_ttl` 覆盖 DNS TTL；其中 `fixed_ttl: 0` 表示动态路由不按时间过期，但同一域名后续应答移除该 IP 时会撤销其引用。
 - `ros_route` 与 `ros_address_list` 都会收集 Answer 区中所有已启用地址族的 A/AAAA 记录，不再重建 CNAME 链或用 CNAME TTL 截断地址 TTL。对 `ros_route` 而言，A 查询只替换/撤销 IPv4 路由，AAAA 查询只替换/撤销 IPv6 路由；但同一 Answer 中的两种地址都会作为新增或刷新候选。
@@ -2774,7 +2800,7 @@ old-static.example.com static.example.net
 - `max_entries` 默认 `65536`，限制动态路由和域名绑定状态；persistent 路由不计入。`fixed_ttl: 0` 路由不会自然过期，应为其预留容量。
 - 动态路由以 RouterOS 实际状态为准：用户删除后由下一次对账接受删除，下一次 DNS 观测再创建；不会在每次 DNS 请求中读取路由表。persistent 路由仍以配置为准。
 - 重启恢复 shared-IP 时，RouterOS comment 只保存一个代表域名。有限 TTL 路由会保守保留到 comment 最大有效期；timeless 路由按“仍可能存在未知 owner”处理，只能由远端删除、shutdown cleanup 或所有权配置变化清理。
-- `tls` 启用 API-SSL（通常 `8729`）；自签名证书优先配置 `tls.ca`，仅在确实无法验证时使用 `insecure: true`。省略 `tls` 时使用明文 API（通常 `8728`）。
+- `tls` 启用 API-SSL（通常 `8729`）：`tls.server_name` 覆盖证书服务器名称，`tls.ca` 指定自签名/私有 CA 文件，`tls.insecure` 默认为 `false`，设为 `true` 时跳过证书验证且不能与 `tls.ca` 同时配置。省略 `tls` 时使用明文 API（通常 `8728`）。
 - `cleanup_on_shutdown: true` 会删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。
 
 ---

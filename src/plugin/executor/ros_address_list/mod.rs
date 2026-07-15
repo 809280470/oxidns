@@ -47,8 +47,9 @@ use self::api::{
     MikrotikApi, MikrotikApiTimeouts, MikrotikRsClient,
 };
 use self::manager::{
-    AddressListFamily, AddressListKey, AddressListManager, AddressListManagerConfig,
-    AddressListManagerHandle, AddressListManagerRuntime, ObserveEnqueueError,
+    AddressListCleanupScope, AddressListFamily, AddressListKey, AddressListManager,
+    AddressListManagerConfig, AddressListManagerHandle, AddressListManagerRuntime,
+    ObserveEnqueueError,
 };
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
@@ -298,6 +299,30 @@ impl AddressListOwnershipNamespace {
             comment_prefix: config.comment_prefix.clone(),
         }
     }
+
+    fn shares_owner_root(&self, other: &Self) -> bool {
+        self.address == other.address && self.comment_prefix == other.comment_prefix
+    }
+
+    fn shares_any_list(&self, other: &Self) -> bool {
+        self.shares_owner_root(other)
+            && ((self.address_list4.is_some() && self.address_list4 == other.address_list4)
+                || (self.address_list6.is_some() && self.address_list6 == other.address_list6))
+    }
+
+    fn cleanup_scope(&self, remaining: &[ActiveAddressListInstance]) -> AddressListCleanupScope {
+        let ipv4 = self.address_list4.is_some()
+            && !remaining.iter().any(|instance| {
+                self.shares_owner_root(&instance.namespace)
+                    && self.address_list4 == instance.namespace.address_list4
+            });
+        let ipv6 = self.address_list6.is_some()
+            && !remaining.iter().any(|instance| {
+                self.shares_owner_root(&instance.namespace)
+                    && self.address_list6 == instance.namespace.address_list6
+            });
+        AddressListCleanupScope { ipv4, ipv6 }
+    }
 }
 
 static NEXT_ADDRESS_LIST_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -327,16 +352,14 @@ fn register_active_address_list_instance(
     Ok(())
 }
 
-fn release_active_address_list_instance(tag: &str, instance_id: u64) -> bool {
-    let Some((cleanup_allowed, metric_replacement, remove_metric, restore_handle)) =
+fn release_active_address_list_instance(tag: &str, instance_id: u64) -> AddressListCleanupScope {
+    let Some((cleanup_scope, metric_replacement, remove_metric, restore_handle)) =
         active_address_list_instances().release(
             tag,
             |instance| instance.instance_id == instance_id,
             |removed, instances, was_metric_owner| {
                 let is_last = instances.is_empty();
-                let cleanup_allowed = !instances
-                    .iter()
-                    .any(|instance| instance.namespace == removed.namespace);
+                let cleanup_scope = removed.namespace.cleanup_scope(instances);
                 let metric_replacement = was_metric_owner
                     .then(|| instances.last().map(|instance| instance.metrics.clone()))
                     .flatten();
@@ -345,13 +368,13 @@ fn release_active_address_list_instance(tag: &str, instance_id: u64) -> bool {
                         instances
                             .iter()
                             .rev()
-                            .find(|instance| instance.namespace == removed.namespace)
+                            .find(|instance| instance.namespace.shares_any_list(&removed.namespace))
                             .and_then(|instance| instance.manager_handle.clone())
                     })
                     .flatten();
                 let remove_metric = was_metric_owner && is_last;
                 (
-                    cleanup_allowed,
+                    cleanup_scope,
                     metric_replacement,
                     remove_metric,
                     restore_handle,
@@ -359,7 +382,7 @@ fn release_active_address_list_instance(tag: &str, instance_id: u64) -> bool {
             },
         )
     else {
-        return false;
+        return AddressListCleanupScope::none();
     };
 
     if let Some(metrics) = metric_replacement {
@@ -375,7 +398,7 @@ fn release_active_address_list_instance(tag: &str, instance_id: u64) -> bool {
             "ros_address_list failed to enqueue immediate reconcile after reload rollback"
         );
     }
-    cleanup_allowed
+    cleanup_scope
 }
 
 impl RosMetrics {
@@ -547,7 +570,7 @@ impl Plugin for MikrotikExecutor {
             self.metrics.clone(),
             Some(manager_handle.clone()),
         ) {
-            runtime.shutdown(false).await;
+            runtime.shutdown(AddressListCleanupScope::none()).await;
             return Err(error);
         }
         let mut runtime = Some(runtime);
@@ -556,7 +579,7 @@ impl Plugin for MikrotikExecutor {
         }
         if let Some(runtime) = runtime {
             release_active_address_list_instance(&self.tag, self.instance_id);
-            runtime.shutdown(false).await;
+            runtime.shutdown(AddressListCleanupScope::none()).await;
             return Err(DnsError::plugin(
                 "ros_address_list runtime lock is poisoned during initialization",
             ));
@@ -567,12 +590,18 @@ impl Plugin for MikrotikExecutor {
     }
 
     async fn destroy(&self) -> Result<()> {
-        let cleanup_allowed = self.active_registered.swap(false, Ordering::AcqRel)
-            && release_active_address_list_instance(&self.tag, self.instance_id);
+        let cleanup_scope = if self.active_registered.swap(false, Ordering::AcqRel) {
+            release_active_address_list_instance(&self.tag, self.instance_id)
+        } else {
+            AddressListCleanupScope::none()
+        };
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
-            runtime
-                .shutdown(self.config.cleanup_on_shutdown && cleanup_allowed)
-                .await;
+            let cleanup_scope = if self.config.cleanup_on_shutdown {
+                cleanup_scope
+            } else {
+                AddressListCleanupScope::none()
+            };
+            runtime.shutdown(cleanup_scope).await;
         }
         Ok(())
     }
@@ -2447,12 +2476,65 @@ persistent:
         )
         .expect("replacement runtime");
 
-        assert!(!release_active_address_list_instance(
-            tag.as_str(),
-            sequence + 1
-        ));
+        assert_eq!(
+            release_active_address_list_instance(tag.as_str(), sequence + 1),
+            AddressListCleanupScope::none()
+        );
         assert!(old_handle.take_reconcile_for_test());
-        assert!(release_active_address_list_instance(tag.as_str(), sequence));
+        assert_eq!(
+            release_active_address_list_instance(tag.as_str(), sequence),
+            AddressListCleanupScope {
+                ipv4: true,
+                ipv6: false,
+            }
+        );
+    }
+
+    #[test]
+    fn partially_overlapping_reload_cleans_only_unclaimed_address_lists() {
+        let sequence = NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
+        let tag = format!("address-list-partial-reload-{sequence}");
+        let old_namespace = AddressListOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            address_list4: Some("shared-v4".to_string()),
+            address_list6: Some("old-v6".to_string()),
+            comment_prefix: "fdns".to_string(),
+        };
+        let new_namespace = AddressListOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            address_list4: Some("shared-v4".to_string()),
+            address_list6: Some("new-v6".to_string()),
+            comment_prefix: "fdns".to_string(),
+        };
+
+        register_active_address_list_instance(
+            &tag,
+            sequence,
+            old_namespace,
+            Arc::new(RosMetrics::new(tag.clone())),
+            None,
+        )
+        .expect("old runtime");
+        register_active_address_list_instance(
+            &tag,
+            sequence + 1,
+            new_namespace,
+            Arc::new(RosMetrics::new(tag.clone())),
+            None,
+        )
+        .expect("replacement runtime");
+
+        assert_eq!(
+            release_active_address_list_instance(&tag, sequence),
+            AddressListCleanupScope {
+                ipv4: false,
+                ipv6: true,
+            }
+        );
+        assert_eq!(
+            release_active_address_list_instance(&tag, sequence + 1),
+            AddressListCleanupScope::all()
+        );
     }
 
     #[tokio::test]
@@ -2595,7 +2677,10 @@ persistent:
             cfg
         });
 
-        manager.shutdown(true).await.unwrap();
+        manager
+            .shutdown(AddressListCleanupScope::all())
+            .await
+            .unwrap();
 
         assert!(
             api.state
@@ -2603,6 +2688,53 @@ persistent:
                 .unwrap()
                 .entries
                 .contains_key(&MockMikrotikApi::storage_key(&key))
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_can_target_only_an_unclaimed_address_family() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let ipv4_key = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(11, 11, 11, 14)),
+            "oxidns_ipv4".to_string(),
+        );
+        let ipv6_key = AddressListKey::new(
+            IpAddr::V6("2001:db8::14".parse().expect("ipv6")),
+            "oxidns_ipv6".to_string(),
+        );
+        for (id, key) in [("*owned-v4", &ipv4_key), ("*owned-v6", &ipv6_key)] {
+            api.seed_entry(RouterListEntry {
+                id: id.to_string(),
+                key: key.clone(),
+                timeout: Some("300s".to_string()),
+                comment: Some(encode_comment(
+                    "oxidns",
+                    "partial-cleanup",
+                    OwnedCommentKind::Dynamic,
+                    Some("example.com"),
+                )),
+            });
+        }
+        let mut manager = AddressListManager::new(api.clone(), default_cfg("partial-cleanup"));
+
+        manager
+            .shutdown(AddressListCleanupScope {
+                ipv4: false,
+                ipv6: true,
+            })
+            .await
+            .expect("partial cleanup");
+
+        let state = api.state.lock().expect("mock lock");
+        assert!(
+            state
+                .entries
+                .contains_key(&MockMikrotikApi::storage_key(&ipv4_key))
+        );
+        assert!(
+            !state
+                .entries
+                .contains_key(&MockMikrotikApi::storage_key(&ipv6_key))
         );
     }
 }

@@ -43,6 +43,12 @@ if (!qnameDefinition) {
   throw new Error("qname matcher definition must exist");
 }
 
+const routerOsDefinitions = executorPluginDefinitions.filter(
+  (definition) =>
+    definition.kind === "ros_route" ||
+    definition.kind === "ros_address_list",
+);
+
 describe("time matcher config form", () => {
   it("normalizes legacy weekday aliases to ISO numbers while preserving monthdays", () => {
     const config = {
@@ -173,6 +179,15 @@ describe("optional object config fields", () => {
       table_name4: "mangle",
       set_name4: "dns_v4",
     });
+  });
+
+  it("keeps RouterOS TLS disabled in newly created configs", () => {
+    expect(routerOsDefinitions).toHaveLength(2);
+    for (const definition of routerOsDefinitions) {
+      const values = createDefaultPluginConfigValues(definition.configSchema);
+      expect(serializePluginConfigValues(definition.configSchema, values)).not
+        .toHaveProperty("tls");
+    }
   });
 });
 

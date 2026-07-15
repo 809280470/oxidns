@@ -2456,10 +2456,7 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
     username: "api-user"
     # API password
     password: "secret"
-    # Omit tls for plaintext API (usually 8728); configure it for API-SSL (usually 8729)
-    tls:
-      server_name: "router.example"
-      ca: "/etc/oxidns/routeros-ca.pem"
+    # Plaintext API is the default (usually 8728); configure tls to enable API-SSL (usually 8729)
     # RouterOS API connection timeout, in seconds
     connect_timeout: 5
     # RouterOS API command send timeout, in seconds
@@ -2497,6 +2494,20 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
         - "/etc/oxidns/persistent_ips.txt"
 ```
 
+To enable API-SSL, change the endpoint to the actual TLS port (usually `8729`) and add `tls` explicitly:
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # Optional: override the certificate server name inferred from address
+    server_name: "router.example"
+    # Optional: PEM file containing a self-signed certificate or private CA
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # Optional, default false: skip certificate verification; cannot be used with ca
+    insecure: false
+```
+
 ### Configuration Details
 
 #### `address`
@@ -2517,7 +2528,10 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 #### `tls`
 
 - Type: `object`; Required: no; Default: none (plaintext API)
-- Purpose: Enables RouterOS API-SSL. `server_name` overrides certificate naming, `ca` loads a private/self-signed CA, and `insecure: true` disables verification. Prefer `ca`; `insecure` cannot be combined with it.
+- Purpose: Enables RouterOS API-SSL.
+- `tls.server_name`: optional string overriding the certificate server name inferred from `address`.
+- `tls.ca`: optional string containing the path to a PEM file for a self-signed certificate or private CA.
+- `tls.insecure`: optional boolean, default `false`; `true` disables certificate verification and cannot be combined with `tls.ca`.
 
 #### `connect_timeout`
 
@@ -2640,9 +2654,7 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
     address: "192.168.88.1:8728"
     username: "api-user"
     password: "secret"
-    tls:
-      server_name: "router.example"
-      ca: "/etc/oxidns/routeros-ca.pem"
+    # Plaintext API is the default; configure tls to enable API-SSL
     routing_table: "via_proxy"
     gateway4: "192.168.88.2@main"
     gateway6: "fe80::2%ether1"
@@ -2654,6 +2666,20 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
       ips: ["198.51.100.0/24"]
 ```
 
+To enable API-SSL, use the complete nested TLS configuration:
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # Optional: override the certificate server name inferred from address
+    server_name: "router.example"
+    # Optional: PEM file containing a self-signed certificate or private CA
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # Optional, default false: skip certificate verification; cannot be used with ca
+    insecure: false
+```
+
 - `routing_table` and `gateway4`/`gateway6` select the target. The RouterOS table, routing rule, and default route must already exist.
 - `min_ttl`/`max_ttl` default to `60`/`3600` seconds. `fixed_ttl` overrides DNS TTL; `fixed_ttl: 0` disables time-based expiry, while a later answer for the same domain still withdraws an absent IP reference.
 - `ros_route` and `ros_address_list` collect every A/AAAA record for an enabled family from the Answer section. They do not rebuild CNAME chains or cap an address TTL by a CNAME TTL. In `ros_route`, an A query replaces/withdraws only IPv4 routes and an AAAA query only IPv6 routes, while both address families from the same Answer remain candidates for creation or refresh.
@@ -2663,7 +2689,7 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
 - `max_entries` defaults to `65536` and limits dynamic routes and domain bindings; persistent routes do not count. `fixed_ttl: 0` routes need deliberate capacity planning.
 - Dynamic routes follow actual RouterOS state: reconcile accepts operator deletion, and a later DNS observation recreates the route. RouterOS is not read on every DNS request; persistent routes remain configuration-authoritative.
 - Shared-IP restart recovery stores one representative domain in the RouterOS comment. Finite routes are conservatively kept until the comment's maximum expiry. Timeless recovered routes retain an unknown-owner marker and are removed only by an operator, shutdown cleanup, or an ownership-configuration change.
-- `tls` enables API-SSL (usually port `8729`); prefer `tls.ca` for self-signed certificates and use `insecure: true` only when verification is impossible. Omitting `tls` uses plaintext API (usually `8728`).
+- `tls` enables API-SSL (usually port `8729`): `tls.server_name` overrides the certificate server name, `tls.ca` selects a self-signed/private CA file, and `tls.insecure` defaults to `false`; setting it to `true` disables certificate verification and cannot be combined with `tls.ca`. Omitting `tls` uses plaintext API (usually `8728`).
 - With `cleanup_on_shutdown: true`, dynamic and persistent routes owned by this plugin tag are removed; `false` leaves them for recovery on the next start.
 
 ---
