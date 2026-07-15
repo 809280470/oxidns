@@ -17,6 +17,7 @@ use super::manager::{
 use crate::infra::error::{DnsError, Result};
 use crate::plugin::executor::ros_common::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
+    RouterOsTransportSnapshot,
 };
 
 /// RouterOS field containing the internal row id.
@@ -72,6 +73,13 @@ pub(super) struct RouterListEntry {
 
 #[async_trait]
 pub(super) trait MikrotikApi: Debug + Send + Sync {
+    /// Enter shutdown-cleanup mode, bypassing reconnect backoff while keeping
+    /// per-operation timeouts.
+    fn begin_shutdown_cleanup(&self) {}
+    /// Transport health used by retry scheduling and metrics.
+    async fn transport_snapshot(&self) -> Option<RouterOsTransportSnapshot> {
+        None
+    }
     /// List all entries from the configured IPv4/IPv6 address lists.
     async fn list_entries(
         &self,
@@ -266,6 +274,14 @@ fn parse_router_list_entry(
 
 #[async_trait]
 impl MikrotikApi for MikrotikRsClient {
+    fn begin_shutdown_cleanup(&self) {
+        self.transport.begin_shutdown_cleanup();
+    }
+
+    async fn transport_snapshot(&self) -> Option<RouterOsTransportSnapshot> {
+        Some(self.transport.snapshot().await)
+    }
+
     async fn list_entries(
         &self,
         list4: Option<&str>,

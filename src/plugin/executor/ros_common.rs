@@ -9,7 +9,10 @@ use ahash::AHashMap;
 
 use crate::proto::Message;
 
+pub(crate) mod batching;
+pub(crate) mod lifecycle;
 pub(crate) mod mailbox;
+pub(crate) mod throttle;
 pub(crate) mod transport;
 
 /// Return whether an echoed response question is compatible with the request.

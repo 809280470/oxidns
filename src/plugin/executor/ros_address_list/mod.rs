@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
@@ -57,6 +57,7 @@ use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
     unregister_metric_source,
 };
+use crate::plugin::executor::ros_common::lifecycle::ActiveInstanceRegistry;
 use crate::plugin::executor::ros_common::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
 use crate::plugin::executor::ros_common::{
     ObservedAddr, collect_answer_addrs, response_question_matches_request,
@@ -290,11 +291,9 @@ impl AddressListOwnershipNamespace {
 
 static NEXT_ADDRESS_LIST_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn active_address_list_instances()
--> &'static Mutex<AHashMap<String, Vec<ActiveAddressListInstance>>> {
-    static INSTANCES: OnceLock<Mutex<AHashMap<String, Vec<ActiveAddressListInstance>>>> =
-        OnceLock::new();
-    INSTANCES.get_or_init(|| Mutex::new(AHashMap::new()))
+fn active_address_list_instances() -> &'static ActiveInstanceRegistry<ActiveAddressListInstance> {
+    static INSTANCES: OnceLock<ActiveInstanceRegistry<ActiveAddressListInstance>> = OnceLock::new();
+    INSTANCES.get_or_init(ActiveInstanceRegistry::new)
 }
 
 fn register_active_address_list_instance(
@@ -305,63 +304,51 @@ fn register_active_address_list_instance(
     manager_handle: Option<AddressListManagerHandle>,
 ) -> Result<()> {
     register_metric_source(metrics.clone())?;
-    let mut active = active_address_list_instances()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    active
-        .entry(tag.to_string())
-        .or_default()
-        .push(ActiveAddressListInstance {
+    active_address_list_instances().push(
+        tag,
+        ActiveAddressListInstance {
             instance_id,
             namespace,
             metrics,
             manager_handle,
-        });
+        },
+    );
     Ok(())
 }
 
 fn release_active_address_list_instance(tag: &str, instance_id: u64) -> bool {
-    let (cleanup_allowed, metric_replacement, remove_metric, restore_handle) = {
-        let mut active = active_address_list_instances()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(instances) = active.get_mut(tag) else {
-            return false;
-        };
-        let Some(index) = instances
-            .iter()
-            .position(|instance| instance.instance_id == instance_id)
-        else {
-            return false;
-        };
-        let was_metric_owner = index + 1 == instances.len();
-        let removed = instances.remove(index);
-        let is_last = instances.is_empty();
-        let cleanup_allowed = !instances
-            .iter()
-            .any(|instance| instance.namespace == removed.namespace);
-        let metric_replacement = was_metric_owner
-            .then(|| instances.last().map(|instance| instance.metrics.clone()))
-            .flatten();
-        let restore_handle = was_metric_owner
-            .then(|| {
-                instances
+    let Some((cleanup_allowed, metric_replacement, remove_metric, restore_handle)) =
+        active_address_list_instances().release(
+            tag,
+            |instance| instance.instance_id == instance_id,
+            |removed, instances, was_metric_owner| {
+                let is_last = instances.is_empty();
+                let cleanup_allowed = !instances
                     .iter()
-                    .rev()
-                    .find(|instance| instance.namespace == removed.namespace)
-                    .and_then(|instance| instance.manager_handle.clone())
-            })
-            .flatten();
-        let remove_metric = was_metric_owner && is_last;
-        if is_last {
-            active.remove(tag);
-        }
-        (
-            cleanup_allowed,
-            metric_replacement,
-            remove_metric,
-            restore_handle,
+                    .any(|instance| instance.namespace == removed.namespace);
+                let metric_replacement = was_metric_owner
+                    .then(|| instances.last().map(|instance| instance.metrics.clone()))
+                    .flatten();
+                let restore_handle = was_metric_owner
+                    .then(|| {
+                        instances
+                            .iter()
+                            .rev()
+                            .find(|instance| instance.namespace == removed.namespace)
+                            .and_then(|instance| instance.manager_handle.clone())
+                    })
+                    .flatten();
+                let remove_metric = was_metric_owner && is_last;
+                (
+                    cleanup_allowed,
+                    metric_replacement,
+                    remove_metric,
+                    restore_handle,
+                )
+            },
         )
+    else {
+        return false;
     };
 
     if let Some(metrics) = metric_replacement {
@@ -951,6 +938,8 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::atomic::AtomicUsize;
 
+    use ahash::AHashMap;
+
     use super::*;
     use crate::infra::clock::AppClock;
     use crate::plugin::executor::ros_address_list::api::RouterListEntry;
@@ -1306,8 +1295,8 @@ mod tests {
     }
 
     #[test]
-    fn observation_mailbox_coalesces_repeated_domain_updates() {
-        let handle = AddressListManagerHandle::new();
+    fn observation_mailbox_keeps_distinct_addresses_from_same_domain() {
+        let handle = AddressListManagerHandle::new_for_test();
         let first = vec![ObservedAddr {
             addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             ttl_secs: 60,
@@ -1327,7 +1316,7 @@ mod tests {
                 .try_observe("busy.example.".to_string(), latest, None)
                 .is_ok()
         );
-        assert_eq!(handle.queued_observations(), 1);
+        assert_eq!(handle.queued_observations(), 2);
     }
 
     fn a_record(ip: Ipv4Addr, ttl: u32) -> Record {
@@ -2244,7 +2233,7 @@ persistent:
             address_list6: None,
             comment_prefix: "fdns".to_string(),
         };
-        let old_handle = AddressListManagerHandle::new();
+        let old_handle = AddressListManagerHandle::new_for_test();
 
         register_active_address_list_instance(
             tag.as_str(),

@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
@@ -233,12 +233,6 @@ impl MikrotikConfigArgs {
             gateway4.is_some(),
             gateway6.is_some(),
         )?;
-        if parsed_persistent.all_ips.len() > max_entries {
-            return Err(DnsError::plugin(format!(
-                "ros_route persistent_route contains {} entries, exceeding max_entries({max_entries})",
-                parsed_persistent.all_ips.len()
-            )));
-        }
         let ignored_by_gateway = parsed_persistent.ignored_by_gateway;
         if emit_warnings && ignored_by_gateway > 0 {
             warn!(
@@ -289,6 +283,7 @@ use self::manager::{
     ObservationScope, ObserveEnqueueError, PersistentReloadConfig, RouteManager,
     RouteManagerConfig, RouteManagerHandle, RouteManagerRuntime,
 };
+use crate::plugin::executor::ros_common::lifecycle::ActiveInstanceRegistry;
 use crate::plugin::executor::ros_common::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
 use crate::plugin::executor::ros_common::{
     ObservedAddr, collect_answer_addrs, response_question_matches_request,
@@ -346,9 +341,9 @@ impl RouteOwnershipNamespace {
 
 static NEXT_ROUTE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn active_route_instances() -> &'static Mutex<AHashMap<String, Vec<ActiveRouteInstance>>> {
-    static INSTANCES: OnceLock<Mutex<AHashMap<String, Vec<ActiveRouteInstance>>>> = OnceLock::new();
-    INSTANCES.get_or_init(|| Mutex::new(AHashMap::new()))
+fn active_route_instances() -> &'static ActiveInstanceRegistry<ActiveRouteInstance> {
+    static INSTANCES: OnceLock<ActiveInstanceRegistry<ActiveRouteInstance>> = OnceLock::new();
+    INSTANCES.get_or_init(ActiveInstanceRegistry::new)
 }
 
 fn register_active_route_instance(
@@ -359,18 +354,15 @@ fn register_active_route_instance(
     manager_handle: Option<RouteManagerHandle>,
 ) -> Result<()> {
     register_metric_source(metrics.clone())?;
-    let mut active = active_route_instances()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    active
-        .entry(tag.to_string())
-        .or_default()
-        .push(ActiveRouteInstance {
+    active_route_instances().push(
+        tag,
+        ActiveRouteInstance {
             instance_id,
             namespace,
             metrics,
             manager_handle,
-        });
+        },
+    );
     Ok(())
 }
 
@@ -384,52 +376,43 @@ fn register_active_route_instance(
 /// not suppress cleanup of the old namespace. The stack also restores the
 /// previous metric source when candidate initialization later rolls back.
 fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
-    let (cleanup_allowed, metric_replacement, remove_metric, restore_tx) = {
-        let mut active = active_route_instances()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(instances) = active.get_mut(tag) else {
-            return false;
-        };
-        let Some(index) = instances
-            .iter()
-            .position(|instance| instance.instance_id == instance_id)
-        else {
-            return false;
-        };
-        let was_metric_owner = index + 1 == instances.len();
-        let removed = instances.remove(index);
-        let is_last = instances.is_empty();
-        let cleanup_allowed = !instances
-            .iter()
-            .any(|instance| instance.namespace == removed.namespace);
-        let metric_replacement = was_metric_owner
-            .then(|| instances.last().map(|instance| instance.metrics.clone()))
-            .flatten();
-        // A candidate is appended after the running instance. If that newest
-        // candidate is destroyed during a failed reload, it may already have
-        // reconciled changed gateway/distance metadata. Ask the compatible
-        // surviving runtime to restore its desired state immediately instead
-        // of waiting for the periodic 180-second reconcile.
-        let restore_tx = was_metric_owner
-            .then(|| {
-                instances
+    let Some((cleanup_allowed, metric_replacement, remove_metric, restore_tx)) =
+        active_route_instances().release(
+            tag,
+            |instance| instance.instance_id == instance_id,
+            |removed, instances, was_metric_owner| {
+                let is_last = instances.is_empty();
+                let cleanup_allowed = !instances
                     .iter()
-                    .rev()
-                    .find(|instance| instance.namespace == removed.namespace)
-                    .and_then(|instance| instance.manager_handle.clone())
-            })
-            .flatten();
-        let remove_metric = was_metric_owner && is_last;
-        if is_last {
-            active.remove(tag);
-        }
-        (
-            cleanup_allowed,
-            metric_replacement,
-            remove_metric,
-            restore_tx,
+                    .any(|instance| instance.namespace == removed.namespace);
+                let metric_replacement = was_metric_owner
+                    .then(|| instances.last().map(|instance| instance.metrics.clone()))
+                    .flatten();
+                // A candidate is appended after the running instance. If that newest
+                // candidate is destroyed during a failed reload, it may already have
+                // reconciled changed gateway/distance metadata. Ask the compatible
+                // surviving runtime to restore its desired state immediately instead
+                // of waiting for the periodic 180-second reconcile.
+                let restore_tx = was_metric_owner
+                    .then(|| {
+                        instances
+                            .iter()
+                            .rev()
+                            .find(|instance| instance.namespace == removed.namespace)
+                            .and_then(|instance| instance.manager_handle.clone())
+                    })
+                    .flatten();
+                let remove_metric = was_metric_owner && is_last;
+                (
+                    cleanup_allowed,
+                    metric_replacement,
+                    remove_metric,
+                    restore_tx,
+                )
+            },
         )
+    else {
+        return false;
     };
 
     if let Some(metrics) = metric_replacement {
@@ -533,7 +516,6 @@ impl Plugin for MikrotikExecutor {
             initial_ips: self.config.persistent_ips.clone(),
             gateway4_enabled: self.config.gateway4.is_some(),
             gateway6_enabled: self.config.gateway6.is_some(),
-            max_entries: self.config.max_entries,
         });
         let runtime = RouteManagerRuntime::start(self.tag.clone(), manager, persistent_reload);
         let manager_handle = runtime.handle();
@@ -1209,7 +1191,7 @@ fixed_ttl: 0
     }
 
     #[test]
-    fn max_entries_is_positive_and_bounds_initial_persistent_routes() {
+    fn max_entries_is_positive_and_excludes_persistent_routes() {
         let args = serde_yaml_ng::from_str::<Value>(
             r#"
 address: "127.0.0.1:8728"
@@ -1261,12 +1243,9 @@ persistent_route:
 "#,
         )
         .expect("yaml");
-        assert!(
-            parse_plugin_config(Some(overflow), false)
-                .expect_err("persistent overflow")
-                .to_string()
-                .contains("max_entries")
-        );
+        let parsed = parse_plugin_config(Some(overflow), false).expect("persistent routes");
+        assert_eq!(parsed.max_entries, 1);
+        assert_eq!(parsed.persistent_ips.len(), 2);
     }
 
     #[test]
@@ -1526,7 +1505,7 @@ routing_table: "policy"
             routing_table: "policy".to_string(),
             comment_prefix: "fdns".to_string(),
         };
-        let old_handle = RouteManagerHandle::new();
+        let old_handle = RouteManagerHandle::new_for_test();
 
         register_active_route_instance(
             &tag,

@@ -15,7 +15,8 @@
 //!   dynamic refresh cache.
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
@@ -28,9 +29,11 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::task as task_center;
 use crate::plugin::executor::ros_common::ObservedAddr;
+use crate::plugin::executor::ros_common::batching::join_all_bounded;
 use crate::plugin::executor::ros_common::mailbox::{
     Coalesce, KeyedMailbox, PushOutcome, TryPushError,
 };
+use crate::plugin::executor::ros_common::throttle::ErrorLogThrottle;
 
 /// Host prefix used for normalized IPv4 single-address entries.
 const HOST_PREFIX_V4: u8 = 32;
@@ -43,8 +46,6 @@ const CONTROL_QUEUE_SIZE: usize = 2;
 const RECONCILE_INTERVAL_SECS: u64 = 180;
 /// Periodic interval for local dynamic-cache pruning.
 const DYNAMIC_CACHE_PRUNE_INTERVAL_SECS: u64 = 60;
-/// Maximum time allowed for graceful manager shutdown coordination.
-const SHUTDOWN_TIMEOUT_SECS: u64 = 8;
 /// Maximum number of RouterOS upserts issued concurrently by one observation.
 const UPSERT_PIPELINE_SIZE: usize = 16;
 /// Maximum time a dynamic key can go without a refresh attempt under steady
@@ -242,16 +243,147 @@ pub(super) struct AddressListManagerConfig {
     pub(super) max_entries: usize,
 }
 
+#[derive(Debug, Clone)]
+struct AddressObservation {
+    domain: String,
+    /// Absolute RouterOS timeout deadline. `None` is timeless.
+    expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ObservationCompletion {
+    remaining: AtomicUsize,
+    first_error: StdMutex<Option<String>>,
+    sender: StdMutex<Option<oneshot::Sender<Result<()>>>>,
+}
+
+impl ObservationCompletion {
+    fn new(items: usize, sender: oneshot::Sender<Result<()>>) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: AtomicUsize::new(items),
+            first_error: StdMutex::new(None),
+            sender: StdMutex::new(Some(sender)),
+        })
+    }
+
+    fn finish(&self, result: &Result<()>) {
+        if let Err(error) = result {
+            let mut first = self
+                .first_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if first.is_none() {
+                *first = Some(error.to_string());
+            }
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let result = self
+            .first_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .map_or(Ok(()), |message| Err(DnsError::plugin(message)));
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = sender.send(result);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ObservationCommand {
-    addrs: Vec<ObservedAddr>,
-    waiters: Vec<oneshot::Sender<Result<()>>>,
+    observation: AddressObservation,
+    completions: Vec<Arc<ObservationCompletion>>,
 }
 
 impl Coalesce for ObservationCommand {
     fn coalesce(&mut self, mut newer: Self) {
-        newer.waiters.append(&mut self.waiters);
-        *self = newer;
+        let keep_newer = match (
+            self.observation.expires_at_ms,
+            newer.observation.expires_at_ms,
+        ) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(current), Some(next)) => next >= current,
+        };
+        self.completions.append(&mut newer.completions);
+        if keep_newer {
+            self.observation = newer.observation;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AddressObservationPolicy {
+    address_list4: Option<String>,
+    address_list6: Option<String>,
+    min_ttl: u32,
+    max_ttl: u32,
+    fixed_ttl: Option<u32>,
+}
+
+impl AddressObservationPolicy {
+    fn from_config(config: &AddressListManagerConfig) -> Self {
+        Self {
+            address_list4: config.address_list4.clone(),
+            address_list6: config.address_list6.clone(),
+            min_ttl: config.min_ttl,
+            max_ttl: config.max_ttl,
+            fixed_ttl: config.fixed_ttl,
+        }
+    }
+
+    fn list_for(&self, family: AddressListFamily) -> Option<&str> {
+        match family {
+            AddressListFamily::Ipv4 => self.address_list4.as_deref(),
+            AddressListFamily::Ipv6 => self.address_list6.as_deref(),
+        }
+    }
+
+    fn commands(
+        &self,
+        domain: String,
+        addrs: Vec<ObservedAddr>,
+    ) -> Vec<(AddressListKey, AddressObservation)> {
+        let now = now_millis();
+        let mut observations = AHashMap::<AddressListKey, AddressObservation>::new();
+        for observed in addrs {
+            let family = AddressListFamily::from_ip(observed.addr);
+            let Some(list) = self.list_for(family) else {
+                continue;
+            };
+            let key = AddressListKey::new(observed.addr, list.to_string());
+            let ttl = match self.fixed_ttl {
+                Some(0) => None,
+                Some(ttl) => Some(ttl),
+                None => Some(observed.ttl_secs.max(1).clamp(self.min_ttl, self.max_ttl)),
+            };
+            let observation = AddressObservation {
+                domain: domain.clone(),
+                expires_at_ms: ttl
+                    .map(|ttl| now.saturating_add(u64::from(ttl).saturating_mul(1_000))),
+            };
+            observations
+                .entry(key)
+                .and_modify(|current| {
+                    let replace = match (current.expires_at_ms, observation.expires_at_ms) {
+                        (_, None) => true,
+                        (None, Some(_)) => false,
+                        (Some(current), Some(next)) => next >= current,
+                    };
+                    if replace {
+                        *current = observation.clone();
+                    }
+                })
+                .or_insert(observation);
+        }
+        observations.into_iter().collect()
     }
 }
 
@@ -293,16 +425,34 @@ pub(super) enum ObserveEnqueueError {
 
 #[derive(Debug, Clone)]
 pub(super) struct AddressListManagerHandle {
-    observations: KeyedMailbox<String, ObservationCommand>,
+    observations: KeyedMailbox<AddressListKey, ObservationCommand>,
     controls: KeyedMailbox<ControlKey, ControlCommand>,
+    policy: AddressObservationPolicy,
 }
 
 impl AddressListManagerHandle {
-    pub(super) fn new() -> Self {
+    fn new(config: &AddressListManagerConfig) -> Self {
         Self {
             observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
+            policy: AddressObservationPolicy::from_config(config),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test() -> Self {
+        AppClock::start();
+        Self::new(&AddressListManagerConfig {
+            plugin_tag: "test".to_string(),
+            address_list4: Some("test_v4".to_string()),
+            address_list6: Some("test_v6".to_string()),
+            persistent_items: AHashSet::new(),
+            comment_prefix: "fdns".to_string(),
+            min_ttl: 60,
+            max_ttl: 3600,
+            fixed_ttl: None,
+            max_entries: 65_536,
+        })
     }
 
     pub(super) fn try_observe(
@@ -311,16 +461,43 @@ impl AddressListManagerHandle {
         addrs: Vec<ObservedAddr>,
         wait: Option<oneshot::Sender<Result<()>>>,
     ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
-        let command = ObservationCommand {
-            addrs,
-            waiters: wait.into_iter().collect(),
-        };
-        self.observations
-            .try_push(domain, command)
-            .map_err(|error| match error {
-                TryPushError::Full(_) => ObserveEnqueueError::Full,
-                TryPushError::Closed(_) => ObserveEnqueueError::Closed,
-            })
+        let commands = self.policy.commands(domain, addrs);
+        if commands.is_empty() {
+            if let Some(waiter) = wait {
+                let _ = waiter.send(Ok(()));
+            }
+            return Ok(PushOutcome::Inserted);
+        }
+        let completion = wait.map(|waiter| ObservationCompletion::new(commands.len(), waiter));
+        let mut outcome = PushOutcome::Coalesced;
+        let mut enqueue_error = None;
+        for (key, observation) in commands {
+            let command = ObservationCommand {
+                observation,
+                completions: completion.iter().cloned().collect(),
+            };
+            match self.observations.try_push(key, command) {
+                Ok(PushOutcome::Inserted) => outcome = PushOutcome::Inserted,
+                Ok(PushOutcome::Coalesced) => {}
+                Err(TryPushError::Full(command)) => {
+                    for completion in command.completions {
+                        completion.finish(&Err(DnsError::plugin(
+                            "ros_address_list observation mailbox is full",
+                        )));
+                    }
+                    enqueue_error.get_or_insert(ObserveEnqueueError::Full);
+                }
+                Err(TryPushError::Closed(command)) => {
+                    for completion in command.completions {
+                        completion.finish(&Err(DnsError::plugin(
+                            "ros_address_list observation mailbox is closed",
+                        )));
+                    }
+                    enqueue_error = Some(ObserveEnqueueError::Closed);
+                }
+            }
+        }
+        enqueue_error.map_or(Ok(outcome), Err)
     }
 
     pub(super) async fn observe(
@@ -329,16 +506,38 @@ impl AddressListManagerHandle {
         addrs: Vec<ObservedAddr>,
         wait: oneshot::Sender<Result<()>>,
     ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
-        self.observations
-            .push(
-                domain,
-                ObservationCommand {
-                    addrs,
-                    waiters: vec![wait],
-                },
-            )
-            .await
-            .map_err(|_| ObserveEnqueueError::Closed)
+        let commands = self.policy.commands(domain, addrs);
+        if commands.is_empty() {
+            let _ = wait.send(Ok(()));
+            return Ok(PushOutcome::Inserted);
+        }
+        let completion = ObservationCompletion::new(commands.len(), wait);
+        let mut outcome = PushOutcome::Coalesced;
+        let total = commands.len();
+        for (index, (key, observation)) in commands.into_iter().enumerate() {
+            let command = ObservationCommand {
+                observation,
+                completions: vec![completion.clone()],
+            };
+            match self.observations.push(key, command).await {
+                Ok(PushOutcome::Inserted) => outcome = PushOutcome::Inserted,
+                Ok(PushOutcome::Coalesced) => {}
+                Err(error) => {
+                    for completion in error.0.completions {
+                        completion.finish(&Err(DnsError::plugin(
+                            "ros_address_list observation mailbox is closed",
+                        )));
+                    }
+                    for _ in index + 1..total {
+                        completion.finish(&Err(DnsError::plugin(
+                            "ros_address_list observation mailbox is closed",
+                        )));
+                    }
+                    return Err(ObserveEnqueueError::Closed);
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     pub(super) fn request_reconcile(&self) -> bool {
@@ -375,7 +574,7 @@ impl AddressListManagerHandle {
 
 #[derive(Debug)]
 enum WorkerCommand {
-    Observe(String, ObservationCommand),
+    Observe(Vec<(AddressListKey, ObservationCommand)>),
     Control(ControlCommand),
 }
 
@@ -395,7 +594,7 @@ impl AddressListManagerRuntime {
     pub(super) fn start(tag: String, manager: AddressListManager) -> Self {
         // All mutable state lives behind one worker to avoid cross-map locking
         // or request-path synchronization in the DNS hot path.
-        let handle = AddressListManagerHandle::new();
+        let handle = AddressListManagerHandle::new(&manager.cfg);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker_tag = tag.clone();
         let worker_handle_mailbox = handle.clone();
@@ -470,18 +669,13 @@ impl AddressListManagerRuntime {
             .is_ok()
         });
         self.handle.close();
-        let shutdown_acked = shutdown_requested
-            && tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), done_rx)
-                .await
-                .is_ok();
+        if shutdown_requested {
+            // There is intentionally no aggregate cleanup deadline. Each API
+            // operation remains bounded by the configured transport timeout.
+            let _ = done_rx.await;
+        }
         if let Some(handle) = self.worker_handle.take() {
-            if shutdown_acked {
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), handle).await;
-            } else {
-                handle.abort();
-                let _ = handle.await;
-            }
+            let _ = handle.await;
         }
     }
 }
@@ -529,6 +723,7 @@ impl AddressListManager {
         Ok(())
     }
 
+    #[cfg(test)]
     #[inline]
     fn effective_dynamic_timeout(&self, ttl_secs: u32) -> DynamicTimeout {
         // TTL policy is centralized here so dynamic observations and tests use
@@ -543,6 +738,7 @@ impl AddressListManager {
         DynamicTimeout::Timed(ttl_secs.clamp(self.cfg.min_ttl, self.cfg.max_ttl))
     }
 
+    #[cfg(test)]
     #[inline]
     fn list_name_for(&self, family: AddressListFamily) -> Option<&str> {
         match family {
@@ -606,31 +802,18 @@ impl AddressListManager {
         self.dynamic_refresh_cache.retain(|key, state| {
             state.expires_at_ms > now_ms && !self.persistent_items.contains(key)
         });
-
-        if self.dynamic_refresh_cache.len() <= self.cfg.max_entries {
-            return;
-        }
-
-        // The cache only suppresses redundant writes, so arbitrary eviction is
-        // safe and avoids sorting a large map on maintenance paths.
-        while self.dynamic_refresh_cache.len() > self.cfg.max_entries {
-            let Some(key) = self.dynamic_refresh_cache.keys().next().cloned() else {
-                break;
-            };
-            self.dynamic_refresh_cache.remove(&key);
-        }
     }
 
-    fn cache_dynamic_write(&mut self, key: AddressListKey, mut state: DynamicRefreshState) {
+    fn cache_dynamic_write(&mut self, key: AddressListKey, mut state: DynamicRefreshState) -> bool {
         if !self.dynamic_refresh_cache.contains_key(&key)
             && self.dynamic_refresh_cache.len() >= self.cfg.max_entries
-            && let Some(evicted) = self.dynamic_refresh_cache.keys().next().cloned()
         {
-            self.dynamic_refresh_cache.remove(&evicted);
+            return false;
         }
         self.dynamic_generation = self.dynamic_generation.wrapping_add(1);
         state.generation = self.dynamic_generation;
         self.dynamic_refresh_cache.insert(key, state);
+        true
     }
 
     async fn reconcile_persistent_inner(&mut self) -> Result<AHashSet<AddressListKey>> {
@@ -659,9 +842,8 @@ impl AddressListManager {
 
         let desired_comment = self.comment_for_persistent();
         let persistent = self.persistent_items.iter().collect::<Vec<_>>();
-        let mut first_error = None;
-        for batch in persistent.chunks(UPSERT_PIPELINE_SIZE) {
-            let results = futures::future::join_all(batch.iter().map(|key| {
+        let results = join_all_bounded(
+            persistent.iter().map(|key| {
                 self.api.upsert_owned_entry(
                     key,
                     None,
@@ -670,22 +852,24 @@ impl AddressListManager {
                     self.cfg.plugin_tag.as_str(),
                     false,
                 )
-            }))
-            .await;
-            for (key, result) in batch.iter().zip(results) {
-                match result {
-                    Ok(Some(())) => {}
-                    Ok(None) => {
-                        warn!(
-                            plugin = %self.cfg.plugin_tag,
-                            list = %key.list,
-                            address = %key.normalized_value(),
-                            "ros_address_list persistent entry conflicts with foreign address-list entry, skipping"
-                        );
-                    }
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
+            }),
+            UPSERT_PIPELINE_SIZE,
+        )
+        .await;
+        let mut first_error = None;
+        for (key, result) in persistent.iter().zip(results) {
+            match result {
+                Ok(Some(())) => {}
+                Ok(None) => {
+                    warn!(
+                        plugin = %self.cfg.plugin_tag,
+                        list = %key.list,
+                        address = %key.normalized_value(),
+                        "ros_address_list persistent entry conflicts with foreign address-list entry, skipping"
+                    );
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -806,6 +990,7 @@ impl AddressListManager {
         }
     }
 
+    #[cfg(test)]
     async fn observe_domain_inner(
         &mut self,
         domain: String,
@@ -870,47 +1055,45 @@ impl AddressListManager {
         let comment_str = comment.as_str();
         let comment_prefix = self.cfg.comment_prefix.clone();
         let plugin_tag = self.cfg.plugin_tag.clone();
-        let mut first_error: Option<DnsError> = None;
-        for batch in to_refresh.chunks(UPSERT_PIPELINE_SIZE) {
-            let results =
-                futures::future::join_all(batch.iter().map(|(key, timeout, timeout_value)| {
-                    api.upsert_owned_entry(
-                        key,
-                        timeout_value.as_deref(),
-                        comment_str,
-                        comment_prefix.as_str(),
-                        plugin_tag.as_str(),
-                        matches!(timeout, DynamicTimeout::Timed(_)),
-                    )
-                }))
-                .await;
+        let results = join_all_bounded(
+            to_refresh.iter().map(|(key, timeout, timeout_value)| {
+                api.upsert_owned_entry(
+                    key,
+                    timeout_value.as_deref(),
+                    comment_str,
+                    comment_prefix.as_str(),
+                    plugin_tag.as_str(),
+                    matches!(timeout, DynamicTimeout::Timed(_)),
+                )
+            }),
+            UPSERT_PIPELINE_SIZE,
+        )
+        .await;
 
-            // Phase 3: update suppression state per result so one failure does
-            // not discard successful writes from the same response.
-            for ((key, timeout, _), result) in batch.iter().zip(results) {
-                match result {
-                    Ok(Some(())) => {
-                        let state = match timeout {
-                            DynamicTimeout::Timed(ttl) => {
-                                DynamicRefreshState::from_write(now_ms, *ttl)
-                            }
-                            DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
-                        };
-                        self.cache_dynamic_write(key.clone(), state);
-                    }
-                    Ok(None) => {
-                        self.dynamic_refresh_cache.remove(key);
-                        warn!(
-                            plugin = %self.cfg.plugin_tag,
-                            list = %key.list,
-                            address = %key.normalized_value(),
-                            "ros_address_list dynamic entry conflicts with foreign address-list entry, skipping"
-                        );
-                    }
-                    Err(err) => {
-                        self.dynamic_refresh_cache.remove(key);
-                        first_error.get_or_insert(err);
-                    }
+        let mut first_error: Option<DnsError> = None;
+        // Phase 3: update suppression state per result so one failure does
+        // not discard successful writes from the same response.
+        for ((key, timeout, _), result) in to_refresh.iter().zip(results) {
+            match result {
+                Ok(Some(())) => {
+                    let state = match timeout {
+                        DynamicTimeout::Timed(ttl) => DynamicRefreshState::from_write(now_ms, *ttl),
+                        DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
+                    };
+                    let _ = self.cache_dynamic_write(key.clone(), state);
+                }
+                Ok(None) => {
+                    self.dynamic_refresh_cache.remove(key);
+                    warn!(
+                        plugin = %self.cfg.plugin_tag,
+                        list = %key.list,
+                        address = %key.normalized_value(),
+                        "ros_address_list dynamic entry conflicts with foreign address-list entry, skipping"
+                    );
+                }
+                Err(err) => {
+                    self.dynamic_refresh_cache.remove(key);
+                    first_error.get_or_insert(err);
                 }
             }
         }
@@ -921,6 +1104,7 @@ impl AddressListManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn observe_domain(
         &mut self,
         domain: String,
@@ -929,6 +1113,128 @@ impl AddressListManager {
         let tag = self.cfg.plugin_tag.clone();
         self.harvest_background_reconcile(tag.as_str()).await;
         self.observe_domain_inner(domain, addrs, now_millis()).await
+    }
+
+    async fn observe_address_batch(
+        &mut self,
+        observations: &[(AddressListKey, AddressObservation)],
+    ) -> Vec<Result<()>> {
+        let tag = self.cfg.plugin_tag.clone();
+        self.harvest_background_reconcile(tag.as_str()).await;
+        self.prune_dynamic_cache(now_millis());
+
+        struct Prepared {
+            index: usize,
+            key: AddressListKey,
+            timeout: DynamicTimeout,
+            timeout_value: Option<String>,
+            comment: String,
+        }
+
+        let now = now_millis();
+        let mut outcomes = std::iter::repeat_with(|| None)
+            .take(observations.len())
+            .collect::<Vec<Option<Result<()>>>>();
+        let mut prepared = Vec::new();
+        let mut reserved_new = AHashSet::new();
+        for (index, (key, observation)) in observations.iter().enumerate() {
+            if self.persistent_items.contains(key) {
+                outcomes[index] = Some(Ok(()));
+                continue;
+            }
+            if !self.dynamic_refresh_cache.contains_key(key)
+                && !reserved_new.contains(key)
+                && self.dynamic_refresh_cache.len() + reserved_new.len() >= self.cfg.max_entries
+            {
+                outcomes[index] = Some(Err(DnsError::plugin(format!(
+                    "ros_address_list dynamic state capacity {} reached",
+                    self.cfg.max_entries
+                ))));
+                continue;
+            }
+            let timeout = match observation.expires_at_ms {
+                None => DynamicTimeout::Timeless,
+                Some(expires_at_ms) if expires_at_ms <= now => {
+                    outcomes[index] = Some(Ok(()));
+                    continue;
+                }
+                Some(expires_at_ms) => {
+                    let remaining_ms = expires_at_ms.saturating_sub(now);
+                    let seconds = remaining_ms
+                        .saturating_add(999)
+                        .saturating_div(1_000)
+                        .clamp(1, u64::from(u32::MAX)) as u32;
+                    DynamicTimeout::Timed(seconds)
+                }
+            };
+            if !self.should_refresh_dynamic_entry(key, timeout, now) {
+                outcomes[index] = Some(Ok(()));
+                continue;
+            }
+            prepared.push(Prepared {
+                index,
+                key: key.clone(),
+                timeout,
+                timeout_value: match timeout {
+                    DynamicTimeout::Timed(ttl) => Some(format!("{ttl}s")),
+                    DynamicTimeout::Timeless => None,
+                },
+                comment: self.comment_for_dynamic(&observation.domain),
+            });
+            if !self.dynamic_refresh_cache.contains_key(key) {
+                reserved_new.insert(key.clone());
+            }
+        }
+
+        let api = self.api.clone();
+        let prefix = self.cfg.comment_prefix.clone();
+        let plugin_tag = self.cfg.plugin_tag.clone();
+        let results = join_all_bounded(
+            prepared.iter().map(|item| {
+                api.upsert_owned_entry(
+                    &item.key,
+                    item.timeout_value.as_deref(),
+                    &item.comment,
+                    &prefix,
+                    &plugin_tag,
+                    matches!(item.timeout, DynamicTimeout::Timed(_)),
+                )
+            }),
+            UPSERT_PIPELINE_SIZE,
+        )
+        .await;
+
+        for (item, result) in prepared.into_iter().zip(results) {
+            outcomes[item.index] = Some(match result {
+                Ok(Some(())) => {
+                    let state = match item.timeout {
+                        DynamicTimeout::Timed(ttl) => DynamicRefreshState::from_write(now, ttl),
+                        DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
+                    };
+                    if self.cache_dynamic_write(item.key, state) {
+                        Ok(())
+                    } else {
+                        Err(DnsError::plugin(format!(
+                            "ros_address_list dynamic state capacity {} reached",
+                            self.cfg.max_entries
+                        )))
+                    }
+                }
+                Ok(None) => {
+                    self.dynamic_refresh_cache.remove(&item.key);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.dynamic_refresh_cache.remove(&item.key);
+                    Err(error)
+                }
+            });
+        }
+
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.unwrap_or_else(|| Ok(())))
+            .collect()
     }
 
     #[cfg(test)]
@@ -963,6 +1269,13 @@ impl AddressListManager {
         Ok(())
     }
 
+    async fn transport_retry_delay(&self) -> Option<Duration> {
+        self.api
+            .transport_snapshot()
+            .await
+            .and_then(|snapshot| snapshot.retry_after)
+    }
+
     pub(super) async fn shutdown(&mut self, cleanup: bool) -> Result<()> {
         if let Some(handle) = self.reconcile_handle.take() {
             handle.abort();
@@ -974,6 +1287,9 @@ impl AddressListManager {
             return Ok(());
         }
 
+        // Cleanup bypasses reconnect backoff but retains per-operation
+        // transport timeouts.
+        self.api.begin_shutdown_cleanup();
         // Cleanup only touches entries that match this plugin's comment ownership.
         self.ensure_initialized().await?;
         let entries = self
@@ -994,18 +1310,17 @@ impl AddressListManager {
                 .is_some()
             })
             .collect::<Vec<_>>();
+        let results = join_all_bounded(
+            owned
+                .iter()
+                .map(|entry| self.api.delete_entry_by_id(&entry.id, entry.key.family)),
+            UPSERT_PIPELINE_SIZE,
+        )
+        .await;
         let mut first_error = None;
-        for batch in owned.chunks(UPSERT_PIPELINE_SIZE) {
-            let results = futures::future::join_all(
-                batch
-                    .iter()
-                    .map(|entry| self.api.delete_entry_by_id(&entry.id, entry.key.family)),
-            )
-            .await;
-            for result in results {
-                if let Err(error) = result {
-                    first_error.get_or_insert(error);
-                }
+        for result in results {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
         self.dynamic_refresh_cache.clear();
@@ -1132,83 +1447,119 @@ async fn run_manager_worker(
 ) {
     // Every state transition is serialized here. Request-path code only pushes
     // commands into the mailbox and never mutates manager state directly.
-    let mut prefer_control = true;
+    let error_logs = ErrorLogThrottle::default();
+    let mut retry_observations =
+        Vec::<(tokio::time::Instant, AddressListKey, ObservationCommand)>::new();
     loop {
-        let command = if prefer_control {
-            tokio::select! {
-                biased;
-                shutdown = &mut shutdown_rx => {
-                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
-                        if let Err(e) = manager.shutdown(cleanup).await {
-                            warn!(plugin = %tag, err = %e, "ros_address_list shutdown cleanup failed");
-                        }
-                        let _ = done.send(());
-                    }
-                    break;
-                }
-                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
-                observation = handle.observations.recv() => observation.map(|(domain, command)| WorkerCommand::Observe(domain, command)),
+        let next_retry = retry_observations
+            .iter()
+            .map(|(retry_at, _, _)| *retry_at)
+            .min();
+        let retry_wakeup = async {
+            match next_retry {
+                Some(retry_at) => tokio::time::sleep_until(retry_at).await,
+                None => std::future::pending::<()>().await,
             }
-        } else {
-            tokio::select! {
-                biased;
-                shutdown = &mut shutdown_rx => {
-                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
-                        if let Err(e) = manager.shutdown(cleanup).await {
-                            warn!(plugin = %tag, err = %e, "ros_address_list shutdown cleanup failed");
-                        }
-                        let _ = done.send(());
+        };
+        let command = tokio::select! {
+            biased;
+            shutdown = &mut shutdown_rx => {
+                if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
+                    if let Err(e) = manager.shutdown(cleanup).await {
+                        warn!(plugin = %tag, err = %e, "ros_address_list shutdown cleanup failed");
                     }
-                    break;
+                    let _ = done.send(());
                 }
-                observation = handle.observations.recv() => observation.map(|(domain, command)| WorkerCommand::Observe(domain, command)),
-                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+                break;
+            }
+            control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+            () = retry_wakeup => {
+                let now = tokio::time::Instant::now();
+                let mut due = Vec::new();
+                let mut pending = Vec::new();
+                for (retry_at, key, mut command) in retry_observations.drain(..) {
+                    if retry_at <= now && due.len() < UPSERT_PIPELINE_SIZE {
+                        if let Some(newer) = handle.observations.take(&key) {
+                            command.coalesce(newer);
+                        }
+                        due.push((key, command));
+                    } else {
+                        pending.push((retry_at, key, command));
+                    }
+                }
+                retry_observations = pending;
+                (!due.is_empty()).then_some(WorkerCommand::Observe(due))
+            }
+            observation = handle.observations.recv(), if retry_observations.is_empty() => {
+                observation.map(|first| {
+                    let mut batch = vec![first];
+                    while batch.len() < UPSERT_PIPELINE_SIZE {
+                        let Some(next) = handle.observations.try_recv() else {
+                            break;
+                        };
+                        batch.push(next);
+                    }
+                    WorkerCommand::Observe(batch)
+                })
             }
         };
         let Some(command) = command else {
             break;
         };
         match command {
-            WorkerCommand::Observe(domain, ObservationCommand { addrs, waiters }) => {
-                prefer_control = true;
-                let result = manager.observe_domain(domain, addrs).await;
-                if waiters.is_empty() {
-                    if let Err(e) = result {
-                        warn!(
-                            plugin = %tag,
-                            err = %e,
-                            "ros_address_list observe failed in async mode"
-                        );
-                    }
+            WorkerCommand::Observe(mut batch) => {
+                let observations = batch
+                    .iter()
+                    .map(|(key, command)| (key.clone(), command.observation.clone()))
+                    .collect::<Vec<_>>();
+                let results = manager.observe_address_batch(&observations).await;
+                let has_error = results.iter().any(|result| result.is_err());
+                let retry_delay = if has_error {
+                    manager.transport_retry_delay().await
                 } else {
-                    let outcome = result.map_err(|error| error.to_string());
-                    for waiter in waiters {
-                        let result = outcome
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|message| DnsError::plugin(message.clone()));
-                        let _ = waiter.send(result);
+                    None
+                };
+                for ((key, mut command), result) in batch.drain(..).zip(results) {
+                    for completion in command.completions.drain(..) {
+                        completion.finish(&result);
                     }
-                }
-            }
-            WorkerCommand::Control(command) => {
-                prefer_control = false;
-                match command {
-                    ControlCommand::Reconcile => {
-                        manager.harvest_background_reconcile(tag.as_str()).await;
-                        manager.spawn_background_reconcile(tag.clone());
-                    }
-                    ControlCommand::PruneDynamicCache => {
-                        if let Err(e) = manager.prune_dynamic_cache_now().await {
+                    if let Err(error) = &result {
+                        if error_logs.should_log("observe") {
                             warn!(
                                 plugin = %tag,
-                                err = %e,
-                                "ros_address_list dynamic cache prune failed"
+                                err = %error,
+                                "ros_address_list observe failed in async mode"
                             );
+                        }
+                        if let Some(delay) = retry_delay
+                            && !error.to_string().contains("state capacity")
+                        {
+                            retry_observations.push((
+                                tokio::time::Instant::now() + delay,
+                                key,
+                                command,
+                            ));
                         }
                     }
                 }
             }
+            WorkerCommand::Control(command) => match command {
+                ControlCommand::Reconcile => {
+                    manager.harvest_background_reconcile(tag.as_str()).await;
+                    manager.spawn_background_reconcile(tag.clone());
+                }
+                ControlCommand::PruneDynamicCache => {
+                    if let Err(e) = manager.prune_dynamic_cache_now().await
+                        && error_logs.should_log("prune")
+                    {
+                        warn!(
+                            plugin = %tag,
+                            err = %e,
+                            "ros_address_list dynamic cache prune failed"
+                        );
+                    }
+                }
+            },
         }
     }
 
@@ -1267,4 +1618,84 @@ pub(super) fn parse_router_address(family: AddressListFamily, raw: &str) -> Opti
         return None;
     }
     Some((ip, family.host_prefix()))
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn mailbox_is_bounded_by_address_list_key() {
+        let handle = AddressListManagerHandle::new_for_test();
+        let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        for index in 0..10_000 {
+            handle
+                .try_observe(
+                    format!("domain-{index}.example."),
+                    vec![ObservedAddr {
+                        addr,
+                        ttl_secs: 60 + (index % 300) as u32,
+                    }],
+                    None,
+                )
+                .expect("coalesced observation");
+        }
+
+        assert_eq!(handle.observations.len(), 1);
+        let (key, command) = handle.observations.recv().await.expect("observation");
+        assert_eq!(key.address, addr);
+        // The coalesced value keeps the longest absolute expiry, not merely
+        // the last domain that happened to observe the same RouterOS row.
+        assert_eq!(command.observation.domain, "domain-9899.example.");
+    }
+
+    #[tokio::test]
+    async fn timeless_observation_cannot_be_replaced_by_timed_observation() {
+        AppClock::start();
+        let mut config = AddressListManagerConfig {
+            plugin_tag: "test".to_string(),
+            address_list4: Some("test_v4".to_string()),
+            address_list6: None,
+            persistent_items: AHashSet::new(),
+            comment_prefix: "fdns".to_string(),
+            min_ttl: 60,
+            max_ttl: 3600,
+            fixed_ttl: Some(0),
+            max_entries: 65_536,
+        };
+        let handle = AddressListManagerHandle::new(&config);
+        let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        handle
+            .try_observe(
+                "timeless.example.".to_string(),
+                vec![ObservedAddr { addr, ttl_secs: 60 }],
+                None,
+            )
+            .expect("timeless observation");
+
+        config.fixed_ttl = Some(300);
+        let (key, observation) = AddressObservationPolicy::from_config(&config)
+            .commands(
+                "timed.example.".to_string(),
+                vec![ObservedAddr { addr, ttl_secs: 60 }],
+            )
+            .pop()
+            .expect("timed command");
+        handle
+            .observations
+            .try_push(
+                key,
+                ObservationCommand {
+                    observation,
+                    completions: Vec::new(),
+                },
+            )
+            .expect("coalesced timed observation");
+
+        let (_, command) = handle.observations.recv().await.expect("observation");
+        assert_eq!(command.observation.domain, "timeless.example.");
+        assert_eq!(command.observation.expires_at_ms, None);
+    }
 }

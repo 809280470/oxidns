@@ -140,7 +140,6 @@ where
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn try_recv(&self) -> Option<(K, V)> {
         let mut state = self
             .inner
@@ -155,6 +154,48 @@ where
         drop(state);
         self.inner.space_ready.notify_one();
         Some((key, value))
+    }
+
+    /// Remove one queued key without disturbing the order of other work.
+    pub(crate) fn take(&self, key: &K) -> Option<V> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let value = state.values.remove(key)?;
+        state.order.retain(|queued| queued != key);
+        drop(state);
+        self.inner.space_ready.notify_one();
+        Some(value)
+    }
+
+    /// Remove every queued item whose key matches a superseding observation.
+    pub(crate) fn remove_where(&self, mut predicate: impl FnMut(&K) -> bool) -> Vec<(K, V)> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed_keys = state
+            .order
+            .iter()
+            .filter(|key| predicate(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed_keys.is_empty() {
+            return Vec::new();
+        }
+        let removed_set = removed_keys.iter().cloned().collect::<ahash::AHashSet<_>>();
+        state.order.retain(|key| !removed_set.contains(key));
+        let removed = removed_keys
+            .into_iter()
+            .filter_map(|key| state.values.remove(&key).map(|value| (key, value)))
+            .collect::<Vec<_>>();
+        drop(state);
+        self.inner.space_ready.notify_waiters();
+        self.inner.space_ready.notify_one();
+        removed
     }
 
     pub(crate) async fn recv(&self) -> Option<(K, V)> {
@@ -201,7 +242,9 @@ where
         self.inner.space_ready.notify_one();
     }
 
-    #[cfg(test)]
+    // Also used by the plugin pending-observation gauges in the final metrics
+    // wiring stage; tests exercise it before that wiring is installed.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.inner
             .state
@@ -287,5 +330,29 @@ mod tests {
 
         assert!(first.await.expect("first producer").is_err());
         assert!(second.await.expect("second producer").is_err());
+    }
+
+    #[test]
+    fn take_removes_only_the_selected_key() {
+        let mailbox = KeyedMailbox::new(2);
+        mailbox.try_push("a", Latest(1)).expect("a");
+        mailbox.try_push("b", Latest(2)).expect("b");
+
+        assert_eq!(mailbox.take(&"a"), Some(Latest(1)));
+        assert_eq!(mailbox.try_recv(), Some(("b", Latest(2))));
+        assert_eq!(mailbox.try_recv(), None);
+    }
+
+    #[test]
+    fn remove_where_preserves_unmatched_order() {
+        let mailbox = KeyedMailbox::new(3);
+        mailbox.try_push("a1", Latest(1)).expect("a1");
+        mailbox.try_push("b", Latest(2)).expect("b");
+        mailbox.try_push("a2", Latest(3)).expect("a2");
+
+        let removed = mailbox.remove_where(|key| key.starts_with('a'));
+
+        assert_eq!(removed, vec![("a1", Latest(1)), ("a2", Latest(3))]);
+        assert_eq!(mailbox.try_recv(), Some(("b", Latest(2))));
     }
 }

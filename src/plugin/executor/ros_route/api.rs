@@ -17,6 +17,7 @@ use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
 use crate::plugin::executor::ros_common::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
+    RouterOsTransportSnapshot,
 };
 
 const ROUTER_ID_FIELD: &str = ".id";
@@ -71,6 +72,13 @@ pub(super) struct RouterRoute {
 
 #[async_trait]
 pub(super) trait MikrotikApi: Debug + Send + Sync {
+    /// Enter shutdown-cleanup mode, bypassing reconnect backoff while keeping
+    /// per-operation timeouts.
+    fn begin_shutdown_cleanup(&self) {}
+    /// Transport health used by retry scheduling and metrics.
+    async fn transport_snapshot(&self) -> Option<RouterOsTransportSnapshot> {
+        None
+    }
     /// List all routes in target table that can be considered by manager
     /// reconciliation.
     async fn list_managed_routes(
@@ -448,6 +456,14 @@ fn classify_exact_routes(
 
 #[async_trait]
 impl MikrotikApi for MikrotikRsClient {
+    fn begin_shutdown_cleanup(&self) {
+        self.transport.begin_shutdown_cleanup();
+    }
+
+    async fn transport_snapshot(&self) -> Option<RouterOsTransportSnapshot> {
+        Some(self.transport.snapshot().await)
+    }
+
     async fn list_managed_routes(
         &self,
         table: &str,

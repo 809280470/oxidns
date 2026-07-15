@@ -22,9 +22,11 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::task as task_center;
 use crate::plugin::executor::ros_common::ObservedAddr;
+use crate::plugin::executor::ros_common::batching::join_all_bounded;
 use crate::plugin::executor::ros_common::mailbox::{
     Coalesce, KeyedMailbox, PushOutcome, TryPushError,
 };
+use crate::plugin::executor::ros_common::throttle::ErrorLogThrottle;
 
 const ROUTE_DEFAULT_V4: &str = "0.0.0.0/0";
 const ROUTE_DEFAULT_V6: &str = "::/0";
@@ -551,15 +553,99 @@ struct ObservationKey {
 
 #[derive(Debug)]
 struct ObservationCommand {
-    addrs: Vec<ObservedAddr>,
-    negative_ttl_secs: Option<u32>,
+    replace_scope: ObservationScope,
+    addrs: Vec<PendingObservedAddr>,
+    observed_at_unix: u64,
+    replay_until_unix: u64,
     waiters: Vec<oneshot::Sender<Result<()>>>,
 }
 
 impl Coalesce for ObservationCommand {
     fn coalesce(&mut self, mut newer: Self) {
+        let current_ips = newer
+            .addrs
+            .iter()
+            .map(|observed| observed.addr)
+            .collect::<AHashSet<_>>();
+        for carried in &self.addrs {
+            if newer.replace_scope.contains(carried.addr)
+                || current_ips.contains(&carried.addr)
+                || carried.expires_at_unix <= newer.observed_at_unix
+                || carried.replay_until_unix <= newer.observed_at_unix
+            {
+                continue;
+            }
+            newer.addrs.push(*carried);
+        }
         newer.waiters.append(&mut self.waiters);
         *self = newer;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RouteObservationPolicy {
+    min_ttl: u32,
+    max_ttl: u32,
+    fixed_ttl: Option<u32>,
+}
+
+impl RouteObservationPolicy {
+    fn from_config(config: &RouteManagerConfig) -> Self {
+        Self {
+            min_ttl: config.min_ttl,
+            max_ttl: config.max_ttl,
+            fixed_ttl: config.fixed_ttl,
+        }
+    }
+
+    fn command(
+        self,
+        replace_scope: ObservationScope,
+        addrs: Vec<ObservedAddr>,
+        negative_ttl_secs: Option<u32>,
+        wait: Option<oneshot::Sender<Result<()>>>,
+    ) -> ObservationCommand {
+        let observed_at_unix = unix_now();
+        let mut pending = AHashMap::<IpAddr, PendingObservedAddr>::new();
+        for observed in addrs {
+            let effective_ttl = match self.fixed_ttl {
+                Some(0) => None,
+                Some(ttl) => Some(ttl),
+                None => Some(observed.ttl_secs.max(1).clamp(self.min_ttl, self.max_ttl)),
+            };
+            let value = PendingObservedAddr {
+                addr: observed.addr,
+                expires_at_unix: effective_ttl.map_or(u64::MAX, |ttl| {
+                    observed_at_unix.saturating_add(u64::from(ttl))
+                }),
+                replay_until_unix: observed_at_unix.saturating_add(u64::from(observed.ttl_secs)),
+            };
+            pending
+                .entry(observed.addr)
+                .and_modify(|current| {
+                    current.expires_at_unix = current.expires_at_unix.max(value.expires_at_unix);
+                    current.replay_until_unix =
+                        current.replay_until_unix.max(value.replay_until_unix);
+                })
+                .or_insert(value);
+        }
+        let addrs = pending.into_values().collect::<Vec<_>>();
+        let replay_until_unix = if addrs.is_empty() {
+            observed_at_unix.saturating_add(u64::from(negative_ttl_secs.unwrap_or(0)))
+        } else {
+            addrs
+                .iter()
+                .map(|observed| observed.replay_until_unix)
+                .max()
+                .unwrap_or(observed_at_unix)
+        };
+        ObservationCommand {
+            replace_scope,
+            addrs,
+            observed_at_unix,
+            replay_until_unix,
+            waiters: wait.into_iter().collect(),
+        }
     }
 }
 
@@ -593,13 +679,58 @@ pub(super) enum ObserveEnqueueError {
 pub(super) struct RouteManagerHandle {
     observations: KeyedMailbox<ObservationKey, ObservationCommand>,
     controls: KeyedMailbox<ControlKey, ControlCommand>,
+    policy: RouteObservationPolicy,
 }
 
 impl RouteManagerHandle {
-    pub(super) fn new() -> Self {
+    fn new(config: &RouteManagerConfig) -> Self {
         Self {
             observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
+            policy: RouteObservationPolicy::from_config(config),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test() -> Self {
+        AppClock::start();
+        Self::new(&RouteManagerConfig {
+            plugin_tag: "test".to_string(),
+            routing_table: "main".to_string(),
+            gateway4: Some("192.0.2.1".to_string()),
+            gateway6: Some("2001:db8::1".to_string()),
+            persistent_ips: AHashSet::new(),
+            comment_prefix: "fdns".to_string(),
+            distance: 100,
+            min_ttl: 60,
+            max_ttl: 3600,
+            fixed_ttl: None,
+            conntrack_guard: false,
+            max_entries: 65_536,
+        })
+    }
+
+    fn supersede_domain_observations(
+        &self,
+        key: &ObservationKey,
+        command: &mut ObservationCommand,
+    ) {
+        if key.replace_scope == ObservationScope::Both {
+            for (_, mut superseded) in self
+                .observations
+                .remove_where(|queued| queued.domain == key.domain)
+            {
+                command.waiters.append(&mut superseded.waiters);
+            }
+            return;
+        }
+
+        let name_level_key = ObservationKey {
+            domain: key.domain.clone(),
+            replace_scope: ObservationScope::Both,
+        };
+        if let Some(mut superseded) = self.observations.take(&name_level_key) {
+            command.waiters.append(&mut superseded.waiters);
         }
     }
 
@@ -615,15 +746,12 @@ impl RouteManagerHandle {
             domain,
             replace_scope,
         };
+        let mut command = self
+            .policy
+            .command(replace_scope, addrs, negative_ttl_secs, wait);
+        self.supersede_domain_observations(&key, &mut command);
         self.observations
-            .try_push(
-                key,
-                ObservationCommand {
-                    addrs,
-                    negative_ttl_secs,
-                    waiters: wait.into_iter().collect(),
-                },
-            )
+            .try_push(key, command)
             .map_err(|error| match error {
                 TryPushError::Full(_) => ObserveEnqueueError::Full,
                 TryPushError::Closed(_) => ObserveEnqueueError::Closed,
@@ -642,15 +770,12 @@ impl RouteManagerHandle {
             domain,
             replace_scope,
         };
+        let mut command = self
+            .policy
+            .command(replace_scope, addrs, negative_ttl_secs, Some(wait));
+        self.supersede_domain_observations(&key, &mut command);
         self.observations
-            .push(
-                key,
-                ObservationCommand {
-                    addrs,
-                    negative_ttl_secs,
-                    waiters: vec![wait],
-                },
-            )
+            .push(key, command)
             .await
             .map_err(|_| ObserveEnqueueError::Closed)
     }
@@ -714,8 +839,6 @@ pub(super) struct PersistentReloadConfig {
     pub(super) gateway4_enabled: bool,
     /// Whether IPv6 gateway is configured.
     pub(super) gateway6_enabled: bool,
-    /// Maximum accepted merged persistent set size.
-    pub(super) max_entries: usize,
 }
 
 #[derive(Debug)]
@@ -734,7 +857,7 @@ impl RouteManagerRuntime {
         manager: RouteManager,
         persistent_reload: Option<PersistentReloadConfig>,
     ) -> Self {
-        let handle = RouteManagerHandle::new();
+        let handle = RouteManagerHandle::new(&manager.cfg);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<ShutdownRequest>();
 
         let worker_tag = tag.clone();
@@ -813,16 +936,6 @@ impl RouteManagerRuntime {
 
                                 let mut desired_ips = reload_cfg.inline_ips.clone();
                                 desired_ips.extend(file_ips);
-
-                                if desired_ips.len() > reload_cfg.max_entries {
-                                    warn!(
-                                        plugin = %maintain_tag,
-                                        entries = desired_ips.len(),
-                                        capacity = reload_cfg.max_entries,
-                                        "ros_route persistent file reload exceeds max_entries; keeping previous desired state"
-                                    );
-                                    return;
-                                }
 
                                 let mut last_loaded_guard = last_loaded_ips.lock().await;
                                 let manager_available = if desired_ips != *last_loaded_guard {
@@ -981,6 +1094,7 @@ impl RouteManager {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn effective_expiry(&self, ttl_secs: u32, now: u64) -> u64 {
         match self.cfg.fixed_ttl {
@@ -1253,6 +1367,7 @@ impl RouteManager {
         }
     }
 
+    #[cfg(test)]
     fn apply_observation(
         &mut self,
         domain: String,
@@ -1351,6 +1466,7 @@ impl RouteManager {
         touched_keys.into_iter().collect()
     }
 
+    #[cfg(test)]
     fn queue_pending_observation(
         &mut self,
         domain: String,
@@ -1379,7 +1495,23 @@ impl RouteManager {
                 })
                 .or_insert(pending);
         }
-        let mut addrs = pending_addrs.into_values().collect::<Vec<_>>();
+        self.queue_pending_absolute(
+            domain,
+            replace_scope,
+            pending_addrs.into_values().collect(),
+            negative_ttl_secs,
+            observed_at_unix,
+        );
+    }
+
+    fn queue_pending_absolute(
+        &mut self,
+        domain: String,
+        replace_scope: ObservationScope,
+        mut addrs: Vec<PendingObservedAddr>,
+        negative_ttl_secs: Option<u32>,
+        observed_at_unix: u64,
+    ) {
         let name_level_negative = replace_scope == ObservationScope::Both && addrs.is_empty();
         if name_level_negative {
             // A name-level denial supersedes every earlier replacement for the
@@ -1519,7 +1651,14 @@ impl RouteManager {
         now: u64,
     ) -> Option<RouteKey> {
         let key = RouteKey::new(ip, self.cfg.routing_table.clone());
+        let dynamic_capacity_available = self.dynamic_route_count() < self.cfg.max_entries;
         if let Some(entry) = self.routes.get_mut(&key) {
+            if entry.domain_expiries.is_empty()
+                && !entry.recovered_ownership_incomplete
+                && !dynamic_capacity_available
+            {
+                return None;
+            }
             let was_pending_delete = matches!(entry.sync_state, SyncState::PendingDelete);
             let inserted = entry.domains.insert(domain.to_string());
             let comment_domain_changed = inserted
@@ -1562,7 +1701,7 @@ impl RouteManager {
             return Some(key);
         }
 
-        if self.routes.len() >= self.cfg.max_entries {
+        if !dynamic_capacity_available {
             return None;
         }
 
@@ -1593,6 +1732,15 @@ impl RouteManager {
             },
         );
         Some(key)
+    }
+
+    fn dynamic_route_count(&self) -> usize {
+        self.routes
+            .values()
+            .filter(|entry| {
+                !entry.domain_expiries.is_empty() || entry.recovered_ownership_incomplete
+            })
+            .count()
     }
 
     fn detach_domain_from_route(&mut self, domain: &str, ip: IpAddr, now: u64) -> Option<RouteKey> {
@@ -1801,37 +1949,37 @@ impl RouteManager {
             }
         }
 
-        for batch in pending_upserts.chunks(UPSERT_PIPELINE_SIZE) {
-            let api = self.api.as_ref();
-            let prefix = self.cfg.comment_prefix.as_str();
-            let plugin_tag = self.cfg.plugin_tag.as_str();
-            let results =
-                futures::future::join_all(batch.iter().map(|(_, entry_snapshot, comment)| {
-                    api.upsert_host_route(
-                        &entry_snapshot.key,
-                        &entry_snapshot.gateway,
-                        entry_snapshot.distance,
-                        comment,
-                        prefix,
-                        plugin_tag,
-                    )
-                }))
-                .await;
+        let api = self.api.as_ref();
+        let prefix = self.cfg.comment_prefix.as_str();
+        let plugin_tag = self.cfg.plugin_tag.as_str();
+        let results = join_all_bounded(
+            pending_upserts.iter().map(|(_, entry_snapshot, comment)| {
+                api.upsert_host_route(
+                    &entry_snapshot.key,
+                    &entry_snapshot.gateway,
+                    entry_snapshot.distance,
+                    comment,
+                    prefix,
+                    plugin_tag,
+                )
+            }),
+            UPSERT_PIPELINE_SIZE,
+        )
+        .await;
 
-            for ((key, entry_snapshot, _), result) in batch.iter().zip(results) {
-                match result {
-                    Ok(route_id) => {
-                        if let Some(route) = self.routes.get_mut(key) {
-                            route.router_id = Some(route_id);
-                            route.sync_state = SyncState::Synced;
-                            route.last_refresh_unix = now;
-                            route.synced_expires_at_unix =
-                                Some(RouteCommentCodec::expires_at_unix(entry_snapshot));
-                        }
+        for ((key, entry_snapshot, _), result) in pending_upserts.iter().zip(results) {
+            match result {
+                Ok(route_id) => {
+                    if let Some(route) = self.routes.get_mut(key) {
+                        route.router_id = Some(route_id);
+                        route.sync_state = SyncState::Synced;
+                        route.last_refresh_unix = now;
+                        route.synced_expires_at_unix =
+                            Some(RouteCommentCodec::expires_at_unix(entry_snapshot));
                     }
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -2264,7 +2412,7 @@ impl RouteManager {
             let Some(gateway) = self.gateway_for(family).map(str::to_string) else {
                 continue;
             };
-            if self.routes.len() >= self.cfg.max_entries
+            if (recover_dynamic_binding && self.dynamic_route_count() >= self.cfg.max_entries)
                 || (recover_dynamic_binding && !dynamic_binding_capacity)
             {
                 warn!(
@@ -2383,25 +2531,27 @@ impl RouteManager {
         }
     }
 
-    pub(super) async fn observe_domain(
+    async fn observe_queued(
         &mut self,
         domain: String,
-        replace_scope: ObservationScope,
-        addrs: Vec<ObservedAddr>,
-        negative_ttl_secs: Option<u32>,
+        command: &ObservationCommand,
         wait_for_sync: bool,
     ) -> Result<()> {
-        let now = unix_now();
+        let replace_scope = command.replace_scope;
+        let observed_at_unix = command.observed_at_unix;
+        let negative_ttl_secs = command.addrs.is_empty().then(|| {
+            command
+                .replay_until_unix
+                .saturating_sub(command.observed_at_unix)
+                .min(u64::from(u32::MAX)) as u32
+        });
         if !self.initialized {
-            // Preserve the latest replacement per domain/family. Every queued
-            // entry retains all answer addresses, and replay is ordered across
-            // families so an older response cannot resurrect stale routes.
-            self.queue_pending_observation(
+            self.queue_pending_absolute(
                 domain.clone(),
                 replace_scope,
-                addrs.clone(),
+                command.addrs.clone(),
                 negative_ttl_secs,
-                now,
+                observed_at_unix,
             );
             if !wait_for_sync {
                 return Ok(());
@@ -2417,16 +2567,47 @@ impl RouteManager {
                 return initialization_result;
             }
 
-            let touched = self.apply_observation(domain, replace_scope, addrs, now);
-            let sync_result = self.sync_route_keys(touched, now).await;
+            let expiries = command
+                .addrs
+                .iter()
+                .map(|observed| (observed.addr, observed.expires_at_unix))
+                .collect();
+            let touched =
+                self.apply_observation_expiries(domain, replace_scope, expiries, observed_at_unix);
+            let sync_result = self.sync_route_keys(touched, observed_at_unix).await;
             return match (initialization_result, sync_result) {
                 (_, Err(error)) => Err(error),
                 (Err(error), Ok(())) => Err(error),
                 (Ok(()), Ok(())) => Ok(()),
             };
         }
-        let touched = self.apply_observation(domain, replace_scope, addrs, now);
+        let now = unix_now();
+        let expiries = command
+            .addrs
+            .iter()
+            .filter(|observed| observed.expires_at_unix > now)
+            .map(|observed| (observed.addr, observed.expires_at_unix))
+            .collect();
+        let touched = self.apply_observation_expiries(domain, replace_scope, expiries, now);
         self.sync_route_keys(touched, now).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn observe_domain(
+        &mut self,
+        domain: String,
+        replace_scope: ObservationScope,
+        addrs: Vec<ObservedAddr>,
+        negative_ttl_secs: Option<u32>,
+        wait_for_sync: bool,
+    ) -> Result<()> {
+        let command = RouteObservationPolicy::from_config(&self.cfg).command(
+            replace_scope,
+            addrs,
+            negative_ttl_secs,
+            None,
+        );
+        self.observe_queued(domain, &command, wait_for_sync).await
     }
 
     pub(super) async fn sweep(&mut self) -> Result<()> {
@@ -2457,11 +2638,21 @@ impl RouteManager {
         Ok(())
     }
 
+    async fn transport_retry_delay(&self) -> Option<Duration> {
+        self.api
+            .transport_snapshot()
+            .await
+            .and_then(|snapshot| snapshot.retry_after)
+    }
+
     pub(super) async fn shutdown(&mut self, cleanup: bool) -> Result<()> {
         if !cleanup {
             return Ok(());
         }
 
+        // Cleanup bypasses reconnect backoff but retains per-operation
+        // transport timeouts.
+        self.api.begin_shutdown_cleanup();
         // Shutdown cleanup must never initialize or reconcile desired state:
         // doing so could create/refresh routes immediately before deleting
         // them. Read RouterOS directly and remove only rows owned by this
@@ -2497,18 +2688,17 @@ impl RouteManager {
                 owned_route || owned_gateway_check
             })
             .collect::<Vec<_>>();
+        let results = join_all_bounded(
+            owned
+                .iter()
+                .map(|route| self.api.delete_route_by_id(&route.id, route.family)),
+            UPSERT_PIPELINE_SIZE,
+        )
+        .await;
         let mut first_error = None;
-        for batch in owned.chunks(UPSERT_PIPELINE_SIZE) {
-            let results = futures::future::join_all(
-                batch
-                    .iter()
-                    .map(|route| self.api.delete_route_by_id(&route.id, route.family)),
-            )
-            .await;
-            for result in results {
-                if let Err(error) = result {
-                    first_error.get_or_insert(error);
-                }
+        for result in results {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
         self.routes.clear();
@@ -2578,37 +2768,37 @@ async fn run_manager_worker(
 ) {
     // Single-owner event loop for route state.
     // All cross-map updates are serialized here to keep transitions deterministic.
-    let mut prefer_control = true;
+    let error_logs = ErrorLogThrottle::default();
+    let mut retry_observation = None::<(tokio::time::Instant, ObservationKey, ObservationCommand)>;
     loop {
-        let command = if prefer_control {
-            tokio::select! {
-                biased;
-                shutdown = &mut shutdown_rx => {
-                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
-                        if let Err(e) = manager.shutdown(cleanup).await {
-                            warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
-                        }
-                        let _ = done.send(());
-                    }
-                    break;
-                }
-                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
-                observation = handle.observations.recv() => observation.map(|(key, command)| WorkerCommand::Observe(key, command)),
+        let retry_wakeup = async {
+            match retry_observation.as_ref() {
+                Some((retry_at, _, _)) => tokio::time::sleep_until(*retry_at).await,
+                None => std::future::pending::<()>().await,
             }
-        } else {
-            tokio::select! {
-                biased;
-                shutdown = &mut shutdown_rx => {
-                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
-                        if let Err(e) = manager.shutdown(cleanup).await {
-                            warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
-                        }
-                        let _ = done.send(());
+        };
+        let command = tokio::select! {
+            biased;
+            shutdown = &mut shutdown_rx => {
+                if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
+                    if let Err(e) = manager.shutdown(cleanup).await {
+                        warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
                     }
-                    break;
+                    let _ = done.send(());
                 }
-                observation = handle.observations.recv() => observation.map(|(key, command)| WorkerCommand::Observe(key, command)),
-                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+                break;
+            }
+            control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+            () = retry_wakeup => {
+                retry_observation.take().map(|(_, key, mut command)| {
+                    if let Some(newer) = handle.observations.take(&key) {
+                        command.coalesce(newer);
+                    }
+                    WorkerCommand::Observe(key, command)
+                })
+            }
+            observation = handle.observations.recv(), if retry_observation.is_none() => {
+                observation.map(|(key, command)| WorkerCommand::Observe(key, command))
             }
         };
         let Some(command) = command else {
@@ -2616,81 +2806,78 @@ async fn run_manager_worker(
         };
 
         match command {
-            WorkerCommand::Observe(
-                ObservationKey {
-                    domain,
-                    replace_scope,
-                },
-                ObservationCommand {
-                    addrs,
-                    negative_ttl_secs,
-                    waiters,
-                },
-            ) => {
-                prefer_control = true;
-                let wait_for_sync = !waiters.is_empty();
+            WorkerCommand::Observe(key, mut command) => {
+                let wait_for_sync = !command.waiters.is_empty();
                 let result = manager
-                    .observe_domain(
-                        domain,
-                        replace_scope,
-                        addrs,
-                        negative_ttl_secs,
-                        wait_for_sync,
-                    )
+                    .observe_queued(key.domain.clone(), &command, wait_for_sync)
                     .await;
-                if waiters.is_empty() {
-                    if let Err(e) = result {
+                let retry_delay = if result.is_err() {
+                    manager.transport_retry_delay().await
+                } else {
+                    None
+                };
+                if let Err(error) = &result {
+                    if command.waiters.is_empty() {
+                        if error_logs.should_log("observe") {
+                            warn!(
+                                plugin = %tag,
+                                err = %error,
+                                "ros_route observe failed in async mode"
+                            );
+                        }
+                    } else {
+                        let message = error.to_string();
+                        for waiter in command.waiters.drain(..) {
+                            let _ = waiter.send(Err(DnsError::plugin(message.clone())));
+                        }
+                    }
+                    if let Some(delay) = retry_delay {
+                        retry_observation =
+                            Some((tokio::time::Instant::now() + delay, key, command));
+                    }
+                } else {
+                    for waiter in command.waiters {
+                        let _ = waiter.send(Ok(()));
+                    }
+                }
+            }
+            WorkerCommand::Control(command) => match command {
+                ControlCommand::Sweep => {
+                    if let Err(e) = manager.sweep().await
+                        && error_logs.should_log("sweep")
+                    {
                         warn!(
                             plugin = %tag,
                             err = %e,
-                            "ros_route observe failed in async mode"
+                            "ros_route periodic sweep failed"
                         );
                     }
-                } else {
-                    let outcome = result.map_err(|error| error.to_string());
-                    for waiter in waiters {
-                        let result = outcome
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|message| DnsError::plugin(message.clone()));
-                        let _ = waiter.send(result);
+                }
+                ControlCommand::UpdatePersistentIps { ips } => {
+                    if let Err(e) = manager.update_persistent_ips(ips).await
+                        && error_logs.should_log("persistent")
+                    {
+                        warn!(
+                            plugin = %tag,
+                            err = %e,
+                            "ros_route persistent route maintenance failed"
+                        );
                     }
                 }
-            }
-            WorkerCommand::Control(command) => {
-                prefer_control = false;
-                match command {
-                    ControlCommand::Sweep => {
-                        if let Err(e) = manager.sweep().await {
-                            warn!(
-                                plugin = %tag,
-                                err = %e,
-                                "ros_route periodic sweep failed"
-                            );
-                        }
-                    }
-                    ControlCommand::UpdatePersistentIps { ips } => {
-                        if let Err(e) = manager.update_persistent_ips(ips).await {
-                            warn!(
-                                plugin = %tag,
-                                err = %e,
-                                "ros_route persistent route maintenance failed"
-                            );
-                        }
-                    }
-                    ControlCommand::Reconcile => {
-                        if let Err(e) = manager.reconcile().await {
-                            warn!(
-                                plugin = %tag,
-                                err = %e,
-                                "ros_route periodic reconcile failed"
-                            );
-                        } else {
-                            debug!(plugin = %tag, "ros_route reconcile completed");
-                        }
+                ControlCommand::Reconcile => {
+                    if let Err(e) = manager.reconcile().await
+                        && error_logs.should_log("reconcile")
+                    {
+                        warn!(
+                            plugin = %tag,
+                            err = %e,
+                            "ros_route periodic reconcile failed"
+                        );
+                    } else {
+                        debug!(plugin = %tag, "ros_route reconcile completed");
                     }
                 }
-            }
+            },
         }
     }
 
@@ -2770,7 +2957,7 @@ mod tests {
 
     #[tokio::test]
     async fn observation_mailbox_replaces_same_domain_and_scope_with_latest_state() {
-        let handle = RouteManagerHandle::new();
+        let handle = RouteManagerHandle::new_for_test();
         let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let latest_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
         let (first_wait, _first_rx) = oneshot::channel();
@@ -2814,13 +3001,100 @@ mod tests {
             .expect("queued observation");
         assert_eq!(queued.addrs.len(), 1);
         assert_eq!(queued.addrs[0].addr, latest_ip);
-        assert_eq!(queued.addrs[0].ttl_secs, 300);
+        assert_eq!(
+            queued.addrs[0]
+                .expires_at_unix
+                .saturating_sub(queued.observed_at_unix),
+            300
+        );
         assert_eq!(queued.waiters.len(), 2);
     }
 
     #[test]
+    fn observation_mailbox_is_bounded_by_domain_and_scope() {
+        let handle = RouteManagerHandle::new_for_test();
+        for index in 0..10_000 {
+            handle
+                .try_observe(
+                    "busy.example.".to_string(),
+                    ObservationScope::Ipv4,
+                    vec![ObservedAddr {
+                        addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, (index % 250 + 1) as u8)),
+                        ttl_secs: 60,
+                    }],
+                    None,
+                    None,
+                )
+                .expect("coalesced observation");
+        }
+        assert_eq!(handle.observations.len(), 1);
+    }
+
+    #[test]
+    fn name_level_negative_supersedes_both_family_observations() {
+        let handle = RouteManagerHandle::new_for_test();
+        for scope in [ObservationScope::Ipv4, ObservationScope::Ipv6] {
+            handle
+                .try_observe(
+                    "missing.example.".to_string(),
+                    scope,
+                    Vec::new(),
+                    Some(60),
+                    None,
+                )
+                .expect("family observation");
+        }
+        assert_eq!(handle.observations.len(), 2);
+
+        handle
+            .try_observe(
+                "missing.example.".to_string(),
+                ObservationScope::Both,
+                Vec::new(),
+                Some(60),
+                None,
+            )
+            .expect("name-level negative");
+        assert_eq!(handle.observations.len(), 1);
+    }
+
+    #[test]
+    fn cross_family_coalescing_preserves_original_absolute_expiry() {
+        let old_v4 = PendingObservedAddr {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            expires_at_unix: 1_300,
+            replay_until_unix: 1_060,
+        };
+        let mut current = ObservationCommand {
+            replace_scope: ObservationScope::Ipv4,
+            addrs: vec![old_v4],
+            observed_at_unix: 1_000,
+            replay_until_unix: 1_060,
+            waiters: Vec::new(),
+        };
+        current.coalesce(ObservationCommand {
+            replace_scope: ObservationScope::Ipv6,
+            addrs: vec![PendingObservedAddr {
+                addr: IpAddr::V6("2001:db8::1".parse().expect("ipv6")),
+                expires_at_unix: 1_310,
+                replay_until_unix: 1_070,
+            }],
+            observed_at_unix: 1_010,
+            replay_until_unix: 1_070,
+            waiters: Vec::new(),
+        });
+
+        let carried = current
+            .addrs
+            .iter()
+            .find(|observed| observed.addr == old_v4.addr)
+            .expect("carried IPv4 observation");
+        assert_eq!(carried.expires_at_unix, 1_300);
+    }
+
+    #[test]
     fn observation_mailbox_keeps_address_family_scopes_distinct() {
-        let handle = RouteManagerHandle::new();
+        let handle = RouteManagerHandle::new_for_test();
         for scope in [ObservationScope::Ipv4, ObservationScope::Ipv6] {
             handle
                 .try_observe(
@@ -2838,7 +3112,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_reload_control_keeps_latest_desired_set() {
-        let handle = RouteManagerHandle::new();
+        let handle = RouteManagerHandle::new_for_test();
         assert!(handle.update_persistent_ips(AHashSet::from_iter(["192.0.2.10/32".to_string()])));
         assert!(handle.update_persistent_ips(AHashSet::from_iter(["192.0.2.11/32".to_string()])));
 
@@ -4095,7 +4369,7 @@ mod tests {
         let api = Arc::new(MockApi::default());
         let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
         manager.initialized = true;
-        let handle = RouteManagerHandle::new();
+        let handle = RouteManagerHandle::new_for_test();
         for index in 0..8 {
             handle
                 .try_observe(

@@ -8,6 +8,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mikrotik_rs::{Command, Event, MikrotikDevice, TrapCategory};
@@ -151,11 +152,6 @@ fn build_tls_mode(address: &str, args: RouterOsTlsArgs) -> Result<RouterOsTlsMod
                 "RouterOS tls.insecure cannot be combined with tls.ca",
             ));
         }
-        if explicit_server_name.is_some() {
-            return Err(DnsError::plugin(
-                "RouterOS tls.server_name is not used with tls.insecure",
-            ));
-        }
         return Ok(RouterOsTlsMode::Insecure);
     }
 
@@ -276,6 +272,17 @@ impl From<RouterOsError> for DnsError {
 
 pub(crate) type RouterOsResult<T> = std::result::Result<T, RouterOsError>;
 
+/// Lock-free counters plus retry state exposed to plugin metrics and workers.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct RouterOsTransportSnapshot {
+    pub(crate) reconnect_total: u64,
+    pub(crate) backoff_total: u64,
+    pub(crate) connect_attempt_total: u64,
+    pub(crate) degraded: bool,
+    pub(crate) retry_after: Option<Duration>,
+}
+
 #[derive(Debug)]
 struct ConnectionState {
     generation: u64,
@@ -288,6 +295,10 @@ struct ConnectionState {
 pub(crate) struct RouterOsTransport {
     config: Arc<RouterOsConnectionConfig>,
     state: Arc<Mutex<ConnectionState>>,
+    shutdown_cleanup: Arc<AtomicBool>,
+    reconnect_total: Arc<AtomicU64>,
+    backoff_total: Arc<AtomicU64>,
+    connect_attempt_total: Arc<AtomicU64>,
 }
 
 impl Debug for RouterOsTransport {
@@ -308,6 +319,31 @@ impl RouterOsTransport {
                 consecutive_failures: 0,
                 retry_at: None,
             })),
+            shutdown_cleanup: Arc::new(AtomicBool::new(false)),
+            reconnect_total: Arc::new(AtomicU64::new(0)),
+            backoff_total: Arc::new(AtomicU64::new(0)),
+            connect_attempt_total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Make all following commands bypass reconnect backoff during ownership
+    /// cleanup. Individual connect/send/receive timeouts remain unchanged.
+    pub(crate) fn begin_shutdown_cleanup(&self) {
+        self.shutdown_cleanup.store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn snapshot(&self) -> RouterOsTransportSnapshot {
+        let state = self.state.lock().await;
+        let now = Instant::now();
+        RouterOsTransportSnapshot {
+            reconnect_total: self.reconnect_total.load(Ordering::Relaxed),
+            backoff_total: self.backoff_total.load(Ordering::Relaxed),
+            connect_attempt_total: self.connect_attempt_total.load(Ordering::Relaxed),
+            degraded: state.device.is_none() && state.consecutive_failures > 0,
+            retry_after: state
+                .retry_at
+                .map(|retry_at| retry_at.saturating_duration_since(now))
+                .filter(|delay| !delay.is_zero()),
         }
     }
 
@@ -316,7 +352,9 @@ impl RouterOsTransport {
         action: &str,
         command: Command,
     ) -> RouterOsResult<RouterOsCommandStream> {
-        self.send_command_with_backoff(action, command, false).await
+        let bypass_backoff = self.shutdown_cleanup.load(Ordering::Acquire);
+        self.send_command_with_backoff(action, command, bypass_backoff)
+            .await
     }
 
     async fn send_command_with_backoff(
@@ -379,6 +417,7 @@ impl RouterOsTransport {
             ));
         }
 
+        self.connect_attempt_total.fetch_add(1, Ordering::Relaxed);
         let connect = async {
             let builder = MikrotikDevice::builder(self.config.address.as_str()).credentials(
                 self.config.username.as_str(),
@@ -402,7 +441,7 @@ impl RouterOsTransport {
         let device = match tokio::time::timeout(self.config.timeouts.connect, connect).await {
             Ok(Ok(device)) => device,
             Ok(Err(error)) => {
-                schedule_backoff(&mut state);
+                self.schedule_backoff(&mut state);
                 return Err(RouterOsError::new(
                     RouterOsErrorKind::Connect,
                     action,
@@ -410,7 +449,7 @@ impl RouterOsTransport {
                 ));
             }
             Err(_) => {
-                schedule_backoff(&mut state);
+                self.schedule_backoff(&mut state);
                 return Err(RouterOsError::new(
                     RouterOsErrorKind::ConnectTimeout,
                     action,
@@ -422,6 +461,9 @@ impl RouterOsTransport {
                 ));
             }
         };
+        if state.generation > 0 {
+            self.reconnect_total.fetch_add(1, Ordering::Relaxed);
+        }
         state.generation = state.generation.wrapping_add(1);
         state.device = Some(device.clone());
         Ok((device, state.generation))
@@ -430,7 +472,7 @@ impl RouterOsTransport {
     async fn record_failure(&self, generation: u64) {
         let mut state = self.state.lock().await;
         if state.generation == generation && state.device.take().is_some() {
-            schedule_backoff(&mut state);
+            self.schedule_backoff(&mut state);
         }
     }
 
@@ -440,6 +482,11 @@ impl RouterOsTransport {
             state.consecutive_failures = 0;
             state.retry_at = None;
         }
+    }
+
+    fn schedule_backoff(&self, state: &mut ConnectionState) {
+        schedule_backoff(state);
+        self.backoff_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -534,6 +581,8 @@ impl RouterOsCommandStream {
 
 #[cfg(test)]
 mod tests {
+    use mikrotik_rs::{CommandBuilder, Tag, TrapResponse};
+
     use super::*;
 
     #[test]
@@ -564,6 +613,42 @@ mod tests {
         )
         .expect_err("insecure and CA must conflict");
         assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn insecure_tls_allows_unused_explicit_server_name() {
+        let mode = build_tls_mode(
+            "192.0.2.1:8729",
+            RouterOsTlsArgs {
+                insecure: Some(true),
+                ca: None,
+                server_name: Some("router.example".to_string()),
+            },
+        )
+        .expect("explicit name is harmless in insecure mode");
+        assert!(matches!(mode, RouterOsTlsMode::Insecure));
+    }
+
+    #[test]
+    fn secure_tls_uses_inferred_or_explicit_server_name() {
+        for (address, explicit, expected) in [
+            ("router.example:8729", None, "router.example"),
+            ("192.0.2.1:8729", Some("router.example"), "router.example"),
+        ] {
+            let mode = build_tls_mode(
+                address,
+                RouterOsTlsArgs {
+                    insecure: Some(false),
+                    ca: None,
+                    server_name: explicit.map(str::to_string),
+                },
+            )
+            .expect("secure TLS mode");
+            let RouterOsTlsMode::Secure { server_name, .. } = mode else {
+                panic!("expected secure TLS");
+            };
+            assert_eq!(server_name.to_str(), expected);
+        }
     }
 
     #[test]
@@ -601,5 +686,104 @@ mod tests {
 
         let error = stream.next().await.expect_err("premature close must fail");
         assert_eq!(error.kind, RouterOsErrorKind::ChannelClosed);
+    }
+
+    #[tokio::test]
+    async fn trap_preserves_connection_state_and_missing_item_category() {
+        let transport = RouterOsTransport::new(RouterOsConnectionConfig::plaintext_for_test());
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Event::Trap {
+                tag: Tag::default(),
+                response: TrapResponse {
+                    tag: Tag::default(),
+                    category: Some(TrapCategory::MissingItemOrCommand),
+                    message: "no such item".to_string(),
+                },
+            })
+            .await
+            .expect("trap event");
+        let mut stream = RouterOsCommandStream {
+            action: "delete".to_string(),
+            receiver,
+            generation: 0,
+            transport: transport.clone(),
+            completed: false,
+        };
+
+        let error = stream.next().await.expect_err("trap");
+
+        assert_eq!(error.kind, RouterOsErrorKind::Trap);
+        assert!(error.is_missing_item());
+        assert_eq!(transport.snapshot().await.backoff_total, 0);
+    }
+
+    #[tokio::test]
+    async fn fatal_event_is_classified_as_connection_failure() {
+        let transport = RouterOsTransport::new(RouterOsConnectionConfig::plaintext_for_test());
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Event::Fatal {
+                reason: "actor stopped".to_string(),
+            })
+            .await
+            .expect("fatal event");
+        let mut stream = RouterOsCommandStream {
+            action: "print".to_string(),
+            receiver,
+            generation: 0,
+            transport,
+            completed: false,
+        };
+
+        assert_eq!(
+            stream.next().await.expect_err("fatal").kind,
+            RouterOsErrorKind::Fatal
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_failed_cold_start_attempts_connect_once_during_backoff() {
+        let mut config = RouterOsConnectionConfig::plaintext_for_test();
+        config.address = "127.0.0.1:0".to_string();
+        let transport = RouterOsTransport::new(config);
+        let attempts = (0..32).map(|_| {
+            let transport = transport.clone();
+            async move {
+                transport
+                    .send_command(
+                        "cold start",
+                        CommandBuilder::new()
+                            .command("/system/identity/print")
+                            .build(),
+                    )
+                    .await
+            }
+        });
+
+        let results = futures::future::join_all(attempts).await;
+        let snapshot = transport.snapshot().await;
+
+        assert!(results.iter().all(|result| result.is_err()));
+        assert_eq!(snapshot.connect_attempt_total, 1);
+        assert_eq!(snapshot.backoff_total, 1);
+        assert!(snapshot.degraded);
+        assert!(snapshot.retry_after.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_failure_does_not_change_retry_state() {
+        let transport = RouterOsTransport::new(RouterOsConnectionConfig::plaintext_for_test());
+        {
+            let mut state = transport.state.lock().await;
+            state.generation = 2;
+        }
+
+        transport.record_failure(1).await;
+
+        let snapshot = transport.snapshot().await;
+        assert_eq!(snapshot.backoff_total, 0);
+        assert!(!snapshot.degraded);
+        assert!(snapshot.retry_after.is_none());
     }
 }
