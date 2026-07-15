@@ -517,12 +517,24 @@ impl ObservationScope {
 struct PendingObservation {
     domain: String,
     replace_scope: ObservationScope,
-    addrs: Vec<ObservedAddr>,
+    addrs: Vec<PendingObservedAddr>,
     observed_at_unix: u64,
     /// Upper bound for replaying this complete replacement observation.
     replay_until_unix: u64,
     /// Whether this family entry came from a name-level NXDOMAIN response.
     name_level_negative: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PendingObservedAddr {
+    addr: IpAddr,
+    /// Effective route expiry calculated from the policy at the time of the
+    /// original DNS observation. Carrying this absolute value prevents a
+    /// later cross-family observation from extending an older route.
+    expires_at_unix: u64,
+    /// DNS lifetime bounds how long an observation may wait for initialization
+    /// even when fixed_ttl=0 would make the resulting route timeless.
+    replay_until_unix: u64,
 }
 
 #[derive(Debug)]
@@ -1096,7 +1108,6 @@ impl RouteManager {
         addrs: Vec<ObservedAddr>,
         now: u64,
     ) -> Vec<RouteKey> {
-        let mut touched_keys = AHashSet::new();
         // Deduplicate answer IPs and keep max ttl per IP for this observation.
         let mut dedup_expiries = AHashMap::<IpAddr, u64>::new();
         for observed in addrs {
@@ -1110,6 +1121,17 @@ impl RouteManager {
                 .and_modify(|existing| *existing = (*existing).max(expires_at_unix))
                 .or_insert(expires_at_unix);
         }
+        self.apply_observation_expiries(domain, replace_scope, dedup_expiries, now)
+    }
+
+    fn apply_observation_expiries(
+        &mut self,
+        domain: String,
+        replace_scope: ObservationScope,
+        dedup_expiries: AHashMap<IpAddr, u64>,
+        now: u64,
+    ) -> Vec<RouteKey> {
+        let mut touched_keys = AHashSet::new();
         let mut binding = self
             .domain_bindings
             .remove(&domain)
@@ -1157,10 +1179,31 @@ impl RouteManager {
         &mut self,
         domain: String,
         replace_scope: ObservationScope,
-        mut addrs: Vec<ObservedAddr>,
+        addrs: Vec<ObservedAddr>,
         negative_ttl_secs: Option<u32>,
         observed_at_unix: u64,
     ) {
+        let mut pending_addrs = AHashMap::<IpAddr, PendingObservedAddr>::new();
+        for observed in addrs {
+            let family = RouteFamily::from_ip(observed.addr);
+            if self.gateway_for(family).is_none() {
+                continue;
+            }
+            let pending = PendingObservedAddr {
+                addr: observed.addr,
+                expires_at_unix: self.effective_expiry(observed.ttl_secs.max(1), observed_at_unix),
+                replay_until_unix: observed_at_unix.saturating_add(u64::from(observed.ttl_secs)),
+            };
+            pending_addrs
+                .entry(observed.addr)
+                .and_modify(|current| {
+                    current.expires_at_unix = current.expires_at_unix.max(pending.expires_at_unix);
+                    current.replay_until_unix =
+                        current.replay_until_unix.max(pending.replay_until_unix);
+                })
+                .or_insert(pending);
+        }
+        let mut addrs = pending_addrs.into_values().collect::<Vec<_>>();
         let name_level_negative = replace_scope == ObservationScope::Both && addrs.is_empty();
         if name_level_negative {
             // A name-level denial supersedes every earlier replacement for the
@@ -1183,7 +1226,7 @@ impl RouteManager {
         // also carry additive AAAA answers (and vice versa). Carry forward
         // those opposite-family additions unless a later queued observation
         // has already replaced that family.
-        let mut carried_expiries = AHashMap::<IpAddr, u64>::new();
+        let mut carried_addrs = AHashMap::<IpAddr, PendingObservedAddr>::new();
         self.pending_observations.retain(|observation| {
             if observation.domain != domain {
                 return true;
@@ -1193,38 +1236,38 @@ impl RouteManager {
                     if replace_scope.contains(observed.addr) {
                         continue;
                     }
-                    let expires_at = observation
-                        .observed_at_unix
-                        .saturating_add(u64::from(observed.ttl_secs));
-                    carried_expiries
+                    carried_addrs
                         .entry(observed.addr)
-                        .and_modify(|current| *current = (*current).max(expires_at))
-                        .or_insert(expires_at);
+                        .and_modify(|current| {
+                            current.expires_at_unix =
+                                current.expires_at_unix.max(observed.expires_at_unix);
+                            current.replay_until_unix =
+                                current.replay_until_unix.max(observed.replay_until_unix);
+                        })
+                        .or_insert(*observed);
                 }
                 return false;
             }
 
             // A retained replacement after an older same-scope observation
             // is authoritative for its family, including an empty NODATA set.
-            carried_expiries.retain(|ip, _| !observation.replace_scope.contains(*ip));
+            carried_addrs.retain(|ip, _| !observation.replace_scope.contains(*ip));
             true
         });
         let current_ips = addrs
             .iter()
             .map(|observed| observed.addr)
             .collect::<AHashSet<_>>();
-        for (addr, expires_at) in carried_expiries {
+        for (addr, carried) in carried_addrs {
             if current_ips.contains(&addr) {
                 continue;
             }
-            let remaining = expires_at.saturating_sub(observed_at_unix);
-            if remaining == 0 {
+            if carried.replay_until_unix <= observed_at_unix
+                || carried.expires_at_unix <= observed_at_unix
+            {
                 continue;
             }
-            addrs.push(ObservedAddr {
-                addr,
-                ttl_secs: u32::try_from(remaining).unwrap_or(u32::MAX),
-            });
+            addrs.push(carried);
         }
 
         let replay_until_unix = if addrs.is_empty() {
@@ -1234,7 +1277,7 @@ impl RouteManager {
         } else {
             addrs
                 .iter()
-                .map(|observed| observed_at_unix.saturating_add(u64::from(observed.ttl_secs)))
+                .map(|observed| observed.replay_until_unix)
                 .max()
                 .unwrap_or(observed_at_unix)
         };
@@ -1275,10 +1318,18 @@ impl RouteManager {
             .cloned()
             .collect::<Vec<_>>();
         for observation in pending {
-            self.apply_observation(
+            let expiries = observation
+                .addrs
+                .into_iter()
+                .filter(|observed| {
+                    observed.replay_until_unix > now && observed.expires_at_unix > now
+                })
+                .map(|observed| (observed.addr, observed.expires_at_unix))
+                .collect();
+            self.apply_observation_expiries(
                 observation.domain,
                 observation.replace_scope,
-                observation.addrs,
+                expiries,
                 observation.observed_at_unix,
             );
         }
@@ -3188,11 +3239,54 @@ mod tests {
         assert_eq!(manager.pending_observations.len(), 1);
         assert_eq!(
             manager.pending_observations[0].addrs,
-            vec![ObservedAddr {
+            vec![PendingObservedAddr {
                 addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 32)),
-                ttl_secs: 60,
+                expires_at_unix: u64::MAX,
+                replay_until_unix: now + 60,
             }]
         );
+    }
+
+    #[test]
+    fn pending_cross_family_carry_keeps_original_fixed_ttl_expiry() {
+        let domain = "pending-fixed-ttl.example.".to_string();
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 73));
+        let ipv6 = "2001:db8::73".parse::<IpAddr>().expect("IPv6 address");
+        let mut config = manager_config(Some(300));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        let first_observed_at = unix_now();
+
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ipv6,
+                ttl_secs: 1_000,
+            }],
+            None,
+            first_observed_at,
+        );
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: ipv4,
+                ttl_secs: 1_000,
+            }],
+            None,
+            first_observed_at + 10,
+        );
+
+        let pending = pending_observation(&manager, &domain, ObservationScope::Ipv4)
+            .expect("compacted observation");
+        let carried = pending
+            .addrs
+            .iter()
+            .find(|observed| observed.addr == ipv6)
+            .expect("carried IPv6 address");
+        assert_eq!(carried.expires_at_unix, first_observed_at + 300);
+        assert_eq!(carried.replay_until_unix, first_observed_at + 1_000);
     }
 
     #[test]

@@ -43,6 +43,8 @@ const DYNAMIC_CACHE_PRUNE_INTERVAL_SECS: u64 = 60;
 const SHUTDOWN_TIMEOUT_SECS: u64 = 8;
 /// Hard upper bound for locally cached dynamic refresh states.
 const MAX_DYNAMIC_CACHE_ENTRIES: usize = 65_536;
+/// Maximum number of RouterOS upserts issued concurrently by one observation.
+const UPSERT_PIPELINE_SIZE: usize = 16;
 /// Maximum time a dynamic key can go without a refresh attempt under steady
 /// traffic.
 const MAX_DYNAMIC_REFRESH_SUPPRESS_MS: u64 = 60_000;
@@ -653,7 +655,6 @@ impl AddressListManager {
         // Phase 1: collect entries that actually need a remote write, along with
         // their pre-formatted timeout strings so the borrow checker lets us hand
         // shared references to the concurrent futures below.
-        let comment = self.comment_for_dynamic(domain.as_str());
         let to_refresh: Vec<(AddressListKey, DynamicTimeout, Option<String>)> = dedup
             .into_iter()
             .filter_map(|(key, timeout)| {
@@ -672,56 +673,56 @@ impl AddressListManager {
             return Ok(());
         }
 
-        // Phase 2: fire all upserts concurrently — one DNS response may carry
-        // many IPs (CDN responses), and each previously-serial write is now
-        // pipelined over the same RouterOS API connection.
+        let comment = self.comment_for_dynamic(domain.as_str());
+
+        // Phase 2: pipeline upserts in bounded batches. The dependency uses a
+        // bounded response channel per command, so an unbounded join_all would
+        // let unusually large CDN answers create excessive in-flight work.
         let api = self.api.as_ref();
         let comment_str = comment.as_str();
         let prefix = self.cfg.comment_prefix.as_str();
         let tag = self.cfg.plugin_tag.as_str();
-
-        let results =
-            futures::future::join_all(to_refresh.iter().map(|(key, timeout, timeout_value)| {
-                api.upsert_owned_entry(
-                    key,
-                    timeout_value.as_deref(),
-                    comment_str,
-                    prefix,
-                    tag,
-                    matches!(timeout, DynamicTimeout::Timed(_)),
-                )
-            }))
-            .await;
-
-        // Phase 3: update the local suppression cache for every result so that
-        // a single failure does not prevent successful entries from being cached.
         let mut first_error: Option<DnsError> = None;
-        for ((key, timeout, _), result) in to_refresh.into_iter().zip(results) {
-            match result {
-                Ok(Some(())) => {
-                    // Only successful remote writes advance the suppression cache.
-                    let state = match timeout {
-                        DynamicTimeout::Timed(ttl) => DynamicRefreshState::from_write(now_ms, ttl),
-                        DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
-                    };
-                    self.dynamic_refresh_cache.insert(key, state);
-                }
-                Ok(None) => {
-                    // Foreign ownership conflict: drop any local cache so future
-                    // observations do not keep assuming we control the entry.
-                    self.dynamic_refresh_cache.remove(&key);
-                    warn!(
-                        plugin = %self.cfg.plugin_tag,
-                        list = %key.list,
-                        address = %key.normalized_value(),
-                        "ros_address_list dynamic entry conflicts with foreign address-list entry, skipping"
-                    );
-                }
-                Err(err) => {
-                    // Error path also drops the local cache so the next
-                    // observation retries immediately instead of being suppressed.
-                    self.dynamic_refresh_cache.remove(&key);
-                    first_error.get_or_insert(err);
+        for batch in to_refresh.chunks(UPSERT_PIPELINE_SIZE) {
+            let results =
+                futures::future::join_all(batch.iter().map(|(key, timeout, timeout_value)| {
+                    api.upsert_owned_entry(
+                        key,
+                        timeout_value.as_deref(),
+                        comment_str,
+                        prefix,
+                        tag,
+                        matches!(timeout, DynamicTimeout::Timed(_)),
+                    )
+                }))
+                .await;
+
+            // Phase 3: update suppression state per result so one failure does
+            // not discard successful writes from the same response.
+            for ((key, timeout, _), result) in batch.iter().zip(results) {
+                match result {
+                    Ok(Some(())) => {
+                        let state = match timeout {
+                            DynamicTimeout::Timed(ttl) => {
+                                DynamicRefreshState::from_write(now_ms, *ttl)
+                            }
+                            DynamicTimeout::Timeless => DynamicRefreshState::timeless(),
+                        };
+                        self.dynamic_refresh_cache.insert(key.clone(), state);
+                    }
+                    Ok(None) => {
+                        self.dynamic_refresh_cache.remove(key);
+                        warn!(
+                            plugin = %self.cfg.plugin_tag,
+                            list = %key.list,
+                            address = %key.normalized_value(),
+                            "ros_address_list dynamic entry conflicts with foreign address-list entry, skipping"
+                        );
+                    }
+                    Err(err) => {
+                        self.dynamic_refresh_cache.remove(key);
+                        first_error.get_or_insert(err);
+                    }
                 }
             }
         }

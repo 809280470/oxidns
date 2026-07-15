@@ -268,7 +268,9 @@ use self::manager::{
     ManagerCommand, ObservationScope, PersistentReloadConfig, RouteManager, RouteManagerConfig,
     RouteManagerRuntime,
 };
-use crate::plugin::executor::ros_common::{ObservedAddr, collect_answer_addrs};
+use crate::plugin::executor::ros_common::{
+    ObservedAddr, collect_answer_addrs, response_question_matches_request,
+};
 
 #[derive(Debug)]
 struct MikrotikExecutor {
@@ -608,11 +610,8 @@ impl Executor for MikrotikExecutor {
             negative_ttl_secs,
             wait: Some(wait_tx),
         };
-        let send_outcome = tokio::time::timeout(
-            Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS),
-            tx.send(send_cmd),
-        )
-        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS);
+        let send_outcome = tokio::time::timeout_at(deadline, tx.send(send_cmd)).await;
         match send_outcome {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
@@ -638,8 +637,7 @@ impl Executor for MikrotikExecutor {
             }
         }
 
-        let wait_outcome =
-            tokio::time::timeout(Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS), wait_rx).await;
+        let wait_outcome = tokio::time::timeout_at(deadline, wait_rx).await;
         match wait_outcome {
             Ok(Ok(Ok(()))) => Ok(step),
             Ok(Ok(Err(e))) => {
@@ -742,10 +740,7 @@ fn extract_observation(
     // A response for another request must never update this request's route
     // bindings. Keep this cheap identity check even though positive answers no
     // longer need CNAME-chain reconstruction.
-    if response
-        .first_question()
-        .is_some_and(|response_question| response_question != question)
-    {
+    if !response_question_matches_request(&context.request, response) {
         return None;
     }
 
@@ -769,6 +764,14 @@ fn extract_observation(
 
     match classify_response(response, Some(question)) {
         ResponseDisposition::DefinitiveNegative(NegativeResponseKind::NoData) => {
+            let scope_enabled = match replace_scope {
+                ObservationScope::Ipv4 => config.gateway4.is_some(),
+                ObservationScope::Ipv6 => config.gateway6.is_some(),
+                ObservationScope::Both => config.gateway4.is_some() || config.gateway6.is_some(),
+            };
+            if !scope_enabled {
+                return None;
+            }
             Some(ExtractedObservation {
                 domain,
                 replace_scope,
@@ -1233,6 +1236,15 @@ routing_table: "policy"
         assert_eq!(observation.replace_scope, ObservationScope::Ipv4);
         assert!(observation.addrs.is_empty());
         assert_eq!(observation.negative_ttl_secs, None);
+    }
+
+    #[test]
+    fn nodata_for_disabled_query_family_is_ignored() {
+        let mut config = observation_config();
+        config.gateway4 = None;
+        let mut context = context_with_nodata(RecordType::A);
+
+        assert!(extract_observation(&mut context, &config).is_none());
     }
 
     #[test]

@@ -9,6 +9,21 @@ use ahash::AHashMap;
 
 use crate::proto::Message;
 
+/// Return whether an echoed response question is compatible with the request.
+///
+/// Some upstreams omit the question section, which is tolerated for observer
+/// side effects. When a question is present it must exactly match the request
+/// so a response accidentally associated with another query cannot mutate
+/// RouterOS state under the wrong domain.
+pub(crate) fn response_question_matches_request(request: &Message, response: &Message) -> bool {
+    let Some(request_question) = request.first_question() else {
+        return false;
+    };
+    response
+        .first_question()
+        .is_none_or(|response_question| response_question == request_question)
+}
+
 /// One address observed in a DNS answer section.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ObservedAddr {
@@ -52,6 +67,34 @@ mod tests {
     use super::*;
     use crate::proto::rdata::{A, AAAA};
     use crate::proto::{Name, RData, Record};
+
+    #[test]
+    fn response_question_must_match_when_present() {
+        let mut request = Message::new();
+        request.add_question(crate::proto::Question::new(
+            Name::from_ascii("example.com.").expect("name"),
+            crate::proto::RecordType::A,
+            crate::proto::DNSClass::IN,
+        ));
+
+        let response_without_question = Message::new();
+        assert!(response_question_matches_request(
+            &request,
+            &response_without_question
+        ));
+
+        let mut matching = Message::new();
+        matching.add_question(request.first_question().expect("question").clone());
+        assert!(response_question_matches_request(&request, &matching));
+
+        let mut mismatched = Message::new();
+        mismatched.add_question(crate::proto::Question::new(
+            Name::from_ascii("other.example.").expect("name"),
+            crate::proto::RecordType::A,
+            crate::proto::DNSClass::IN,
+        ));
+        assert!(!response_question_matches_request(&request, &mismatched));
+    }
 
     #[test]
     fn collector_keeps_all_answer_addresses_and_largest_duplicate_ttl() {

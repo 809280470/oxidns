@@ -256,43 +256,15 @@ impl MikrotikRsClient {
             }
         };
 
-        let mut rows = Vec::new();
-        loop {
-            let recv_result = tokio::time::timeout(self.timeouts.receive, rx.recv()).await;
-            let Some(event) = (match recv_result {
-                Ok(item) => item,
-                Err(_) => {
+        match receive_rows(action, self.timeouts.receive, &mut rx).await {
+            Ok(rows) => Ok(rows),
+            Err((error, invalidate)) => {
+                if invalidate {
                     self.invalidate_connection().await;
-                    return Err(DnsError::plugin(format!(
-                        "ros_address_list {action} receive timeout after {}s",
-                        self.timeouts.receive.as_secs()
-                    )));
                 }
-            }) else {
-                break;
-            };
-
-            match event {
-                Event::Reply { response, .. } => rows.push(RouterReply {
-                    attributes: response.attributes,
-                }),
-                Event::Done { .. } | Event::Empty { .. } => {}
-                Event::Trap { response, .. } => {
-                    return Err(DnsError::plugin(format!(
-                        "ros_address_list {action} trap: {}",
-                        response.message
-                    )));
-                }
-                Event::Fatal { reason } => {
-                    self.invalidate_connection().await;
-                    return Err(DnsError::plugin(format!(
-                        "ros_address_list {action} fatal: {reason}"
-                    )));
-                }
-            };
+                Err(error)
+            }
         }
-
-        Ok(rows)
     }
 
     async fn find_entries_by_key(&self, key: &AddressListKey) -> Result<Vec<RouterListEntry>> {
@@ -334,6 +306,58 @@ impl MikrotikRsClient {
             .send_rows("add address-list entry", add.build())
             .await?;
         Ok(())
+    }
+}
+
+async fn receive_rows(
+    action: &str,
+    receive_timeout: Duration,
+    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
+) -> std::result::Result<Vec<RouterReply>, (DnsError, bool)> {
+    let mut rows = Vec::new();
+    loop {
+        let event = match tokio::time::timeout(receive_timeout, receiver.recv()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                return Err((
+                    DnsError::plugin(format!(
+                        "ros_address_list {action} response channel closed before a terminal event"
+                    )),
+                    true,
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    DnsError::plugin(format!(
+                        "ros_address_list {action} receive timeout after {}s",
+                        receive_timeout.as_secs()
+                    )),
+                    true,
+                ));
+            }
+        };
+
+        match event {
+            Event::Reply { response, .. } => rows.push(RouterReply {
+                attributes: response.attributes,
+            }),
+            Event::Done { .. } | Event::Empty { .. } => return Ok(rows),
+            Event::Trap { response, .. } => {
+                return Err((
+                    DnsError::plugin(format!(
+                        "ros_address_list {action} trap: {}",
+                        response.message
+                    )),
+                    false,
+                ));
+            }
+            Event::Fatal { reason } => {
+                return Err((
+                    DnsError::plugin(format!("ros_address_list {action} fatal: {reason}")),
+                    true,
+                ));
+            }
+        }
     }
 }
 
@@ -554,4 +578,22 @@ fn is_not_found_error(err: &DnsError) -> bool {
     lower.contains("no such item")
         || lower.contains("not found")
         || lower.contains("does not exist")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn response_channel_close_before_terminal_event_is_an_error() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        drop(sender);
+
+        let (error, invalidate) = receive_rows("test", Duration::from_millis(10), &mut receiver)
+            .await
+            .expect_err("premature close must fail");
+
+        assert!(error.to_string().contains("before a terminal event"));
+        assert!(invalidate);
+    }
 }

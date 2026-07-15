@@ -59,7 +59,9 @@ use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
     unregister_metric_source,
 };
-use crate::plugin::executor::ros_common::{ObservedAddr, collect_answer_addrs};
+use crate::plugin::executor::ros_common::{
+    ObservedAddr, collect_answer_addrs, response_question_matches_request,
+};
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
 use crate::proto::Rcode;
@@ -411,11 +413,8 @@ impl Executor for MikrotikExecutor {
             addrs,
             wait: Some(wait_tx),
         };
-        let send_outcome = tokio::time::timeout(
-            Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS),
-            tx.send(send_cmd),
-        )
-        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS);
+        let send_outcome = tokio::time::timeout_at(deadline, tx.send(send_cmd)).await;
         match send_outcome {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
@@ -441,8 +440,7 @@ impl Executor for MikrotikExecutor {
             }
         }
 
-        let wait_outcome =
-            tokio::time::timeout(Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS), wait_rx).await;
+        let wait_outcome = tokio::time::timeout_at(deadline, wait_rx).await;
         match wait_outcome {
             Ok(Ok(Ok(()))) => Ok(step),
             Ok(Ok(Err(e))) => {
@@ -534,6 +532,10 @@ fn extract_observation(
 
     let response = context.response()?;
     if response.rcode() != Rcode::NoError {
+        return None;
+    }
+
+    if !response_question_matches_request(&context.request, response) {
         return None;
     }
 
@@ -796,6 +798,7 @@ fn parse_persistent_item(
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
     use crate::infra::clock::AppClock;
@@ -848,6 +851,53 @@ mod tests {
                 .lock()
                 .map(|state| state.entries.len())
                 .unwrap_or_default()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PipelineMikrotikApi {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MikrotikApi for PipelineMikrotikApi {
+        async fn list_entries(
+            &self,
+            _list4: Option<&str>,
+            _list6: Option<&str>,
+        ) -> Result<Vec<RouterListEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_entries_by_key(&self, _key: &AddressListKey) -> Result<Vec<RouterListEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn upsert_owned_entry(
+            &self,
+            _key: &AddressListKey,
+            _timeout: Option<&str>,
+            _comment: &str,
+            _comment_prefix: &str,
+            _plugin_tag: &str,
+            _refresh_timeout: bool,
+        ) -> Result<Option<()>> {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            Ok(Some(()))
+        }
+
+        async fn delete_entry_by_id(&self, _id: &str, _family: AddressListFamily) -> Result<()> {
+            Ok(())
+        }
+
+        async fn healthcheck(&self) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -1043,6 +1093,55 @@ mod tests {
             resp.answers_mut().push(record);
         }
         resp
+    }
+
+    #[test]
+    fn observation_with_mismatched_response_question_is_ignored() {
+        let config = MikrotikConfig {
+            address: "127.0.0.1:8728".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            api_timeouts: MikrotikApiTimeouts::default(),
+            async_mode: true,
+            address_list4: Some("oxidns_ipv4".to_string()),
+            address_list6: None,
+            persistent_items: AHashSet::new(),
+            comment_prefix: "oxidns".to_string(),
+            min_ttl: DEFAULT_MIN_TTL,
+            max_ttl: DEFAULT_MAX_TTL,
+            fixed_ttl: None,
+            cleanup_on_shutdown: false,
+        };
+        let mut context = make_context();
+        let mut response = response_with_records(vec![a_record(Ipv4Addr::new(192, 0, 2, 1), 60)]);
+        response.add_question(Question::new(
+            Name::from_ascii("other.example.").expect("name"),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        context.set_response(response);
+
+        assert!(extract_observation(&mut context, &config).is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_upserts_use_bounded_pipeline() {
+        let api = Arc::new(PipelineMikrotikApi::default());
+        let mut manager = AddressListManager::new(api.clone(), default_cfg("pipeline"));
+        let addrs = (1..=17)
+            .map(|last_octet| ObservedAddr {
+                addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, last_octet)),
+                ttl_secs: 60,
+            })
+            .collect();
+
+        manager
+            .observe_domain("pipeline.example.".to_string(), addrs)
+            .await
+            .expect("pipeline writes");
+
+        assert_eq!(api.attempts.load(Ordering::Relaxed), 17);
+        assert_eq!(api.max_active.load(Ordering::Acquire), 16);
     }
 
     fn a_record(ip: Ipv4Addr, ttl: u32) -> Record {
