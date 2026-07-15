@@ -1794,6 +1794,13 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         default: false,
         description: "删除普通路由前检查 RouterOS conntrack；有目标连接时延后删除。",
       },
+      {
+        key: "max_entries",
+        label: "本地状态上限",
+        type: "number",
+        default: 65536,
+        description: "分别限制本地路由条目和域名绑定数量；必须大于 0。",
+      },
       { key: "cleanup_on_shutdown", label: "关闭时清理", type: "switch", default: true },
     ],
   },

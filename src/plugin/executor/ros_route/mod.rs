@@ -63,6 +63,7 @@ const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
 const DEFAULT_CONNTRACK_GUARD: bool = false;
 const DEFAULT_ROUTE_DISTANCE: u8 = 100;
 const DEFAULT_COMMENT_PREFIX: &str = "fdns";
+const DEFAULT_MAX_ENTRIES: usize = 65_536;
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -111,6 +112,8 @@ struct MikrotikConfigArgs {
     /// Delay normal route removal while RouterOS connection tracking has a
     /// connection for the route destination.
     conntrack_guard: Option<bool>,
+    /// Maximum number of route entries and domain bindings retained locally.
+    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -156,6 +159,8 @@ struct MikrotikConfig {
     cleanup_on_shutdown: bool,
     /// Delay normal route removal while a matching RouterOS connection exists.
     conntrack_guard: bool,
+    /// Per-table admission limit for route entries and domain bindings.
+    max_entries: usize,
 }
 
 #[derive(Debug)]
@@ -217,11 +222,23 @@ impl MikrotikConfigArgs {
         }
         // `0` deliberately means a dynamic route that never expires by time.
         let fixed_ttl = self.fixed_ttl;
+        let max_entries = self.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES);
+        if max_entries == 0 {
+            return Err(DnsError::plugin(
+                "ros_route max_entries must be greater than zero",
+            ));
+        }
         let parsed_persistent = parse_persistent_ips(
             self.persistent_route,
             gateway4.is_some(),
             gateway6.is_some(),
         )?;
+        if parsed_persistent.all_ips.len() > max_entries {
+            return Err(DnsError::plugin(format!(
+                "ros_route persistent_route contains {} entries, exceeding max_entries({max_entries})",
+                parsed_persistent.all_ips.len()
+            )));
+        }
         let ignored_by_gateway = parsed_persistent.ignored_by_gateway;
         if emit_warnings && ignored_by_gateway > 0 {
             warn!(
@@ -256,6 +273,7 @@ impl MikrotikConfigArgs {
                 .cleanup_on_shutdown
                 .unwrap_or(DEFAULT_CLEANUP_ON_SHUTDOWN),
             conntrack_guard: self.conntrack_guard.unwrap_or(DEFAULT_CONNTRACK_GUARD),
+            max_entries,
         })
     }
 }
@@ -515,20 +533,32 @@ impl Plugin for MikrotikExecutor {
             initial_ips: self.config.persistent_ips.clone(),
             gateway4_enabled: self.config.gateway4.is_some(),
             gateway6_enabled: self.config.gateway6.is_some(),
+            max_entries: self.config.max_entries,
         });
         let runtime = RouteManagerRuntime::start(self.tag.clone(), manager, persistent_reload);
         let manager_handle = runtime.handle();
-        self.manager_handle = Some(manager_handle.clone());
-        if let Ok(mut slot) = self.runtime.lock() {
-            *slot = Some(runtime);
-        }
-        register_active_route_instance(
+        if let Err(error) = register_active_route_instance(
             &self.tag,
             self.instance_id,
             RouteOwnershipNamespace::from_config(&self.config),
             self.metrics.clone(),
-            Some(manager_handle),
-        )?;
+            Some(manager_handle.clone()),
+        ) {
+            runtime.shutdown(false).await;
+            return Err(error);
+        }
+        let mut runtime = Some(runtime);
+        if let Ok(mut slot) = self.runtime.lock() {
+            *slot = runtime.take();
+        }
+        if let Some(runtime) = runtime {
+            release_active_route_instance(&self.tag, self.instance_id);
+            runtime.shutdown(false).await;
+            return Err(DnsError::plugin(
+                "ros_route runtime lock is poisoned during initialization",
+            ));
+        }
+        self.manager_handle = Some(manager_handle);
         self.active_registered.store(true, Ordering::Release);
         Ok(())
     }
@@ -701,6 +731,7 @@ impl PluginFactory for MikrotikFactory {
             max_ttl: config.max_ttl,
             fixed_ttl: config.fixed_ttl,
             conntrack_guard: config.conntrack_guard,
+            max_entries: config.max_entries,
         };
         let metrics = Arc::new(RosRouteMetrics::new(plugin_config.tag.clone()));
         let manager = RouteManager::with_metrics(api, manager_cfg, metrics.clone());
@@ -1174,6 +1205,68 @@ fixed_ttl: 0
         .expect("yaml");
         let parsed = parse_plugin_config(Some(args), false).expect("config");
         assert_eq!(parsed.fixed_ttl, Some(0));
+        assert_eq!(parsed.max_entries, DEFAULT_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn max_entries_is_positive_and_bounds_initial_persistent_routes() {
+        let args = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "127.0.0.1:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+max_entries: 8
+"#,
+        )
+        .expect("yaml");
+        assert_eq!(
+            parse_plugin_config(Some(args), false)
+                .expect("config")
+                .max_entries,
+            8
+        );
+
+        let zero = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "127.0.0.1:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+max_entries: 0
+"#,
+        )
+        .expect("yaml");
+        assert!(
+            parse_plugin_config(Some(zero), false)
+                .expect_err("zero capacity")
+                .to_string()
+                .contains("max_entries")
+        );
+
+        let overflow = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "127.0.0.1:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+max_entries: 1
+persistent_route:
+  ips:
+    - "192.0.2.10"
+    - "192.0.2.11"
+"#,
+        )
+        .expect("yaml");
+        assert!(
+            parse_plugin_config(Some(overflow), false)
+                .expect_err("persistent overflow")
+                .to_string()
+                .contains("max_entries")
+        );
     }
 
     #[test]

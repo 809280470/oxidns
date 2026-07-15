@@ -1678,6 +1678,11 @@ export const enUSPluginDefined = {
           label: "Connection tracking guard",
           description: "Check RouterOS conntrack before normal route deletion and defer when a target connection exists.",
         },
+        max_entries: {
+          label: "Local state limit",
+          description:
+            "Limit route entries and domain bindings independently; must be greater than 0.",
+        },
         cleanup_on_shutdown: { label: "Clean up on shutdown" },
       },
       metrics: {

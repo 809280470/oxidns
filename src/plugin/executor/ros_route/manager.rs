@@ -80,6 +80,8 @@ pub(super) struct RouteManagerConfig {
     pub(super) fixed_ttl: Option<u32>,
     /// Whether normal desired-state deletion waits for RouterOS conntrack.
     pub(super) conntrack_guard: bool,
+    /// Admission limit for dynamic route and domain state.
+    pub(super) max_entries: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -712,6 +714,8 @@ pub(super) struct PersistentReloadConfig {
     pub(super) gateway4_enabled: bool,
     /// Whether IPv6 gateway is configured.
     pub(super) gateway6_enabled: bool,
+    /// Maximum accepted merged persistent set size.
+    pub(super) max_entries: usize,
 }
 
 #[derive(Debug)]
@@ -810,10 +814,24 @@ impl RouteManagerRuntime {
                                 let mut desired_ips = reload_cfg.inline_ips.clone();
                                 desired_ips.extend(file_ips);
 
+                                if desired_ips.len() > reload_cfg.max_entries {
+                                    warn!(
+                                        plugin = %maintain_tag,
+                                        entries = desired_ips.len(),
+                                        capacity = reload_cfg.max_entries,
+                                        "ros_route persistent file reload exceeds max_entries; keeping previous desired state"
+                                    );
+                                    return;
+                                }
+
                                 let mut last_loaded_guard = last_loaded_ips.lock().await;
                                 let manager_available = if desired_ips != *last_loaded_guard {
-                                    *last_loaded_guard = desired_ips.clone();
-                                    maintain_handle.update_persistent_ips(desired_ips.clone())
+                                    if maintain_handle.update_persistent_ips(desired_ips.clone()) {
+                                        *last_loaded_guard = desired_ips;
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 } else {
                                     true
                                 };
@@ -1266,16 +1284,26 @@ impl RouteManager {
         now: u64,
     ) -> Vec<RouteKey> {
         let mut touched_keys = AHashSet::new();
-        let mut binding = self
-            .domain_bindings
-            .remove(&domain)
-            .unwrap_or_else(|| DomainBinding {
-                domain: domain.clone(),
-                ips: AHashSet::new(),
-                ip_expiries: AHashMap::new(),
-                expires_at_unix: 0,
-                last_refresh_unix: now,
-            });
+        let existing_binding = self.domain_bindings.remove(&domain);
+        if existing_binding.is_none()
+            && !dedup_expiries.is_empty()
+            && self.domain_bindings.len() >= self.cfg.max_entries
+        {
+            warn!(
+                plugin = %self.cfg.plugin_tag,
+                domain = %domain,
+                capacity = self.cfg.max_entries,
+                "ros_route domain state capacity reached, observation ignored"
+            );
+            return Vec::new();
+        }
+        let mut binding = existing_binding.unwrap_or_else(|| DomainBinding {
+            domain: domain.clone(),
+            ips: AHashSet::new(),
+            ip_expiries: AHashMap::new(),
+            expires_at_unix: 0,
+            last_refresh_unix: now,
+        });
         let removed_ips = binding
             .ips
             .iter()
@@ -1292,12 +1320,26 @@ impl RouteManager {
             }
         }
 
+        let mut capacity_dropped = 0usize;
         for (ip, expiry) in &dedup_expiries {
-            binding.ips.insert(*ip);
-            binding.ip_expiries.insert(*ip, *expiry);
             if let Some(key) = self.attach_or_refresh_route(&domain, *ip, *expiry, now) {
+                binding.ips.insert(*ip);
+                binding.ip_expiries.insert(*ip, *expiry);
                 touched_keys.insert(key);
+            } else {
+                binding.ips.remove(ip);
+                binding.ip_expiries.remove(ip);
+                capacity_dropped = capacity_dropped.saturating_add(1);
             }
+        }
+        if capacity_dropped > 0 {
+            warn!(
+                plugin = %self.cfg.plugin_tag,
+                domain = %domain,
+                dropped = capacity_dropped,
+                capacity = self.cfg.max_entries,
+                "ros_route route state capacity reached, answer addresses ignored"
+            );
         }
 
         if !binding.ips.is_empty() {
@@ -1520,6 +1562,10 @@ impl RouteManager {
             return Some(key);
         }
 
+        if self.routes.len() >= self.cfg.max_entries {
+            return None;
+        }
+
         let family = RouteFamily::from_ip(ip);
         let gateway = self.gateway_for(family).map(str::to_string)?;
         let mut domains = AHashSet::new();
@@ -1673,6 +1719,16 @@ impl RouteManager {
     fn prune_expired_local_state(&mut self, now: u64) {
         self.expire_domain_bindings(now);
         self.update_route_expiration(now);
+        self.prune_connection_retry_state();
+    }
+
+    fn prune_connection_retry_state(&mut self) {
+        let routes = &self.routes;
+        self.connection_retry_after.retain(|key, _| {
+            routes
+                .get(key)
+                .is_some_and(|route| matches!(route.sync_state, SyncState::PendingDelete))
+        });
     }
 
     fn recover_domain_binding(
@@ -1781,6 +1837,7 @@ impl RouteManager {
         }
         self.sync_pending_deletes(pending_deletes, now, &mut first_error)
             .await;
+        self.prune_connection_retry_state();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -2113,6 +2170,8 @@ impl RouteManager {
                 && meta.kind.has_dynamic_ownership()
                 && !meta.comment_domain.is_empty()
                 && prefix == family.prefix();
+            let dynamic_binding_capacity = self.domain_bindings.contains_key(&meta.comment_domain)
+                || self.domain_bindings.len() < self.cfg.max_entries;
             let foreign_conflict = foreign_keys.contains(&key);
 
             if let Some(existing) = self.routes.get_mut(&key) {
@@ -2155,7 +2214,7 @@ impl RouteManager {
                         existing.sync_state = SyncState::Dirty;
                     }
                 } else {
-                    if recover_dynamic_binding {
+                    if recover_dynamic_binding && dynamic_binding_capacity {
                         if existing.domains.insert(meta.comment_domain.clone()) {
                             existing.ref_count = existing.ref_count.saturating_add(1);
                         }
@@ -2205,6 +2264,17 @@ impl RouteManager {
             let Some(gateway) = self.gateway_for(family).map(str::to_string) else {
                 continue;
             };
+            if self.routes.len() >= self.cfg.max_entries
+                || (recover_dynamic_binding && !dynamic_binding_capacity)
+            {
+                warn!(
+                    plugin = %self.cfg.plugin_tag,
+                    dst = %key.dst_address(),
+                    capacity = self.cfg.max_entries,
+                    "ros_route recovery state capacity reached, leaving RouterOS route unchanged"
+                );
+                continue;
+            }
             let mut domains = AHashSet::new();
             let mut domain_expiries = AHashMap::new();
             if recover_dynamic_binding {
@@ -2404,32 +2474,47 @@ impl RouteManager {
                 self.cfg.gateway6.is_some(),
             )
             .await?;
-        for route in routes {
-            let comment = route.comment.as_deref().unwrap_or_default();
-            let owned_route = RouteCommentCodec::decode(
-                &self.cfg.comment_prefix,
-                &self.cfg.plugin_tag,
-                route.family,
-                &route.dst_address,
-                comment,
+        let owned = routes
+            .into_iter()
+            .filter(|route| {
+                let comment = route.comment.as_deref().unwrap_or_default();
+                let owned_route = RouteCommentCodec::decode(
+                    &self.cfg.comment_prefix,
+                    &self.cfg.plugin_tag,
+                    route.family,
+                    &route.dst_address,
+                    comment,
+                )
+                .ok()
+                .flatten()
+                .is_some();
+                let owned_gateway_check = owned_comment_has_kind(
+                    &self.cfg.comment_prefix,
+                    &self.cfg.plugin_tag,
+                    comment,
+                    COMMENT_KIND_GATEWAY_CHECK,
+                );
+                owned_route || owned_gateway_check
+            })
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for batch in owned.chunks(UPSERT_PIPELINE_SIZE) {
+            let results = futures::future::join_all(
+                batch
+                    .iter()
+                    .map(|route| self.api.delete_route_by_id(&route.id, route.family)),
             )
-            .ok()
-            .flatten()
-            .is_some();
-            let owned_gateway_check = owned_comment_has_kind(
-                &self.cfg.comment_prefix,
-                &self.cfg.plugin_tag,
-                comment,
-                COMMENT_KIND_GATEWAY_CHECK,
-            );
-            if owned_route || owned_gateway_check {
-                self.api.delete_route_by_id(&route.id, route.family).await?;
+            .await;
+            for result in results {
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
             }
         }
         self.routes.clear();
         self.domain_bindings.clear();
         self.connection_retry_after.clear();
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -2750,6 +2835,19 @@ mod tests {
 
         assert_eq!(handle.observations.len(), 2);
     }
+
+    #[tokio::test]
+    async fn persistent_reload_control_keeps_latest_desired_set() {
+        let handle = RouteManagerHandle::new();
+        assert!(handle.update_persistent_ips(AHashSet::from_iter(["192.0.2.10/32".to_string()])));
+        assert!(handle.update_persistent_ips(AHashSet::from_iter(["192.0.2.11/32".to_string()])));
+
+        let (_, command) = handle.controls.recv().await.expect("reload command");
+        let ControlCommand::UpdatePersistentIps { ips } = command else {
+            panic!("expected persistent update");
+        };
+        assert_eq!(ips, AHashSet::from_iter(["192.0.2.11/32".to_string()]));
+    }
     #[derive(Debug)]
     struct NoopApi;
 
@@ -3031,11 +3129,101 @@ mod tests {
             max_ttl: 3600,
             fixed_ttl,
             conntrack_guard: false,
+            max_entries: 65_536,
         }
     }
 
     fn manager_with_timeless_dynamic_routes() -> RouteManager {
         RouteManager::new(Arc::new(NoopApi), manager_config(Some(0)))
+    }
+
+    #[test]
+    fn dynamic_route_and_domain_state_respect_max_entries() {
+        let mut config = manager_config(Some(300));
+        config.max_entries = 2;
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        let addrs = (1..=3)
+            .map(|last| ObservedAddr {
+                addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, last)),
+                ttl_secs: 300,
+            })
+            .collect();
+
+        manager.apply_observation(
+            "capacity.example.".to_string(),
+            ObservationScope::Ipv4,
+            addrs,
+            100,
+        );
+
+        assert_eq!(manager.routes.len(), 2);
+        assert_eq!(manager.domain_bindings.len(), 1);
+        assert_eq!(manager.domain_bindings["capacity.example."].ips.len(), 2);
+
+        let shared_ip = *manager.domain_bindings["capacity.example."]
+            .ips
+            .iter()
+            .next()
+            .expect("one admitted route");
+        manager.apply_observation(
+            "second.example.".to_string(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: shared_ip,
+                ttl_secs: 300,
+            }],
+            101,
+        );
+        manager.apply_observation(
+            "third.example.".to_string(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: shared_ip,
+                ttl_secs: 300,
+            }],
+            102,
+        );
+
+        assert_eq!(manager.domain_bindings.len(), 2);
+        assert!(!manager.domain_bindings.contains_key("third.example."));
+        assert_eq!(
+            manager.routes[&RouteKey::new(shared_ip, "via_proxy".to_string())].ref_count,
+            2
+        );
+    }
+
+    #[test]
+    fn conntrack_retry_state_only_retains_pending_deletions() {
+        let mut manager = RouteManager::new(Arc::new(NoopApi), manager_config(Some(300)));
+        let missing = RouteKey::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            "via_proxy".to_string(),
+        );
+        let pending = RouteKey::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)),
+            "via_proxy".to_string(),
+        );
+        let synced = RouteKey::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12)),
+            "via_proxy".to_string(),
+        );
+        manager.routes.insert(
+            pending.clone(),
+            pending_delete_entry(pending.clone(), "*pending"),
+        );
+        let mut synced_entry = pending_delete_entry(synced.clone(), "*synced");
+        synced_entry.sync_state = SyncState::Synced;
+        manager.routes.insert(synced.clone(), synced_entry);
+        manager.connection_retry_after.insert(missing.clone(), 200);
+        manager.connection_retry_after.insert(pending.clone(), 200);
+        manager.connection_retry_after.insert(synced.clone(), 200);
+
+        manager.prune_connection_retry_state();
+
+        assert_eq!(
+            manager.connection_retry_after.keys().collect::<Vec<_>>(),
+            vec![&pending]
+        );
     }
 
     fn pending_observation<'a>(

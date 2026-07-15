@@ -1525,6 +1525,10 @@ export const zhCNPluginDefined = {
           label: "连接跟踪保护",
           description: "删除普通路由前检查 RouterOS conntrack；有目标连接时延后删除。",
         },
+        max_entries: {
+          label: "本地状态上限",
+          description: "分别限制本地路由条目和域名绑定数量；必须大于 0。",
+        },
         cleanup_on_shutdown: { label: "关闭时清理" },
       },
       metrics: {

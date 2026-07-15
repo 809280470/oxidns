@@ -2627,6 +2627,7 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
     gateway6: "fe80::2%ether1"
     fixed_ttl: 0
     conntrack_guard: true
+    max_entries: 65536
     cleanup_on_shutdown: true
     persistent_route:
       ips: ["198.51.100.0/24"]
@@ -2638,6 +2639,7 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
 - `persistent_route` is a DNS-independent IP/CIDR set; files reload every minute and are periodically reconciled.
 - RouterOS failures do not block DNS startup. `async: false` waits for one sync attempt but never changes the DNS response on failure.
 - `conntrack_guard` defaults to disabled. When enabled, dynamic withdrawal/expiry and removed persistent configuration check RouterOS conntrack before deleting; any tracked connection to the destination keeps the route and retries after 30 seconds. CIDRs check connections inside the prefix. Disabled connection tracking, RAW `notrack` traffic, and failed checks cannot prove safety, so the route is kept. Shutdown cleanup, validation residue, duplicates, and disabled-family cleanup still delete immediately.
+- `max_entries` defaults to `65536` and independently limits retained route entries and domain bindings so DNS answers or recovered RouterOS data cannot grow local state without bound. Configuration validation rejects an oversized initial persistent set; an oversized merged file reload keeps the previous desired state.
 - With `cleanup_on_shutdown: true`, dynamic and persistent routes owned by this plugin tag are removed; `false` leaves them for recovery on the next start.
 
 ---

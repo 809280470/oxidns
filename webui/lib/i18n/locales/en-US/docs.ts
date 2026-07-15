@@ -392,6 +392,8 @@ export const enUSDocs = {
     fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry.",
     conntrack_guard:
       "- Type: `bool`; Default: `false`\n- Checks RouterOS conntrack before normal route deletion; any tracked connection to the destination defers deletion and retries after 30 seconds. Shutdown and internal maintenance cleanup are unchanged.",
+    max_entries:
+      "- Type: `usize`; Default: `65536`\n- Independently limits retained route entries and domain bindings and must be greater than `0`. Initial persistent routes or a merged file reload above the limit are rejected.",
     cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin on shutdown.",
   },
   ros_address_list: {
