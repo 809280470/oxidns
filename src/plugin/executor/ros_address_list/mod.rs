@@ -260,6 +260,17 @@ struct RosMetrics {
     dropped_total: AtomicU64,
     sync_error_total: AtomicU64,
     sync_timeout_total: AtomicU64,
+    pending_observations: AtomicU64,
+    managed_entries: AtomicU64,
+    coalesced_total: AtomicU64,
+    capacity_rejected_total: AtomicU64,
+    reconnect_total: AtomicU64,
+    connect_attempt_total: AtomicU64,
+    backoff_total: AtomicU64,
+    reconcile_error_total: AtomicU64,
+    last_reconcile_success_timestamp_seconds: AtomicU64,
+    degraded: AtomicU64,
+    cleanup_error_total: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -375,6 +386,17 @@ impl RosMetrics {
             dropped_total: AtomicU64::new(0),
             sync_error_total: AtomicU64::new(0),
             sync_timeout_total: AtomicU64::new(0),
+            pending_observations: AtomicU64::new(0),
+            managed_entries: AtomicU64::new(0),
+            coalesced_total: AtomicU64::new(0),
+            capacity_rejected_total: AtomicU64::new(0),
+            reconnect_total: AtomicU64::new(0),
+            connect_attempt_total: AtomicU64::new(0),
+            backoff_total: AtomicU64::new(0),
+            reconcile_error_total: AtomicU64::new(0),
+            last_reconcile_success_timestamp_seconds: AtomicU64::new(0),
+            degraded: AtomicU64::new(0),
+            cleanup_error_total: AtomicU64::new(0),
         }
     }
 }
@@ -414,6 +436,70 @@ impl MetricSource for RosMetrics {
             &labels,
             self.sync_timeout_total.load(Ordering::Relaxed),
         ));
+        for (name, help, value) in [
+            (
+                "ros_address_list_pending_observations",
+                "Current coalesced address-list observations waiting for processing.",
+                self.pending_observations.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_managed_entries",
+                "Current address-list entries retained by the manager.",
+                self.managed_entries.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_last_reconcile_success_timestamp_seconds",
+                "Unix timestamp of the last successful address-list reconcile.",
+                self.last_reconcile_success_timestamp_seconds
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_degraded",
+                "Whether the RouterOS transport is currently degraded.",
+                self.degraded.load(Ordering::Relaxed),
+            ),
+        ] {
+            sink.emit(MetricSample::gauge(name, help, &labels, value));
+        }
+        for (name, help, value) in [
+            (
+                "ros_address_list_coalesced_total",
+                "Total address-list observations merged into an existing mailbox key.",
+                self.coalesced_total.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_capacity_rejected_total",
+                "Total address-list observations rejected by queue or state capacity.",
+                self.capacity_rejected_total.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_reconnect_total",
+                "Total successful RouterOS transport reconnections.",
+                self.reconnect_total.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_connect_attempt_total",
+                "Total RouterOS transport connection attempts.",
+                self.connect_attempt_total.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_backoff_total",
+                "Total RouterOS transport backoff schedules.",
+                self.backoff_total.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_reconcile_error_total",
+                "Total failed address-list reconcile attempts.",
+                self.reconcile_error_total.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_address_list_cleanup_error_total",
+                "Total address-list entries that failed shutdown cleanup.",
+                self.cleanup_error_total.load(Ordering::Relaxed),
+            ),
+        ] {
+            sink.emit(MetricSample::counter(name, help, &labels, value));
+        }
     }
 }
 
@@ -645,13 +731,14 @@ impl PluginFactory for MikrotikFactory {
             fixed_ttl: config.fixed_ttl,
             max_entries: config.max_entries,
         };
-        let manager = AddressListManager::new(api, manager_cfg);
+        let metrics = Arc::new(RosMetrics::new(plugin_config.tag.clone()));
+        let manager = AddressListManager::with_metrics(api, manager_cfg, metrics.clone());
 
         Ok(UninitializedPlugin::Executor(Box::new(MikrotikExecutor {
             tag: plugin_config.tag.clone(),
             instance_id: NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             active_registered: AtomicBool::new(false),
-            metrics: Arc::new(RosMetrics::new(plugin_config.tag.clone())),
+            metrics,
             config,
             manager: Some(manager),
             manager_handle: None,
@@ -957,6 +1044,7 @@ mod tests {
         fail_healthcheck: bool,
         list_entries_delay: Option<Duration>,
         convert_persistent_to_dynamic_after_list: bool,
+        convert_owned_to_foreign_after_list: bool,
         upsert_v4: u64,
         upsert_v6: u64,
         update_ops: u64,
@@ -1089,6 +1177,12 @@ mod tests {
                         OwnedCommentKind::Dynamic,
                         Some("race.example"),
                     ));
+                }
+            }
+            if state.convert_owned_to_foreign_after_list {
+                state.convert_owned_to_foreign_after_list = false;
+                if let Some(entry) = state.entries.values_mut().next() {
+                    entry.comment = Some("operator-owned".to_string());
                 }
             }
 
@@ -2471,5 +2565,44 @@ persistent:
                 .contains_key(&MockMikrotikApi::storage_key(&owned_key))
         );
         assert_eq!(state.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_revalidates_ownership_before_delete() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let key = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(11, 11, 11, 13)),
+            "oxidns_ipv4".to_string(),
+        );
+        api.seed_entry(RouterListEntry {
+            id: "*ownership-race".to_string(),
+            key: key.clone(),
+            timeout: Some("300s".to_string()),
+            comment: Some(encode_comment(
+                "oxidns",
+                "cleanup-race",
+                OwnedCommentKind::Dynamic,
+                Some("example.com"),
+            )),
+        });
+        api.state
+            .lock()
+            .unwrap()
+            .convert_owned_to_foreign_after_list = true;
+        let mut manager = AddressListManager::new(api.clone(), {
+            let mut cfg = default_cfg("cleanup-race");
+            cfg.comment_prefix = "oxidns".to_string();
+            cfg
+        });
+
+        manager.shutdown(true).await.unwrap();
+
+        assert!(
+            api.state
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&MockMikrotikApi::storage_key(&key))
+        );
     }
 }

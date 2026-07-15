@@ -118,7 +118,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     configSchema: [
       {
         key: "concurrent",
-        description: "定义多上游模式下的并发查询扇出数，运行时上限为 32 且不超过上游数量。",
+        description:
+          "定义多上游模式下的并发查询扇出数，运行时上限为 32 且不超过上游数量。",
         label: "并发上游数",
         type: "number",
         default: 1,
@@ -559,7 +560,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     kind: "response",
     type: "executor",
     name: "Response",
-    description: "构造并覆盖完整 DNS 响应，可分别配置 Answer、Authority 和 Additional",
+    description:
+      "构造并覆盖完整 DNS 响应，可分别配置 Answer、Authority 和 Additional",
     icon: "Reply",
     configSchema: [
       {
@@ -796,7 +798,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       {
         key: "socks5",
-        description: "为 TCP 探测指定局部 SOCKS5 代理，优先于 outbound profile proxy。",
+        description:
+          "为 TCP 探测指定局部 SOCKS5 代理，优先于 outbound profile proxy。",
         label: "SOCKS5 代理",
         type: "text",
         placeholder: "127.0.0.1:1080",
@@ -1732,18 +1735,37 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_route_sync_timeout_total: "同步超时",
         ros_route_delete_deferred_total: "延迟删除",
         ros_route_connection_check_error_total: "连接检查失败",
+        ros_route_pending_observations: "待处理观测",
+        ros_route_managed_entries: "受管路由",
+        ros_route_coalesced_total: "合并观测",
+        ros_route_capacity_rejected_total: "容量拒绝",
+        ros_route_reconnect_total: "重连",
+        ros_route_connect_attempt_total: "连接尝试",
+        ros_route_backoff_total: "退避",
+        ros_route_reconcile_error_total: "对账失败",
+        ros_route_last_reconcile_success_timestamp_seconds: "最近对账成功",
+        ros_route_degraded: "连接降级",
+        ros_route_cleanup_error_total: "清理失败",
       },
       metricHelp: {
         ros_route_observe_total: "提交给 RouterOS 路由管理器的域名观测总数。",
-        ros_route_dropped_total: "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
-        ros_route_sync_error_total: "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
+        ros_route_dropped_total:
+          "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
+        ros_route_sync_error_total:
+          "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
         ros_route_sync_timeout_total: "同步模式下入队或等待超时的观测总数。",
         ros_route_delete_deferred_total:
           "因 RouterOS conntrack 中仍存在目标连接而延迟删除路由的总次数。",
         ros_route_connection_check_error_total:
           "路由删除期间 RouterOS conntrack 查询失败的总次数。",
+        ros_route_pending_observations: "当前等待 manager 处理的合并后观测数。",
+        ros_route_managed_entries: "manager 当前保留的路由条目数。",
+        ros_route_degraded: "RouterOS transport 当前是否处于降级状态。",
       },
-      cardPriority: ["ros_route_observe_total", "ros_route_sync_error_total"],
+      cardPriority: [
+        "ros_route_managed_entries",
+        "ros_route_pending_observations",
+      ],
     } satisfies PluginMetricsDef,
     configSchema: [
       {
@@ -1754,7 +1776,23 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         placeholder: "172.16.1.1:8728",
       },
       { key: "username", label: "用户名", type: "text", required: true },
-      { key: "password", label: "密码", type: "text", required: true },
+      { key: "password", label: "密码", type: "password", required: true },
+      {
+        key: "tls",
+        label: "TLS",
+        type: "object",
+        description: "启用 RouterOS API-SSL（通常为 8729 端口）。",
+        fields: [
+          { key: "server_name", label: "服务器名称", type: "text" },
+          { key: "ca", label: "自定义 CA 文件", type: "text" },
+          {
+            key: "insecure",
+            label: "跳过证书验证",
+            type: "switch",
+            default: false,
+          },
+        ],
+      },
       { key: "connect_timeout", label: "连接超时", type: "number", default: 5 },
       { key: "send_timeout", label: "发送超时", type: "number", default: 5 },
       { key: "receive_timeout", label: "接收超时", type: "number", default: 5 },
@@ -1766,21 +1804,51 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         required: true,
         placeholder: "via_proxy",
       },
-      { key: "gateway4", label: "IPv4 网关", type: "text", placeholder: "192.168.88.2@main" },
-      { key: "gateway6", label: "IPv6 网关", type: "text", placeholder: "fe80::2%ether1" },
+      {
+        key: "gateway4",
+        label: "IPv4 网关",
+        type: "text",
+        placeholder: "192.168.88.2@main",
+      },
+      {
+        key: "gateway6",
+        label: "IPv6 网关",
+        type: "text",
+        placeholder: "fe80::2%ether1",
+      },
       { key: "distance", label: "路由距离", type: "number", default: 100 },
-      { key: "comment_prefix", label: "注释前缀", type: "text", default: "fdns" },
+      {
+        key: "comment_prefix",
+        label: "注释前缀",
+        type: "text",
+        default: "fdns",
+      },
       {
         key: "persistent_route",
         label: "常驻路由",
         type: "object",
         fields: [
           stringArrayField("ips", "IP / CIDR", "1.1.1.1\n100.64.1.0/24", false),
-          stringArrayField("files", "文件", "/etc/oxidns/persistent_routes.txt", false),
+          stringArrayField(
+            "files",
+            "文件",
+            "/etc/oxidns/persistent_routes.txt",
+            false,
+          ),
         ],
       },
-      { key: "min_ttl", label: "动态路由最小 TTL", type: "number", default: 60 },
-      { key: "max_ttl", label: "动态路由最大 TTL", type: "number", default: 3600 },
+      {
+        key: "min_ttl",
+        label: "动态路由最小 TTL",
+        type: "number",
+        default: 60,
+      },
+      {
+        key: "max_ttl",
+        label: "动态路由最大 TTL",
+        type: "number",
+        default: 3600,
+      },
       {
         key: "fixed_ttl",
         label: "动态路由固定 TTL",
@@ -1792,7 +1860,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "连接跟踪保护",
         type: "switch",
         default: false,
-        description: "删除普通路由前检查 RouterOS conntrack；有目标连接时延后删除。",
+        description:
+          "删除普通路由前检查 RouterOS conntrack；有目标连接时延后删除。",
       },
       {
         key: "max_entries",
@@ -1801,7 +1870,12 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         default: 65536,
         description: "分别限制本地路由条目和域名绑定数量；必须大于 0。",
       },
-      { key: "cleanup_on_shutdown", label: "关闭时清理", type: "switch", default: true },
+      {
+        key: "cleanup_on_shutdown",
+        label: "关闭时清理",
+        type: "switch",
+        default: true,
+      },
     ],
   },
   {
@@ -1816,6 +1890,18 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_address_list_dropped_total: "异步丢弃",
         ros_address_list_sync_error_total: "同步失败",
         ros_address_list_sync_timeout_total: "同步超时",
+        ros_address_list_pending_observations: "待处理观测",
+        ros_address_list_managed_entries: "受管条目",
+        ros_address_list_coalesced_total: "合并观测",
+        ros_address_list_capacity_rejected_total: "容量拒绝",
+        ros_address_list_reconnect_total: "重连",
+        ros_address_list_connect_attempt_total: "连接尝试",
+        ros_address_list_backoff_total: "退避",
+        ros_address_list_reconcile_error_total: "对账失败",
+        ros_address_list_last_reconcile_success_timestamp_seconds:
+          "最近对账成功",
+        ros_address_list_degraded: "连接降级",
+        ros_address_list_cleanup_error_total: "清理失败",
       },
       metricHelp: {
         ros_address_list_observe_total:
@@ -1826,10 +1912,15 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           "同步模式下在 RouterOS 管理器侧失败的观测总数。",
         ros_address_list_sync_timeout_total:
           "同步模式下入队或等待超时的观测总数。",
+        ros_address_list_pending_observations:
+          "当前等待 manager 处理的合并后观测数。",
+        ros_address_list_managed_entries:
+          "manager 当前保留的 address-list 条目数。",
+        ros_address_list_degraded: "RouterOS transport 当前是否处于降级状态。",
       },
       cardPriority: [
-        "ros_address_list_observe_total",
-        "ros_address_list_sync_error_total",
+        "ros_address_list_managed_entries",
+        "ros_address_list_pending_observations",
       ],
     } satisfies PluginMetricsDef,
     configSchema: [
@@ -1849,10 +1940,26 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         required: true,
       },
       {
+        key: "tls",
+        label: "TLS",
+        type: "object",
+        description: "启用 RouterOS API-SSL（通常为 8729 端口）。",
+        fields: [
+          { key: "server_name", label: "服务器名称", type: "text" },
+          { key: "ca", label: "自定义 CA 文件", type: "text" },
+          {
+            key: "insecure",
+            label: "跳过证书验证",
+            type: "switch",
+            default: false,
+          },
+        ],
+      },
+      {
         key: "password",
         description: "指定 RouterOS API 登录密码。",
         label: "密码",
-        type: "text",
+        type: "password",
         required: true,
       },
       {
@@ -1953,6 +2060,13 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         description: "为所有动态写入项指定固定 TTL。",
         label: "动态项固定 TTL",
         type: "number",
+      },
+      {
+        key: "max_entries",
+        description: "限制本地已知动态地址键数量；persistent 不计入。",
+        label: "动态状态上限",
+        type: "number",
+        default: 65536,
       },
       {
         key: "cleanup_on_shutdown",

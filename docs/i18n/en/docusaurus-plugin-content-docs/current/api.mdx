@@ -762,6 +762,12 @@ Current exported metrics include:
 * `ros_address_list_dropped_total`
 * `ros_address_list_sync_error_total`
 * `ros_address_list_sync_timeout_total`
+* `ros_address_list_pending_observations` / `ros_address_list_managed_entries`
+* `ros_address_list_coalesced_total` / `ros_address_list_capacity_rejected_total`
+* `ros_address_list_reconnect_total` / `ros_address_list_connect_attempt_total` / `ros_address_list_backoff_total`
+* `ros_address_list_reconcile_error_total` / `ros_address_list_last_reconcile_success_timestamp_seconds`
+* `ros_address_list_degraded` / `ros_address_list_cleanup_error_total`
+* Corresponding `ros_route_*` manager metrics, plus its conntrack defer/error counters.
 * `reverse_lookup_ptr_hit_total`
 * `reverse_lookup_ptr_miss_total`
 * `reverse_lookup_cache_insert_total`

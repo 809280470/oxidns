@@ -2456,6 +2456,10 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
     username: "api-user"
     # API password
     password: "secret"
+    # Omit tls for plaintext API (usually 8728); configure it for API-SSL (usually 8729)
+    tls:
+      server_name: "router.example"
+      ca: "/etc/oxidns/routeros-ca.pem"
     # RouterOS API connection timeout, in seconds
     connect_timeout: 5
     # RouterOS API command send timeout, in seconds
@@ -2476,6 +2480,8 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
     max_ttl: 3600
     # Force dynamic entries to 300 seconds; use 0 to omit RouterOS timeout
     fixed_ttl: 300
+    # Local known-dynamic-key limit; persistent entries do not count
+    max_entries: 65536
     # Remove owned entries when the plugin shuts down
     cleanup_on_shutdown: true
     persistent:
@@ -2507,6 +2513,11 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 
 - Type: `string`; Required: yes
 - Purpose: RouterOS password.
+
+#### `tls`
+
+- Type: `object`; Required: no; Default: none (plaintext API)
+- Purpose: Enables RouterOS API-SSL. `server_name` overrides certificate naming, `ca` loads a private/self-signed CA, and `insecure: true` disables verification. Prefer `ca`; `insecure` cannot be combined with it.
 
 #### `connect_timeout`
 
@@ -2577,6 +2588,12 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 - Type: `u64`; Required: no; Default: none
 - Purpose: Specifies one fixed TTL for all dynamically written entries. If it is set to `0`, dynamic entries will not set a RouterOS `timeout`.
 
+#### `max_entries`
+
+- Type: `usize`; Required: no; Default: `65536`
+- Purpose: Limits locally known dynamic address keys; persistent entries do not count. Existing RouterOS entries above the limit are preserved while new keys are rejected.
+- Notes: `fixed_ttl: 0` entries do not expire naturally, so size this limit deliberately.
+
 #### `cleanup_on_shutdown`
 
 - Type: `bool`; Required: no; Default: `true`
@@ -2596,6 +2613,7 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
   - Dynamic entry refresh
   - Persistent entry consistency maintenance
   - Cleanup on shutdown
+- Dynamic entries follow actual RouterOS state: an operator deletion clears local suppression on reconcile, and only a later DNS observation recreates it. The plugin does not read RouterOS on every DNS request. Persistent entries remain configuration-authoritative and are restored by reconcile.
 
 ### Typical Uses
 
@@ -2622,6 +2640,9 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
     address: "192.168.88.1:8728"
     username: "api-user"
     password: "secret"
+    tls:
+      server_name: "router.example"
+      ca: "/etc/oxidns/routeros-ca.pem"
     routing_table: "via_proxy"
     gateway4: "192.168.88.2@main"
     gateway6: "fe80::2%ether1"
@@ -2639,7 +2660,10 @@ Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routi
 - `persistent_route` is a DNS-independent IP/CIDR set; files reload every minute and are periodically reconciled.
 - RouterOS failures do not block DNS startup. `async: false` waits for one sync attempt but never changes the DNS response on failure.
 - `conntrack_guard` defaults to disabled. When enabled, dynamic withdrawal/expiry and removed persistent configuration check RouterOS conntrack before deleting; any tracked connection to the destination keeps the route and retries after 30 seconds. CIDRs check connections inside the prefix. Disabled connection tracking, RAW `notrack` traffic, and failed checks cannot prove safety, so the route is kept. Shutdown cleanup, validation residue, duplicates, and disabled-family cleanup still delete immediately.
-- `max_entries` defaults to `65536` and independently limits retained route entries and domain bindings so DNS answers or recovered RouterOS data cannot grow local state without bound. Configuration validation rejects an oversized initial persistent set; an oversized merged file reload keeps the previous desired state.
+- `max_entries` defaults to `65536` and limits dynamic routes and domain bindings; persistent routes do not count. `fixed_ttl: 0` routes need deliberate capacity planning.
+- Dynamic routes follow actual RouterOS state: reconcile accepts operator deletion, and a later DNS observation recreates the route. RouterOS is not read on every DNS request; persistent routes remain configuration-authoritative.
+- Shared-IP restart recovery stores one representative domain in the RouterOS comment. Finite routes are conservatively kept until the comment's maximum expiry. Timeless recovered routes retain an unknown-owner marker and are removed only by an operator, shutdown cleanup, or an ownership-configuration change.
+- `tls` enables API-SSL (usually port `8729`); prefer `tls.ca` for self-signed certificates and use `insecure: true` only when verification is impossible. Omitting `tls` uses plaintext API (usually `8728`).
 - With `cleanup_on_shutdown: true`, dynamic and persistent routes owned by this plugin tag are removed; `false` leaves them for recovery on the next start.
 
 ---

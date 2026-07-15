@@ -24,6 +24,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use super::RosMetrics;
 use super::api::{MikrotikApi, RouterListEntry};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
@@ -428,31 +429,61 @@ pub(super) struct AddressListManagerHandle {
     observations: KeyedMailbox<AddressListKey, ObservationCommand>,
     controls: KeyedMailbox<ControlKey, ControlCommand>,
     policy: AddressObservationPolicy,
+    metrics: Option<Arc<RosMetrics>>,
 }
 
 impl AddressListManagerHandle {
-    fn new(config: &AddressListManagerConfig) -> Self {
+    fn new(config: &AddressListManagerConfig, metrics: Option<Arc<RosMetrics>>) -> Self {
         Self {
             observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
             policy: AddressObservationPolicy::from_config(config),
+            metrics,
         }
     }
 
     #[cfg(test)]
     pub(super) fn new_for_test() -> Self {
         AppClock::start();
-        Self::new(&AddressListManagerConfig {
-            plugin_tag: "test".to_string(),
-            address_list4: Some("test_v4".to_string()),
-            address_list6: Some("test_v6".to_string()),
-            persistent_items: AHashSet::new(),
-            comment_prefix: "fdns".to_string(),
-            min_ttl: 60,
-            max_ttl: 3600,
-            fixed_ttl: None,
-            max_entries: 65_536,
-        })
+        Self::new(
+            &AddressListManagerConfig {
+                plugin_tag: "test".to_string(),
+                address_list4: Some("test_v4".to_string()),
+                address_list6: Some("test_v6".to_string()),
+                persistent_items: AHashSet::new(),
+                comment_prefix: "fdns".to_string(),
+                min_ttl: 60,
+                max_ttl: 3600,
+                fixed_ttl: None,
+                max_entries: 65_536,
+            },
+            None,
+        )
+    }
+
+    fn refresh_pending_metric_with(&self, extra: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.pending_observations.store(
+                self.observations.len().saturating_add(extra) as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn record_outcome(&self, outcome: PushOutcome) {
+        if matches!(outcome, PushOutcome::Coalesced)
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.coalesced_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_capacity_rejection(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .capacity_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn try_observe(
@@ -477,9 +508,13 @@ impl AddressListManagerHandle {
                 completions: completion.iter().cloned().collect(),
             };
             match self.observations.try_push(key, command) {
-                Ok(PushOutcome::Inserted) => outcome = PushOutcome::Inserted,
-                Ok(PushOutcome::Coalesced) => {}
+                Ok(item_outcome @ PushOutcome::Inserted) => {
+                    self.record_outcome(item_outcome);
+                    outcome = PushOutcome::Inserted;
+                }
+                Ok(item_outcome @ PushOutcome::Coalesced) => self.record_outcome(item_outcome),
                 Err(TryPushError::Full(command)) => {
+                    self.record_capacity_rejection();
                     for completion in command.completions {
                         completion.finish(&Err(DnsError::plugin(
                             "ros_address_list observation mailbox is full",
@@ -497,6 +532,7 @@ impl AddressListManagerHandle {
                 }
             }
         }
+        self.refresh_pending_metric_with(0);
         enqueue_error.map_or(Ok(outcome), Err)
     }
 
@@ -520,8 +556,11 @@ impl AddressListManagerHandle {
                 completions: vec![completion.clone()],
             };
             match self.observations.push(key, command).await {
-                Ok(PushOutcome::Inserted) => outcome = PushOutcome::Inserted,
-                Ok(PushOutcome::Coalesced) => {}
+                Ok(item_outcome @ PushOutcome::Inserted) => {
+                    self.record_outcome(item_outcome);
+                    outcome = PushOutcome::Inserted;
+                }
+                Ok(item_outcome @ PushOutcome::Coalesced) => self.record_outcome(item_outcome),
                 Err(error) => {
                     for completion in error.0.completions {
                         completion.finish(&Err(DnsError::plugin(
@@ -537,6 +576,7 @@ impl AddressListManagerHandle {
                 }
             }
         }
+        self.refresh_pending_metric_with(0);
         Ok(outcome)
     }
 
@@ -594,7 +634,7 @@ impl AddressListManagerRuntime {
     pub(super) fn start(tag: String, manager: AddressListManager) -> Self {
         // All mutable state lives behind one worker to avoid cross-map locking
         // or request-path synchronization in the DNS hot path.
-        let handle = AddressListManagerHandle::new(&manager.cfg);
+        let handle = AddressListManagerHandle::new(&manager.cfg, manager.metrics.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker_tag = tag.clone();
         let worker_handle_mailbox = handle.clone();
@@ -684,6 +724,7 @@ impl AddressListManagerRuntime {
 pub(super) struct AddressListManager {
     /// RouterOS API abstraction used by the single-owner worker.
     api: Arc<dyn MikrotikApi>,
+    metrics: Option<Arc<RosMetrics>>,
     /// Immutable config shared across runtime decisions.
     cfg: AddressListManagerConfig,
     /// Current desired persistent set.
@@ -703,12 +744,55 @@ impl AddressListManager {
     pub(super) fn new(api: Arc<dyn MikrotikApi>, cfg: AddressListManagerConfig) -> Self {
         Self {
             api,
+            metrics: None,
             persistent_items: cfg.persistent_items.clone(),
             dynamic_refresh_cache: AHashMap::new(),
             reconcile_handle: None,
             dynamic_generation: 0,
             cfg,
             initialized: false,
+        }
+    }
+
+    pub(super) fn with_metrics(
+        api: Arc<dyn MikrotikApi>,
+        cfg: AddressListManagerConfig,
+        metrics: Arc<RosMetrics>,
+    ) -> Self {
+        let mut manager = Self::new(api, cfg);
+        manager.metrics = Some(metrics);
+        manager.refresh_managed_metric();
+        manager
+    }
+
+    fn refresh_managed_metric(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.managed_entries.store(
+                self.dynamic_refresh_cache
+                    .len()
+                    .saturating_add(self.persistent_items.len()) as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    async fn refresh_transport_metrics(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        if let Some(snapshot) = self.api.transport_snapshot().await {
+            metrics
+                .reconnect_total
+                .store(snapshot.reconnect_total, Ordering::Relaxed);
+            metrics
+                .connect_attempt_total
+                .store(snapshot.connect_attempt_total, Ordering::Relaxed);
+            metrics
+                .backoff_total
+                .store(snapshot.backoff_total, Ordering::Relaxed);
+            metrics
+                .degraded
+                .store(u64::from(snapshot.degraded), Ordering::Relaxed);
         }
     }
 
@@ -813,6 +897,7 @@ impl AddressListManager {
         self.dynamic_generation = self.dynamic_generation.wrapping_add(1);
         state.generation = self.dynamic_generation;
         self.dynamic_refresh_cache.insert(key, state);
+        self.refresh_managed_metric();
         true
     }
 
@@ -948,6 +1033,7 @@ impl AddressListManager {
             }
         }
         self.prune_dynamic_cache(now);
+        self.refresh_managed_metric();
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1024,9 +1110,21 @@ impl AddressListManager {
                     .await
                 {
                     Ok(()) => {
+                        if let Some(metrics) = &self.metrics {
+                            metrics
+                                .last_reconcile_success_timestamp_seconds
+                                .store(AppClock::now_timestamp() / 1000, Ordering::Relaxed);
+                        }
+                        self.refresh_transport_metrics().await;
                         debug!(plugin = %tag, "ros_address_list background reconcile completed");
                     }
                     Err(error) => {
+                        if let Some(metrics) = &self.metrics {
+                            metrics
+                                .reconcile_error_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.refresh_transport_metrics().await;
                         warn!(
                             plugin = %tag,
                             err = %error,
@@ -1036,6 +1134,12 @@ impl AddressListManager {
                 }
             }
             Ok(Err(error)) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .reconcile_error_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.refresh_transport_metrics().await;
                 warn!(
                     plugin = %tag,
                     err = %error,
@@ -1218,6 +1322,11 @@ impl AddressListManager {
                 && !reserved_new.contains(key)
                 && self.dynamic_refresh_cache.len() + reserved_new.len() >= self.cfg.max_entries
             {
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .capacity_rejected_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 outcomes[index] = Some(Err(DnsError::plugin(format!(
                     "ros_address_list dynamic state capacity {} reached",
                     self.cfg.max_entries
@@ -1351,14 +1460,49 @@ impl AddressListManager {
         let tag = self.cfg.plugin_tag.clone();
         self.harvest_background_reconcile(tag.as_str()).await;
         self.prune_dynamic_cache(now_millis());
+        self.refresh_managed_metric();
         Ok(())
     }
 
     async fn transport_retry_delay(&self) -> Option<Duration> {
-        self.api
-            .transport_snapshot()
-            .await
-            .and_then(|snapshot| snapshot.retry_after)
+        let snapshot = self.api.transport_snapshot().await;
+        if let (Some(metrics), Some(snapshot)) = (&self.metrics, snapshot) {
+            metrics
+                .reconnect_total
+                .store(snapshot.reconnect_total, Ordering::Relaxed);
+            metrics
+                .connect_attempt_total
+                .store(snapshot.connect_attempt_total, Ordering::Relaxed);
+            metrics
+                .backoff_total
+                .store(snapshot.backoff_total, Ordering::Relaxed);
+            metrics
+                .degraded
+                .store(u64::from(snapshot.degraded), Ordering::Relaxed);
+            snapshot.retry_after
+        } else {
+            snapshot.and_then(|snapshot| snapshot.retry_after)
+        }
+    }
+
+    async fn cleanup_entry_if_still_owned(&self, entry: &RouterListEntry) -> Result<()> {
+        let current = self.api.list_entries_by_key(&entry.key).await?;
+        let still_owned = current.iter().any(|candidate| {
+            candidate.id == entry.id
+                && candidate.key == entry.key
+                && decode_owned_comment(
+                    self.cfg.comment_prefix.as_str(),
+                    self.cfg.plugin_tag.as_str(),
+                    candidate.comment.as_deref(),
+                )
+                .is_some()
+        });
+        if still_owned {
+            self.api
+                .delete_entry_by_id(&entry.id, entry.key.family)
+                .await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn shutdown(&mut self, cleanup: bool) -> Result<()> {
@@ -1398,17 +1542,29 @@ impl AddressListManager {
         let results = join_all_bounded(
             owned
                 .iter()
-                .map(|entry| self.api.delete_entry_by_id(&entry.id, entry.key.family)),
+                .map(|entry| self.cleanup_entry_if_still_owned(entry)),
             UPSERT_PIPELINE_SIZE,
         )
         .await;
         let mut first_error = None;
+        let mut failures = 0u64;
         for result in results {
             if let Err(error) = result {
+                failures += 1;
                 first_error.get_or_insert(error);
             }
         }
+        if failures > 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .cleanup_error_total
+                    .fetch_add(failures, Ordering::Relaxed);
+            }
+            warn!(plugin = %self.cfg.plugin_tag, failures, "ros_address_list shutdown cleanup completed with failures");
+        }
         self.dynamic_refresh_cache.clear();
+        self.refresh_managed_metric();
+        self.refresh_transport_metrics().await;
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1646,6 +1802,7 @@ async fn run_manager_worker(
                 }
             },
         }
+        handle.refresh_pending_metric_with(retry_observations.len());
     }
 
     debug!(plugin = %tag, "ros_address_list manager worker exited");
@@ -1792,7 +1949,7 @@ mod observation_tests {
             fixed_ttl: Some(0),
             max_entries: 65_536,
         };
-        let handle = AddressListManagerHandle::new(&config);
+        let handle = AddressListManagerHandle::new(&config, None);
         let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         handle
             .try_observe(

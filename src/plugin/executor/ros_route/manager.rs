@@ -684,34 +684,71 @@ pub(super) struct RouteManagerHandle {
     observations: KeyedMailbox<ObservationKey, ObservationCommand>,
     controls: KeyedMailbox<ControlKey, ControlCommand>,
     policy: RouteObservationPolicy,
+    metrics: Option<Arc<RosRouteMetrics>>,
 }
 
 impl RouteManagerHandle {
-    fn new(config: &RouteManagerConfig) -> Self {
+    fn new(config: &RouteManagerConfig, metrics: Option<Arc<RosRouteMetrics>>) -> Self {
         Self {
             observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
             policy: RouteObservationPolicy::from_config(config),
+            metrics,
         }
     }
 
     #[cfg(test)]
     pub(super) fn new_for_test() -> Self {
         AppClock::start();
-        Self::new(&RouteManagerConfig {
-            plugin_tag: "test".to_string(),
-            routing_table: "main".to_string(),
-            gateway4: Some("192.0.2.1".to_string()),
-            gateway6: Some("2001:db8::1".to_string()),
-            persistent_ips: AHashSet::new(),
-            comment_prefix: "fdns".to_string(),
-            distance: 100,
-            min_ttl: 60,
-            max_ttl: 3600,
-            fixed_ttl: None,
-            conntrack_guard: false,
-            max_entries: 65_536,
-        })
+        Self::new(
+            &RouteManagerConfig {
+                plugin_tag: "test".to_string(),
+                routing_table: "main".to_string(),
+                gateway4: Some("192.0.2.1".to_string()),
+                gateway6: Some("2001:db8::1".to_string()),
+                persistent_ips: AHashSet::new(),
+                comment_prefix: "fdns".to_string(),
+                distance: 100,
+                min_ttl: 60,
+                max_ttl: 3600,
+                fixed_ttl: None,
+                conntrack_guard: false,
+                max_entries: 65_536,
+            },
+            None,
+        )
+    }
+
+    fn refresh_pending_metric(&self) {
+        self.refresh_pending_metric_with(0);
+    }
+
+    fn refresh_pending_metric_with(&self, extra: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.pending_observations.store(
+                self.observations.len().saturating_add(extra) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn record_push_result(&self, result: &std::result::Result<PushOutcome, ObserveEnqueueError>) {
+        if let Some(metrics) = &self.metrics {
+            match result {
+                Ok(PushOutcome::Coalesced) => {
+                    metrics
+                        .coalesced_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(ObserveEnqueueError::Full) => {
+                    metrics
+                        .capacity_rejected_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        self.refresh_pending_metric();
     }
 
     fn supersede_domain_observations(
@@ -720,10 +757,16 @@ impl RouteManagerHandle {
         command: &mut ObservationCommand,
     ) {
         if key.replace_scope == ObservationScope::Both {
-            for (_, mut superseded) in self
+            let superseded_commands = self
                 .observations
-                .remove_where(|queued| queued.domain == key.domain)
-            {
+                .remove_where(|queued| queued.domain == key.domain);
+            if let Some(metrics) = &self.metrics {
+                metrics.coalesced_total.fetch_add(
+                    superseded_commands.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            for (_, mut superseded) in superseded_commands {
                 command.waiters.append(&mut superseded.waiters);
             }
             return;
@@ -734,6 +777,11 @@ impl RouteManagerHandle {
             replace_scope: ObservationScope::Both,
         };
         if let Some(mut superseded) = self.observations.take(&name_level_key) {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .coalesced_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             command.waiters.append(&mut superseded.waiters);
         }
     }
@@ -754,12 +802,15 @@ impl RouteManagerHandle {
             .policy
             .command(replace_scope, addrs, negative_ttl_secs, wait);
         self.supersede_domain_observations(&key, &mut command);
-        self.observations
+        let result = self
+            .observations
             .try_push(key, command)
             .map_err(|error| match error {
                 TryPushError::Full(_) => ObserveEnqueueError::Full,
                 TryPushError::Closed(_) => ObserveEnqueueError::Closed,
-            })
+            });
+        self.record_push_result(&result);
+        result
     }
 
     pub(super) async fn observe(
@@ -778,10 +829,13 @@ impl RouteManagerHandle {
             .policy
             .command(replace_scope, addrs, negative_ttl_secs, Some(wait));
         self.supersede_domain_observations(&key, &mut command);
-        self.observations
+        let result = self
+            .observations
             .push(key, command)
             .await
-            .map_err(|_| ObserveEnqueueError::Closed)
+            .map_err(|_| ObserveEnqueueError::Closed);
+        self.record_push_result(&result);
+        result
     }
 
     pub(super) fn request_reconcile(&self) -> bool {
@@ -874,7 +928,7 @@ impl RouteManagerRuntime {
         manager: RouteManager,
         persistent_reload: Option<PersistentReloadConfig>,
     ) -> Self {
-        let handle = RouteManagerHandle::new(&manager.cfg);
+        let handle = RouteManagerHandle::new(&manager.cfg, manager.metrics.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<ShutdownRequest>();
 
         let worker_tag = tag.clone();
@@ -1064,6 +1118,38 @@ impl RouteManager {
         let mut manager = Self::new(api, cfg);
         manager.metrics = Some(metrics);
         manager
+    }
+
+    fn refresh_managed_metric(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.managed_entries.store(
+                self.routes.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    async fn refresh_transport_metrics(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        if let Some(snapshot) = self.api.transport_snapshot().await {
+            metrics.reconnect_total.store(
+                snapshot.reconnect_total,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics.connect_attempt_total.store(
+                snapshot.connect_attempt_total,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics
+                .backoff_total
+                .store(snapshot.backoff_total, std::sync::atomic::Ordering::Relaxed);
+            metrics.degraded.store(
+                u64::from(snapshot.degraded),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     async fn ensure_initialized(&mut self) -> Result<()> {
@@ -1410,6 +1496,11 @@ impl RouteManager {
             && !dedup_expiries.is_empty()
             && self.domain_bindings.len() >= self.cfg.max_entries
         {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .capacity_rejected_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             warn!(
                 plugin = %self.cfg.plugin_tag,
                 domain = %domain,
@@ -1449,6 +1540,12 @@ impl RouteManager {
             }
         }
         if capacity_dropped > 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.capacity_rejected_total.fetch_add(
+                    capacity_dropped as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             warn!(
                 plugin = %self.cfg.plugin_tag,
                 domain = %domain,
@@ -1463,6 +1560,8 @@ impl RouteManager {
             binding.last_refresh_unix = now;
             self.domain_bindings.insert(domain, binding);
         }
+
+        self.refresh_managed_metric();
 
         touched_keys.into_iter().collect()
     }
@@ -2616,18 +2715,91 @@ impl RouteManager {
     }
 
     pub(super) async fn reconcile(&mut self) -> Result<()> {
-        self.prune_expired_local_state(unix_now());
-        self.ensure_initialized().await?;
-        self.ensure_persistent_routes(unix_now());
-        self.reconcile_from_router().await?;
-        Ok(())
+        let result = async {
+            self.prune_expired_local_state(unix_now());
+            self.ensure_initialized().await?;
+            self.ensure_persistent_routes(unix_now());
+            self.reconcile_from_router().await
+        }
+        .await;
+        if let Some(metrics) = &self.metrics {
+            if result.is_ok() {
+                metrics
+                    .last_reconcile_success_timestamp_seconds
+                    .store(unix_now(), std::sync::atomic::Ordering::Relaxed);
+            } else {
+                metrics
+                    .reconcile_error_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.refresh_managed_metric();
+        self.refresh_transport_metrics().await;
+        result
     }
 
     async fn transport_retry_delay(&self) -> Option<Duration> {
-        self.api
-            .transport_snapshot()
-            .await
-            .and_then(|snapshot| snapshot.retry_after)
+        let snapshot = self.api.transport_snapshot().await;
+        if let (Some(metrics), Some(snapshot)) = (&self.metrics, snapshot) {
+            metrics.reconnect_total.store(
+                snapshot.reconnect_total,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics.connect_attempt_total.store(
+                snapshot.connect_attempt_total,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics
+                .backoff_total
+                .store(snapshot.backoff_total, std::sync::atomic::Ordering::Relaxed);
+            metrics.degraded.store(
+                u64::from(snapshot.degraded),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            snapshot.retry_after
+        } else {
+            snapshot.and_then(|snapshot| snapshot.retry_after)
+        }
+    }
+
+    async fn cleanup_route_if_still_owned(&self, route: &RouterRoute) -> Result<()> {
+        let comment = route.comment.as_deref().unwrap_or_default();
+        let still_owned = if owned_comment_has_kind(
+            &self.cfg.comment_prefix,
+            &self.cfg.plugin_tag,
+            comment,
+            COMMENT_KIND_GATEWAY_CHECK,
+        ) {
+            self.api
+                .list_managed_routes(
+                    &self.cfg.routing_table,
+                    self.cfg.gateway4.is_some(),
+                    self.cfg.gateway6.is_some(),
+                )
+                .await?
+                .into_iter()
+                .any(|candidate| candidate.id == route.id && candidate.comment == route.comment)
+        } else {
+            let Some((ip, prefix)) = parse_dst_address(&route.dst_address) else {
+                return Ok(());
+            };
+            let Some(key) = RouteKey::new_with_prefix(ip, prefix, route.routing_table.clone())
+            else {
+                return Ok(());
+            };
+            self.api
+                .find_route(&key, &self.cfg.comment_prefix, &self.cfg.plugin_tag)
+                .await?
+                .is_some_and(|candidate| {
+                    candidate.id == route.id
+                        && candidate.dst_address == route.dst_address
+                        && candidate.comment == route.comment
+                })
+        };
+        if still_owned {
+            self.api.delete_route_by_id(&route.id, route.family).await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn shutdown(&mut self, cleanup: bool) -> Result<()> {
@@ -2676,19 +2848,31 @@ impl RouteManager {
         let results = join_all_bounded(
             owned
                 .iter()
-                .map(|route| self.api.delete_route_by_id(&route.id, route.family)),
+                .map(|route| self.cleanup_route_if_still_owned(route)),
             UPSERT_PIPELINE_SIZE,
         )
         .await;
         let mut first_error = None;
+        let mut failures = 0u64;
         for result in results {
             if let Err(error) = result {
+                failures += 1;
                 first_error.get_or_insert(error);
             }
+        }
+        if failures > 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .cleanup_error_total
+                    .fetch_add(failures, std::sync::atomic::Ordering::Relaxed);
+            }
+            warn!(plugin = %self.cfg.plugin_tag, failures, "ros_route shutdown cleanup completed with failures");
         }
         self.routes.clear();
         self.domain_bindings.clear();
         self.connection_retry_after.clear();
+        self.refresh_managed_metric();
+        self.refresh_transport_metrics().await;
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -2849,21 +3033,20 @@ async fn run_manager_worker(
                         );
                     }
                 }
-                ControlCommand::Reconcile => {
-                    if let Err(e) = manager.reconcile().await
-                        && error_logs.should_log("reconcile")
-                    {
+                ControlCommand::Reconcile => match manager.reconcile().await {
+                    Ok(()) => debug!(plugin = %tag, "ros_route reconcile completed"),
+                    Err(e) if error_logs.should_log("reconcile") => {
                         warn!(
                             plugin = %tag,
                             err = %e,
                             "ros_route periodic reconcile failed"
                         );
-                    } else {
-                        debug!(plugin = %tag, "ros_route reconcile completed");
                     }
-                }
+                    Err(_) => {}
+                },
             },
         }
+        handle.refresh_pending_metric_with(usize::from(retry_observation.is_some()));
     }
 
     debug!(plugin = %tag, "ros_route manager worker exited");
@@ -3205,6 +3388,7 @@ mod tests {
         connection_queries: Vec<(RouteFamily, Vec<IpAddr>)>,
         fail_connection_check: bool,
         fail_healthcheck: bool,
+        convert_owned_to_foreign_after_list: bool,
     }
 
     #[derive(Debug, Default)]
@@ -3300,7 +3484,14 @@ mod tests {
                 return Err(DnsError::plugin("mock route scan failure"));
             }
             state.list_requirements.push((require_ipv4, require_ipv6));
-            Ok(state.routes.clone())
+            let routes = state.routes.clone();
+            if state.convert_owned_to_foreign_after_list {
+                state.convert_owned_to_foreign_after_list = false;
+                if let Some(route) = state.routes.first_mut() {
+                    route.comment = Some("operator-owned".to_string());
+                }
+            }
+            Ok(routes)
         }
 
         async fn find_route(
@@ -4467,6 +4658,26 @@ mod tests {
             vec!["*owned".to_string(), "*gateway-check".to_string()]
         );
         assert!(state.upsert_attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_revalidates_route_ownership_before_delete() {
+        let key = RouteKey::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99)),
+            "via_proxy".to_string(),
+        );
+        let api = Arc::new(MockApi::with_state(MockApiState {
+            routes: vec![owned_router_route("*ownership-race", &key)],
+            convert_owned_to_foreign_after_list: true,
+            ..MockApiState::default()
+        }));
+        let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
+
+        manager.shutdown(true).await.unwrap();
+
+        let state = api.state.lock().expect("mock lock");
+        assert!(state.deleted_ids.is_empty());
+        assert_eq!(state.routes[0].comment.as_deref(), Some("operator-owned"));
     }
 
     #[tokio::test]

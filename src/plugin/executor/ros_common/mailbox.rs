@@ -140,6 +140,9 @@ where
         }
     }
 
+    // Used by ros_address_list batching; it is intentionally unused in a
+    // minimal build that enables only ros_route.
+    #[allow(dead_code)]
     pub(crate) fn try_recv(&self) -> Option<(K, V)> {
         let mut state = self
             .inner
@@ -171,6 +174,9 @@ where
     }
 
     /// Remove every queued item whose key matches a superseding observation.
+    // Used by ros_route scope supersession; it is intentionally unused in a
+    // minimal build that enables only ros_address_list.
+    #[allow(dead_code)]
     pub(crate) fn remove_where(&self, mut predicate: impl FnMut(&K) -> bool) -> Vec<(K, V)> {
         let mut state = self
             .inner
@@ -242,9 +248,6 @@ where
         self.inner.space_ready.notify_one();
     }
 
-    // Also used by the plugin pending-observation gauges in the final metrics
-    // wiring stage; tests exercise it before that wiring is installed.
-    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.inner
             .state

@@ -80,7 +80,7 @@ It is better suited for users who want explicit control over DNS behavior, rathe
 | Matchers | `qname`, `question`, `qtype`, `qclass`, `client_ip`, `resp_ip`, `rcode`, `time`, `rate_limiter`, and more |
 | Data sets | `domain_set`, `dynamic_domain_set`, `ip_set`, `geoip`, `geosite`, `adguard_rule` |
 | Outbound networking | `network.outbound` centralizes nameservers and SOCKS5 settings for HTTP downloads, upgrade checks, webhooks, and upstreams |
-| System integrations | `ipset`, `nftset`, `ros_address_list`, `ros_route` (with bounded local state via `max_entries`), `reverse_lookup` |
+| System integrations | `ipset`, `nftset`, `ros_address_list`, `ros_route` (both support TLS and bounded dynamic state via `max_entries`), `reverse_lookup` |
 | Debugging and operations | Health checks, config validation, hot reload, query records, Prometheus plugin metrics, real-time logs |
 | Deployment | Multi-platform builds, Debian packages, OpenWrt LuCI app, standalone WebUI hosting, service installation |
 

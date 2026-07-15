@@ -756,6 +756,12 @@ GET /api/plugins/reverse_lookup_main?ip=8.8.8.8
 * `ros_address_list_dropped_total`
 * `ros_address_list_sync_error_total`
 * `ros_address_list_sync_timeout_total`
+* `ros_address_list_pending_observations` / `ros_address_list_managed_entries`
+* `ros_address_list_coalesced_total` / `ros_address_list_capacity_rejected_total`
+* `ros_address_list_reconnect_total` / `ros_address_list_connect_attempt_total` / `ros_address_list_backoff_total`
+* `ros_address_list_reconcile_error_total` / `ros_address_list_last_reconcile_success_timestamp_seconds`
+* `ros_address_list_degraded` / `ros_address_list_cleanup_error_total`
+* `ros_route_*` 提供对应的 route manager 指标，并保留 conntrack 延迟/错误计数。
 * `reverse_lookup_ptr_hit_total`
 * `reverse_lookup_ptr_miss_total`
 * `reverse_lookup_cache_insert_total`

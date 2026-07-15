@@ -274,7 +274,6 @@ pub(crate) type RouterOsResult<T> = std::result::Result<T, RouterOsError>;
 
 /// Lock-free counters plus retry state exposed to plugin metrics and workers.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct RouterOsTransportSnapshot {
     pub(crate) reconnect_total: u64,
     pub(crate) backoff_total: u64,

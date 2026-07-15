@@ -629,6 +629,18 @@ function ConfigFieldControl({
           disabled={readOnly}
         />
       );
+    case "password":
+      return (
+        <Input
+          type="password"
+          value={(value as string) || ""}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={defaultPlaceholder}
+          className="font-mono text-sm"
+          disabled={readOnly}
+          autoComplete="new-password"
+        />
+      );
     case "time":
       return (
         <Input

@@ -65,6 +65,7 @@ export interface PluginKindDefinition {
 }
 export type ConfigFieldType =
   | "text"
+  | "password"
   | "time"
   | "number"
   | "select"
