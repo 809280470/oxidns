@@ -1746,8 +1746,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 [[package]]
 name = "mikrotik-proto"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4bfa65d096fee86dd1f27c579bc729d4fdb0b1bfee24e2fc71acd0a8349e836"
+source = "git+https://github.com/svenshi/mikrotik-rs.git?branch=fix%2Ftokio-unbounded-response-channel#4b525bba941d136d80804d300159978f4434496d"
 dependencies = [
  "hashbrown 0.17.1",
  "thiserror 2.0.18",
@@ -1767,8 +1766,7 @@ dependencies = [
 [[package]]
 name = "mikrotik-tokio"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a223d8a1a4e0646071ed7afc8a7d59edb7e14af3471713e2def2838025cde101"
+source = "git+https://github.com/svenshi/mikrotik-rs.git?branch=fix%2Ftokio-unbounded-response-channel#4b525bba941d136d80804d300159978f4434496d"
 dependencies = [
  "mikrotik-proto",
  "rustls",

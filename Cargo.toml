@@ -108,6 +108,12 @@ zoneparser = { package = "oxidns-zoneparser", version = "0.1.1", path = "crates/
 # Service management
 service-manager = "0.11.0"
 
+# Use the forked Tokio transport until the response-channel fix is
+# released upstream.
+[patch.crates-io]
+mikrotik-proto = { git = "https://github.com/svenshi/mikrotik-rs.git", branch = "fix/tokio-unbounded-response-channel", package = "mikrotik-proto" }
+mikrotik-tokio = { git = "https://github.com/svenshi/mikrotik-rs.git", branch = "fix/tokio-unbounded-response-channel", package = "mikrotik-tokio" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 ripset = { package = "oxidns-ripset", version = "0.1.2", path = "crates/ripset", optional = true }
 

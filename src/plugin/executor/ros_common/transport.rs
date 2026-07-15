@@ -519,7 +519,7 @@ pub(crate) enum RouterOsEvent {
 
 pub(crate) struct RouterOsCommandStream {
     action: String,
-    receiver: tokio::sync::mpsc::Receiver<Event>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<Event>,
     generation: u64,
     transport: RouterOsTransport,
     completed: bool,
@@ -677,7 +677,7 @@ mod tests {
     #[tokio::test]
     async fn response_channel_close_before_terminal_event_is_an_error() {
         let transport = RouterOsTransport::new(RouterOsConnectionConfig::plaintext_for_test());
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(sender);
         let mut stream = RouterOsCommandStream {
             action: "test command".to_string(),
@@ -694,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn trap_preserves_connection_state_and_missing_item_category() {
         let transport = RouterOsTransport::new(RouterOsConnectionConfig::plaintext_for_test());
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         sender
             .send(Event::Trap {
                 tag: Tag::default(),
@@ -704,7 +704,6 @@ mod tests {
                     message: "no such item".to_string(),
                 },
             })
-            .await
             .expect("trap event");
         let mut stream = RouterOsCommandStream {
             action: "delete".to_string(),
@@ -724,12 +723,11 @@ mod tests {
     #[tokio::test]
     async fn fatal_event_is_classified_as_connection_failure() {
         let transport = RouterOsTransport::new(RouterOsConnectionConfig::plaintext_for_test());
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         sender
             .send(Event::Fatal {
                 reason: "actor stopped".to_string(),
             })
-            .await
             .expect("fatal event");
         let mut stream = RouterOsCommandStream {
             action: "print".to_string(),
