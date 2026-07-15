@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
 use tokio::fs as tokio_fs;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::config::types::PluginConfig;
@@ -268,8 +268,8 @@ use self::api::{
     MikrotikApi, MikrotikApiTimeouts, MikrotikRsClient,
 };
 use self::manager::{
-    ManagerCommand, ObservationScope, PersistentReloadConfig, RouteManager, RouteManagerConfig,
-    RouteManagerRuntime,
+    ObservationScope, ObserveEnqueueError, PersistentReloadConfig, RouteManager,
+    RouteManagerConfig, RouteManagerHandle, RouteManagerRuntime,
 };
 use crate::plugin::executor::ros_common::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
 use crate::plugin::executor::ros_common::{
@@ -284,7 +284,7 @@ struct MikrotikExecutor {
     metrics: Arc<RosRouteMetrics>,
     config: MikrotikConfig,
     manager: Option<RouteManager>,
-    command_tx: Option<mpsc::Sender<ManagerCommand>>,
+    manager_handle: Option<RouteManagerHandle>,
     runtime: Mutex<Option<RouteManagerRuntime>>,
 }
 
@@ -306,7 +306,7 @@ struct ActiveRouteInstance {
     metrics: Arc<RosRouteMetrics>,
     /// Used to request that the prior compatible runtime immediately restore
     /// its desired RouterOS state when a replacement candidate rolls back.
-    command_tx: Option<mpsc::Sender<ManagerCommand>>,
+    manager_handle: Option<RouteManagerHandle>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -338,7 +338,7 @@ fn register_active_route_instance(
     instance_id: u64,
     namespace: RouteOwnershipNamespace,
     metrics: Arc<RosRouteMetrics>,
-    command_tx: Option<mpsc::Sender<ManagerCommand>>,
+    manager_handle: Option<RouteManagerHandle>,
 ) -> Result<()> {
     register_metric_source(metrics.clone())?;
     let mut active = active_route_instances()
@@ -351,7 +351,7 @@ fn register_active_route_instance(
             instance_id,
             namespace,
             metrics,
-            command_tx,
+            manager_handle,
         });
     Ok(())
 }
@@ -399,7 +399,7 @@ fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
                     .iter()
                     .rev()
                     .find(|instance| instance.namespace == removed.namespace)
-                    .and_then(|instance| instance.command_tx.clone())
+                    .and_then(|instance| instance.manager_handle.clone())
             })
             .flatten();
         let remove_metric = was_metric_owner && is_last;
@@ -419,8 +419,8 @@ fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
     } else if remove_metric {
         unregister_metric_source(tag);
     }
-    if let Some(tx) = restore_tx
-        && tx.try_send(ManagerCommand::Reconcile).is_err()
+    if let Some(handle) = restore_tx
+        && !handle.request_reconcile()
     {
         warn!(
             plugin = %tag,
@@ -501,7 +501,7 @@ impl Plugin for MikrotikExecutor {
     }
 
     async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
-        if self.manager.is_none() || self.command_tx.is_some() {
+        if self.manager.is_none() || self.manager_handle.is_some() {
             return Ok(());
         }
 
@@ -517,8 +517,8 @@ impl Plugin for MikrotikExecutor {
             gateway6_enabled: self.config.gateway6.is_some(),
         });
         let runtime = RouteManagerRuntime::start(self.tag.clone(), manager, persistent_reload);
-        let command_tx = runtime.sender();
-        self.command_tx = Some(command_tx.clone());
+        let manager_handle = runtime.handle();
+        self.manager_handle = Some(manager_handle.clone());
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = Some(runtime);
         }
@@ -527,7 +527,7 @@ impl Plugin for MikrotikExecutor {
             self.instance_id,
             RouteOwnershipNamespace::from_config(&self.config),
             self.metrics.clone(),
-            Some(command_tx),
+            Some(manager_handle),
         )?;
         self.active_registered.store(true, Ordering::Release);
         Ok(())
@@ -564,7 +564,7 @@ impl Executor for MikrotikExecutor {
         if !self.active_registered.load(Ordering::Acquire) {
             return Ok(step);
         }
-        let Some(tx) = self.command_tx.as_ref() else {
+        let Some(handle) = self.manager_handle.as_ref() else {
             return Ok(step);
         };
 
@@ -580,22 +580,16 @@ impl Executor for MikrotikExecutor {
         self.metrics.observe_total.fetch_add(1, Ordering::Relaxed);
 
         if self.config.async_mode {
-            match tx.try_send(ManagerCommand::ObserveDomain {
-                domain,
-                replace_scope,
-                addrs,
-                negative_ttl_secs,
-                wait: None,
-            }) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
+            match handle.try_observe(domain, replace_scope, addrs, negative_ttl_secs, None) {
+                Ok(_) => {}
+                Err(ObserveEnqueueError::Full) => {
                     self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         plugin = %self.tag,
                         "ros_route observe queue is full, observation dropped"
                     );
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(ObserveEnqueueError::Closed) => {
                     self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         plugin = %self.tag,
@@ -607,17 +601,14 @@ impl Executor for MikrotikExecutor {
         }
 
         let (wait_tx, wait_rx) = oneshot::channel::<Result<()>>();
-        let send_cmd = ManagerCommand::ObserveDomain {
-            domain,
-            replace_scope,
-            addrs,
-            negative_ttl_secs,
-            wait: Some(wait_tx),
-        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS);
-        let send_outcome = tokio::time::timeout_at(deadline, tx.send(send_cmd)).await;
+        let send_outcome = tokio::time::timeout_at(
+            deadline,
+            handle.observe(domain, replace_scope, addrs, negative_ttl_secs, wait_tx),
+        )
+        .await;
         match send_outcome {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(_)) => {
                 self.metrics
                     .sync_error_total
@@ -721,7 +712,7 @@ impl PluginFactory for MikrotikFactory {
             metrics,
             config,
             manager: Some(manager),
-            command_tx: None,
+            manager_handle: None,
             runtime: Mutex::new(None),
         })))
     }
@@ -1442,14 +1433,14 @@ routing_table: "policy"
             routing_table: "policy".to_string(),
             comment_prefix: "fdns".to_string(),
         };
-        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let old_handle = RouteManagerHandle::new();
 
         register_active_route_instance(
             &tag,
             sequence,
             namespace.clone(),
             Arc::new(RosRouteMetrics::new(tag.clone())),
-            Some(old_tx),
+            Some(old_handle.clone()),
         )
         .expect("old runtime");
         register_active_route_instance(
@@ -1462,7 +1453,7 @@ routing_table: "policy"
         .expect("candidate runtime");
 
         assert!(!release_active_route_instance(&tag, sequence + 1));
-        assert!(matches!(old_rx.try_recv(), Ok(ManagerCommand::Reconcile)));
+        assert!(old_handle.take_reconcile_for_test());
         assert!(release_active_route_instance(&tag, sequence));
     }
 }

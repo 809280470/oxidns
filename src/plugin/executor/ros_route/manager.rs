@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ahash::{AHashMap, AHashSet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -22,6 +22,9 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::task as task_center;
 use crate::plugin::executor::ros_common::ObservedAddr;
+use crate::plugin::executor::ros_common::mailbox::{
+    Coalesce, KeyedMailbox, PushOutcome, TryPushError,
+};
 
 const ROUTE_DEFAULT_V4: &str = "0.0.0.0/0";
 const ROUTE_DEFAULT_V6: &str = "::/0";
@@ -30,6 +33,7 @@ const ROUTE_PREFIX_V6: u8 = 128;
 const PERSISTENT_COMMENT_DOMAIN: &str = "persistent";
 const PERSISTENT_EXPIRES_AT_UNIX: u64 = u64::MAX;
 const MANAGER_QUEUE_SIZE: usize = 1024;
+const CONTROL_QUEUE_SIZE: usize = 3;
 const MAX_PENDING_OBSERVATIONS: usize = MANAGER_QUEUE_SIZE;
 const SWEEP_INTERVAL_SECS: u64 = 30;
 const RECONCILE_INTERVAL_SECS: u64 = 180;
@@ -537,20 +541,157 @@ struct PendingObservedAddr {
     replay_until_unix: u64,
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct ObservationKey {
+    domain: String,
+    replace_scope: ObservationScope,
+}
+
 #[derive(Debug)]
-pub(super) enum ManagerCommand {
-    ObserveDomain {
+struct ObservationCommand {
+    addrs: Vec<ObservedAddr>,
+    negative_ttl_secs: Option<u32>,
+    waiters: Vec<oneshot::Sender<Result<()>>>,
+}
+
+impl Coalesce for ObservationCommand {
+    fn coalesce(&mut self, mut newer: Self) {
+        newer.waiters.append(&mut self.waiters);
+        *self = newer;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+enum ControlKey {
+    UpdatePersistentIps,
+    Sweep,
+    Reconcile,
+}
+
+#[derive(Debug)]
+enum ControlCommand {
+    UpdatePersistentIps { ips: AHashSet<String> },
+    Sweep,
+    Reconcile,
+}
+
+impl Coalesce for ControlCommand {
+    fn coalesce(&mut self, newer: Self) {
+        *self = newer;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum ObserveEnqueueError {
+    Full,
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RouteManagerHandle {
+    observations: KeyedMailbox<ObservationKey, ObservationCommand>,
+    controls: KeyedMailbox<ControlKey, ControlCommand>,
+}
+
+impl RouteManagerHandle {
+    pub(super) fn new() -> Self {
+        Self {
+            observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
+            controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
+        }
+    }
+
+    pub(super) fn try_observe(
+        &self,
         domain: String,
         replace_scope: ObservationScope,
         addrs: Vec<ObservedAddr>,
         negative_ttl_secs: Option<u32>,
         wait: Option<oneshot::Sender<Result<()>>>,
-    },
-    UpdatePersistentIps {
-        ips: AHashSet<String>,
-    },
-    Sweep,
-    Reconcile,
+    ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
+        let key = ObservationKey {
+            domain,
+            replace_scope,
+        };
+        self.observations
+            .try_push(
+                key,
+                ObservationCommand {
+                    addrs,
+                    negative_ttl_secs,
+                    waiters: wait.into_iter().collect(),
+                },
+            )
+            .map_err(|error| match error {
+                TryPushError::Full(_) => ObserveEnqueueError::Full,
+                TryPushError::Closed(_) => ObserveEnqueueError::Closed,
+            })
+    }
+
+    pub(super) async fn observe(
+        &self,
+        domain: String,
+        replace_scope: ObservationScope,
+        addrs: Vec<ObservedAddr>,
+        negative_ttl_secs: Option<u32>,
+        wait: oneshot::Sender<Result<()>>,
+    ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
+        let key = ObservationKey {
+            domain,
+            replace_scope,
+        };
+        self.observations
+            .push(
+                key,
+                ObservationCommand {
+                    addrs,
+                    negative_ttl_secs,
+                    waiters: vec![wait],
+                },
+            )
+            .await
+            .map_err(|_| ObserveEnqueueError::Closed)
+    }
+
+    pub(super) fn request_reconcile(&self) -> bool {
+        self.controls
+            .try_push(ControlKey::Reconcile, ControlCommand::Reconcile)
+            .is_ok()
+    }
+
+    fn request_sweep(&self) {
+        let _ = self
+            .controls
+            .try_push(ControlKey::Sweep, ControlCommand::Sweep);
+    }
+
+    fn update_persistent_ips(&self, ips: AHashSet<String>) -> bool {
+        self.controls
+            .try_push(
+                ControlKey::UpdatePersistentIps,
+                ControlCommand::UpdatePersistentIps { ips },
+            )
+            .is_ok()
+    }
+
+    fn close(&self) {
+        self.observations.close();
+        self.controls.close();
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_reconcile_for_test(&self) -> bool {
+        matches!(
+            self.controls.try_recv(),
+            Some((ControlKey::Reconcile, ControlCommand::Reconcile))
+        )
+    }
+}
+
+#[derive(Debug)]
+enum WorkerCommand {
+    Observe(ObservationKey, ObservationCommand),
+    Control(ControlCommand),
 }
 
 #[derive(Debug)]
@@ -575,7 +716,7 @@ pub(super) struct PersistentReloadConfig {
 
 #[derive(Debug)]
 pub(super) struct RouteManagerRuntime {
-    tx: mpsc::Sender<ManagerCommand>,
+    handle: RouteManagerHandle,
     shutdown_tx: Option<oneshot::Sender<ShutdownRequest>>,
     worker_handle: Option<JoinHandle<()>>,
     sweep_task_id: Option<u64>,
@@ -589,38 +730,39 @@ impl RouteManagerRuntime {
         manager: RouteManager,
         persistent_reload: Option<PersistentReloadConfig>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<ManagerCommand>(MANAGER_QUEUE_SIZE);
+        let handle = RouteManagerHandle::new();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<ShutdownRequest>();
 
         let worker_tag = tag.clone();
+        let worker_mailbox = handle.clone();
         let worker_handle = Some(tokio::spawn(async move {
-            run_manager_worker(worker_tag, manager, rx, shutdown_rx).await;
+            run_manager_worker(worker_tag, manager, worker_mailbox, shutdown_rx).await;
         }));
 
         // RouterOS validation and the initial table scan intentionally happen
         // on the background manager. They must never delay DNS startup.
-        let _ = tx.try_send(ManagerCommand::Reconcile);
+        handle.request_reconcile();
 
-        let sweep_tx = tx.clone();
+        let sweep_handle = handle.clone();
         let sweep_task_id = Some(task_center::spawn_fixed(
             format!("ros_route:{}:sweep", tag),
             Duration::from_secs(SWEEP_INTERVAL_SECS),
             move || {
-                let sweep_tx = sweep_tx.clone();
+                let sweep_handle = sweep_handle.clone();
                 async move {
-                    let _ = sweep_tx.send(ManagerCommand::Sweep).await;
+                    sweep_handle.request_sweep();
                 }
             },
         ));
 
-        let reconcile_tx = tx.clone();
+        let reconcile_handle = handle.clone();
         let reconcile_task_id = Some(task_center::spawn_fixed(
             format!("ros_route:{}:reconcile", tag),
             Duration::from_secs(RECONCILE_INTERVAL_SECS),
             move || {
-                let reconcile_tx = reconcile_tx.clone();
+                let reconcile_handle = reconcile_handle.clone();
                 async move {
-                    let _ = reconcile_tx.send(ManagerCommand::Reconcile).await;
+                    reconcile_handle.request_reconcile();
                 }
             },
         ));
@@ -630,14 +772,14 @@ impl RouteManagerRuntime {
                 return None;
             }
 
-            let maintain_tx = tx.clone();
+            let maintain_handle = handle.clone();
             let maintain_tag = tag.clone();
             let last_loaded_ips = Arc::new(tokio::sync::Mutex::new(reload_cfg.initial_ips.clone()));
             Some(task_center::spawn_fixed(
                 format!("ros_route:{}:persistent_reload", maintain_tag),
                 Duration::from_secs(PERSISTENT_RELOAD_INTERVAL_SECS),
                 move || {
-                    let maintain_tx = maintain_tx.clone();
+                    let maintain_handle = maintain_handle.clone();
                     let maintain_tag = maintain_tag.clone();
                     let last_loaded_ips = last_loaded_ips.clone();
                     let reload_cfg = reload_cfg.clone();
@@ -671,12 +813,7 @@ impl RouteManagerRuntime {
                                 let mut last_loaded_guard = last_loaded_ips.lock().await;
                                 let manager_available = if desired_ips != *last_loaded_guard {
                                     *last_loaded_guard = desired_ips.clone();
-                                    maintain_tx
-                                        .send(ManagerCommand::UpdatePersistentIps {
-                                            ips: desired_ips.clone(),
-                                        })
-                                        .await
-                                        .is_ok()
+                                    maintain_handle.update_persistent_ips(desired_ips.clone())
                                 } else {
                                     true
                                 };
@@ -684,7 +821,7 @@ impl RouteManagerRuntime {
                                 // Dedicated tick keeps persistent routes self-healed
                                 // without requiring new DNS observations.
                                 if manager_available {
-                                    let _ = maintain_tx.send(ManagerCommand::Reconcile).await;
+                                    maintain_handle.request_reconcile();
                                 }
                             }
                             Err(e) => {
@@ -701,7 +838,7 @@ impl RouteManagerRuntime {
         });
 
         Self {
-            tx,
+            handle,
             shutdown_tx: Some(shutdown_tx),
             worker_handle,
             sweep_task_id,
@@ -711,8 +848,8 @@ impl RouteManagerRuntime {
     }
 
     #[inline]
-    pub(super) fn sender(&self) -> mpsc::Sender<ManagerCommand> {
-        self.tx.clone()
+    pub(super) fn handle(&self) -> RouteManagerHandle {
+        self.handle.clone()
     }
 
     pub(super) async fn shutdown(mut self, cleanup: bool) {
@@ -737,6 +874,7 @@ impl RouteManagerRuntime {
             })
             .is_ok()
         });
+        self.handle.close();
         if shutdown_requested {
             // `cleanup_on_shutdown` is an explicit ownership contract. Route
             // deletion is serialized and can legitimately take longer than a
@@ -2350,40 +2488,62 @@ fn select_comment_domain(domains: &AHashSet<String>, persistent: bool) -> String
 async fn run_manager_worker(
     tag: String,
     mut manager: RouteManager,
-    mut rx: mpsc::Receiver<ManagerCommand>,
+    handle: RouteManagerHandle,
     mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
 ) {
     // Single-owner event loop for route state.
     // All cross-map updates are serialized here to keep transitions deterministic.
+    let mut prefer_control = true;
     loop {
-        let command = tokio::select! {
-            biased;
-            shutdown = &mut shutdown_rx => {
-                if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
-                    if let Err(e) = manager.shutdown(cleanup).await {
-                        warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
+        let command = if prefer_control {
+            tokio::select! {
+                biased;
+                shutdown = &mut shutdown_rx => {
+                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
+                        if let Err(e) = manager.shutdown(cleanup).await {
+                            warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
+                        }
+                        let _ = done.send(());
                     }
-                    let _ = done.send(());
-                }
-                break;
-            }
-            command = rx.recv() => {
-                let Some(command) = command else {
                     break;
-                };
-                command
+                }
+                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+                observation = handle.observations.recv() => observation.map(|(key, command)| WorkerCommand::Observe(key, command)),
             }
+        } else {
+            tokio::select! {
+                biased;
+                shutdown = &mut shutdown_rx => {
+                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
+                        if let Err(e) = manager.shutdown(cleanup).await {
+                            warn!(plugin = %tag, err = %e, "ros_route shutdown cleanup failed");
+                        }
+                        let _ = done.send(());
+                    }
+                    break;
+                }
+                observation = handle.observations.recv() => observation.map(|(key, command)| WorkerCommand::Observe(key, command)),
+                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+            }
+        };
+        let Some(command) = command else {
+            break;
         };
 
         match command {
-            ManagerCommand::ObserveDomain {
-                domain,
-                replace_scope,
-                addrs,
-                negative_ttl_secs,
-                wait,
-            } => {
-                let wait_for_sync = wait.is_some();
+            WorkerCommand::Observe(
+                ObservationKey {
+                    domain,
+                    replace_scope,
+                },
+                ObservationCommand {
+                    addrs,
+                    negative_ttl_secs,
+                    waiters,
+                },
+            ) => {
+                prefer_control = true;
+                let wait_for_sync = !waiters.is_empty();
                 let result = manager
                     .observe_domain(
                         domain,
@@ -2393,47 +2553,57 @@ async fn run_manager_worker(
                         wait_for_sync,
                     )
                     .await;
-                match (wait, result) {
-                    (Some(ch), outcome) => {
-                        let _ = ch.send(outcome);
-                    }
-                    (None, Ok(())) => {}
-                    (None, Err(e)) => {
+                if waiters.is_empty() {
+                    if let Err(e) = result {
                         warn!(
                             plugin = %tag,
                             err = %e,
                             "ros_route observe failed in async mode"
                         );
                     }
-                }
-            }
-            ManagerCommand::Sweep => {
-                if let Err(e) = manager.sweep().await {
-                    warn!(
-                        plugin = %tag,
-                        err = %e,
-                        "ros_route periodic sweep failed"
-                    );
-                }
-            }
-            ManagerCommand::UpdatePersistentIps { ips } => {
-                if let Err(e) = manager.update_persistent_ips(ips).await {
-                    warn!(
-                        plugin = %tag,
-                        err = %e,
-                        "ros_route persistent route maintenance failed"
-                    );
-                }
-            }
-            ManagerCommand::Reconcile => {
-                if let Err(e) = manager.reconcile().await {
-                    warn!(
-                        plugin = %tag,
-                        err = %e,
-                        "ros_route periodic reconcile failed"
-                    );
                 } else {
-                    debug!(plugin = %tag, "ros_route reconcile completed");
+                    let outcome = result.map_err(|error| error.to_string());
+                    for waiter in waiters {
+                        let result = outcome
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|message| DnsError::plugin(message.clone()));
+                        let _ = waiter.send(result);
+                    }
+                }
+            }
+            WorkerCommand::Control(command) => {
+                prefer_control = false;
+                match command {
+                    ControlCommand::Sweep => {
+                        if let Err(e) = manager.sweep().await {
+                            warn!(
+                                plugin = %tag,
+                                err = %e,
+                                "ros_route periodic sweep failed"
+                            );
+                        }
+                    }
+                    ControlCommand::UpdatePersistentIps { ips } => {
+                        if let Err(e) = manager.update_persistent_ips(ips).await {
+                            warn!(
+                                plugin = %tag,
+                                err = %e,
+                                "ros_route persistent route maintenance failed"
+                            );
+                        }
+                    }
+                    ControlCommand::Reconcile => {
+                        if let Err(e) = manager.reconcile().await {
+                            warn!(
+                                plugin = %tag,
+                                err = %e,
+                                "ros_route periodic reconcile failed"
+                            );
+                        } else {
+                            debug!(plugin = %tag, "ros_route reconcile completed");
+                        }
+                    }
                 }
             }
         }
@@ -2513,6 +2683,73 @@ mod tests {
     use super::*;
     use crate::plugin::executor::ros_route::api::RouterRoute;
 
+    #[tokio::test]
+    async fn observation_mailbox_replaces_same_domain_and_scope_with_latest_state() {
+        let handle = RouteManagerHandle::new();
+        let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let latest_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let (first_wait, _first_rx) = oneshot::channel();
+        let (latest_wait, _latest_rx) = oneshot::channel();
+
+        assert_eq!(
+            handle
+                .try_observe(
+                    "busy.example.".to_string(),
+                    ObservationScope::Ipv4,
+                    vec![ObservedAddr {
+                        addr: first_ip,
+                        ttl_secs: 60,
+                    }],
+                    None,
+                    Some(first_wait),
+                )
+                .expect("first observation"),
+            PushOutcome::Inserted
+        );
+        assert_eq!(
+            handle
+                .try_observe(
+                    "busy.example.".to_string(),
+                    ObservationScope::Ipv4,
+                    vec![ObservedAddr {
+                        addr: latest_ip,
+                        ttl_secs: 300,
+                    }],
+                    None,
+                    Some(latest_wait),
+                )
+                .expect("replacement observation"),
+            PushOutcome::Coalesced
+        );
+
+        let (_, queued) = handle
+            .observations
+            .recv()
+            .await
+            .expect("queued observation");
+        assert_eq!(queued.addrs.len(), 1);
+        assert_eq!(queued.addrs[0].addr, latest_ip);
+        assert_eq!(queued.addrs[0].ttl_secs, 300);
+        assert_eq!(queued.waiters.len(), 2);
+    }
+
+    #[test]
+    fn observation_mailbox_keeps_address_family_scopes_distinct() {
+        let handle = RouteManagerHandle::new();
+        for scope in [ObservationScope::Ipv4, ObservationScope::Ipv6] {
+            handle
+                .try_observe(
+                    "dual.example.".to_string(),
+                    scope,
+                    Vec::new(),
+                    Some(60),
+                    None,
+                )
+                .expect("family observation");
+        }
+
+        assert_eq!(handle.observations.len(), 2);
+    }
     #[derive(Debug)]
     struct NoopApi;
 
@@ -3670,19 +3907,20 @@ mod tests {
         let api = Arc::new(MockApi::default());
         let mut manager = RouteManager::new(api.clone(), manager_config(Some(300)));
         manager.initialized = true;
-        let (tx, rx) = mpsc::channel(MANAGER_QUEUE_SIZE);
+        let handle = RouteManagerHandle::new();
         for index in 0..8 {
-            tx.try_send(ManagerCommand::ObserveDomain {
-                domain: format!("queued-{index}.example."),
-                replace_scope: ObservationScope::Ipv4,
-                addrs: vec![ObservedAddr {
-                    addr: ip,
-                    ttl_secs: 60,
-                }],
-                negative_ttl_secs: None,
-                wait: None,
-            })
-            .expect("queue observation");
+            handle
+                .try_observe(
+                    format!("queued-{index}.example."),
+                    ObservationScope::Ipv4,
+                    vec![ObservedAddr {
+                        addr: ip,
+                        ttl_secs: 60,
+                    }],
+                    None,
+                    None,
+                )
+                .expect("queue observation");
         }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (done_tx, done_rx) = oneshot::channel();
@@ -3693,7 +3931,7 @@ mod tests {
             })
             .expect("signal shutdown");
 
-        run_manager_worker("route-test".to_string(), manager, rx, shutdown_rx).await;
+        run_manager_worker("route-test".to_string(), manager, handle, shutdown_rx).await;
         done_rx.await.expect("shutdown acknowledgement");
 
         assert!(

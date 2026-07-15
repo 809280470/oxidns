@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -28,13 +28,17 @@ use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::task as task_center;
 use crate::plugin::executor::ros_common::ObservedAddr;
+use crate::plugin::executor::ros_common::mailbox::{
+    Coalesce, KeyedMailbox, PushOutcome, TryPushError,
+};
 
 /// Host prefix used for normalized IPv4 single-address entries.
 const HOST_PREFIX_V4: u8 = 32;
 /// Host prefix used for normalized IPv6 single-address entries.
 const HOST_PREFIX_V6: u8 = 128;
-/// Capacity of the manager command channel.
+/// Maximum number of distinct domains waiting for manager processing.
 const MANAGER_QUEUE_SIZE: usize = 1024;
+const CONTROL_QUEUE_SIZE: usize = 2;
 /// Periodic interval for persistent desired-set reconciliation.
 const RECONCILE_INTERVAL_SECS: u64 = 180;
 /// Periodic interval for local dynamic-cache pruning.
@@ -235,24 +239,132 @@ pub(super) struct AddressListManagerConfig {
 }
 
 #[derive(Debug)]
-pub(super) enum ManagerCommand {
-    ObserveDomain {
+struct ObservationCommand {
+    addrs: Vec<ObservedAddr>,
+    waiters: Vec<oneshot::Sender<Result<()>>>,
+}
+
+impl Coalesce for ObservationCommand {
+    fn coalesce(&mut self, mut newer: Self) {
+        newer.waiters.append(&mut self.waiters);
+        *self = newer;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+enum ControlKey {
+    Reconcile,
+    PruneDynamicCache,
+}
+
+#[derive(Debug)]
+enum ControlCommand {
+    Reconcile,
+    PruneDynamicCache,
+}
+
+impl Coalesce for ControlCommand {
+    fn coalesce(&mut self, newer: Self) {
+        *self = newer;
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownRequest {
+    cleanup: bool,
+    done: oneshot::Sender<()>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum ObserveEnqueueError {
+    Full,
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AddressListManagerHandle {
+    observations: KeyedMailbox<String, ObservationCommand>,
+    controls: KeyedMailbox<ControlKey, ControlCommand>,
+}
+
+impl AddressListManagerHandle {
+    pub(super) fn new() -> Self {
+        Self {
+            observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
+            controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
+        }
+    }
+
+    pub(super) fn try_observe(
+        &self,
         domain: String,
         addrs: Vec<ObservedAddr>,
         wait: Option<oneshot::Sender<Result<()>>>,
-    },
-    Reconcile,
-    PruneDynamicCache,
-    Shutdown {
-        cleanup: bool,
-        done: oneshot::Sender<()>,
-    },
+    ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
+        let command = ObservationCommand {
+            addrs,
+            waiters: wait.into_iter().collect(),
+        };
+        self.observations
+            .try_push(domain, command)
+            .map_err(|error| match error {
+                TryPushError::Full(_) => ObserveEnqueueError::Full,
+                TryPushError::Closed(_) => ObserveEnqueueError::Closed,
+            })
+    }
+
+    pub(super) async fn observe(
+        &self,
+        domain: String,
+        addrs: Vec<ObservedAddr>,
+        wait: oneshot::Sender<Result<()>>,
+    ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
+        self.observations
+            .push(
+                domain,
+                ObservationCommand {
+                    addrs,
+                    waiters: vec![wait],
+                },
+            )
+            .await
+            .map_err(|_| ObserveEnqueueError::Closed)
+    }
+
+    fn request_reconcile(&self) {
+        let _ = self
+            .controls
+            .try_push(ControlKey::Reconcile, ControlCommand::Reconcile);
+    }
+
+    fn request_prune(&self) {
+        let _ = self.controls.try_push(
+            ControlKey::PruneDynamicCache,
+            ControlCommand::PruneDynamicCache,
+        );
+    }
+
+    fn close(&self) {
+        self.observations.close();
+        self.controls.close();
+    }
+
+    #[cfg(test)]
+    pub(super) fn queued_observations(&self) -> usize {
+        self.observations.len()
+    }
+}
+
+#[derive(Debug)]
+enum WorkerCommand {
+    Observe(String, ObservationCommand),
+    Control(ControlCommand),
 }
 
 #[derive(Debug)]
 pub(super) struct AddressListManagerRuntime {
-    /// Command channel used by with-next execution and background tasks.
-    tx: mpsc::Sender<ManagerCommand>,
+    handle: AddressListManagerHandle,
+    shutdown_tx: Option<oneshot::Sender<ShutdownRequest>>,
     /// Single-owner worker task that serializes all local state transitions.
     worker_handle: Option<JoinHandle<()>>,
     /// Local-memory cache prune loop.
@@ -265,50 +377,53 @@ impl AddressListManagerRuntime {
     pub(super) fn start(tag: String, manager: AddressListManager) -> Self {
         // All mutable state lives behind one worker to avoid cross-map locking
         // or request-path synchronization in the DNS hot path.
-        let (tx, rx) = mpsc::channel::<ManagerCommand>(MANAGER_QUEUE_SIZE);
+        let handle = AddressListManagerHandle::new();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let reconcile_enabled = !manager.cfg.persistent_items.is_empty();
 
         let worker_tag = tag.clone();
+        let worker_handle_mailbox = handle.clone();
         let worker_handle = Some(tokio::spawn(async move {
-            run_manager_worker(worker_tag, manager, rx).await;
+            run_manager_worker(worker_tag, manager, worker_handle_mailbox, shutdown_rx).await;
         }));
 
         // Startup reconciliation is deliberately queued onto the manager worker
         // instead of awaited during plugin init. Slow RouterOS list scans must
         // not prevent the DNS service from coming up.
-        let _ = tx.try_send(ManagerCommand::Reconcile);
+        handle.request_reconcile();
 
         // Pruning is local-memory only. It never talks to RouterOS and exists
         // solely to keep the write-suppression cache bounded.
-        let prune_tx = tx.clone();
+        let prune_handle = handle.clone();
         let prune_task_id = Some(task_center::spawn_fixed(
             format!("ros_address_list:{tag}:dynamic_cache_prune"),
             Duration::from_secs(DYNAMIC_CACHE_PRUNE_INTERVAL_SECS),
             move || {
-                let prune_tx = prune_tx.clone();
+                let prune_handle = prune_handle.clone();
                 async move {
-                    let _ = prune_tx.send(ManagerCommand::PruneDynamicCache).await;
+                    prune_handle.request_prune();
                 }
             },
         ));
 
         // Reconcile is only useful when persistent behavior is configured.
         let reconcile_task_id = reconcile_enabled.then(|| {
-            let reconcile_tx = tx.clone();
+            let reconcile_handle = handle.clone();
             task_center::spawn_fixed(
                 format!("ros_address_list:{tag}:reconcile"),
                 Duration::from_secs(RECONCILE_INTERVAL_SECS),
                 move || {
-                    let reconcile_tx = reconcile_tx.clone();
+                    let reconcile_handle = reconcile_handle.clone();
                     async move {
-                        let _ = reconcile_tx.send(ManagerCommand::Reconcile).await;
+                        reconcile_handle.request_reconcile();
                     }
                 },
             )
         });
 
         Self {
-            tx,
+            handle,
+            shutdown_tx: Some(shutdown_tx),
             worker_handle,
             prune_task_id,
             reconcile_task_id,
@@ -316,42 +431,31 @@ impl AddressListManagerRuntime {
     }
 
     #[inline]
-    pub(super) fn sender(&self) -> mpsc::Sender<ManagerCommand> {
-        self.tx.clone()
+    pub(super) fn handle(&self) -> AddressListManagerHandle {
+        self.handle.clone()
     }
 
     pub(super) async fn shutdown(mut self, cleanup: bool) {
-        let mut shutdown_acked = false;
-        let (done_tx, done_rx) = oneshot::channel::<()>();
-        let shutdown_cmd = ManagerCommand::Shutdown {
-            cleanup,
-            done: done_tx,
-        };
-        let sent = match self.tx.try_send(shutdown_cmd) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-            Err(mpsc::error::TrySendError::Full(shutdown_cmd)) => matches!(
-                tokio::time::timeout(
-                    Duration::from_secs(SHUTDOWN_TIMEOUT_SECS),
-                    self.tx.send(shutdown_cmd),
-                )
-                .await,
-                Ok(Ok(()))
-            ),
-        };
-        if sent {
-            shutdown_acked =
-                tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), done_rx)
-                    .await
-                    .is_ok();
-        }
-
         if let Some(task_id) = self.prune_task_id.take() {
             task_center::stop_task(task_id).await;
         }
         if let Some(task_id) = self.reconcile_task_id.take() {
             task_center::stop_task(task_id).await;
         }
+
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let shutdown_requested = self.shutdown_tx.take().is_some_and(|tx| {
+            tx.send(ShutdownRequest {
+                cleanup,
+                done: done_tx,
+            })
+            .is_ok()
+        });
+        self.handle.close();
+        let shutdown_acked = shutdown_requested
+            && tokio::time::timeout(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS), done_rx)
+                .await
+                .is_ok();
         if let Some(handle) = self.worker_handle.take() {
             if shutdown_acked {
                 let _ =
@@ -900,50 +1004,86 @@ pub(super) fn decode_owned_comment(
 async fn run_manager_worker(
     tag: String,
     mut manager: AddressListManager,
-    mut rx: mpsc::Receiver<ManagerCommand>,
+    handle: AddressListManagerHandle,
+    mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
 ) {
     // Every state transition is serialized here. Request-path code only pushes
-    // commands into the channel and never mutates manager state directly.
-    while let Some(command) = rx.recv().await {
-        match command {
-            ManagerCommand::ObserveDomain {
-                domain,
-                addrs,
-                wait,
-            } => {
-                let result = manager.observe_domain(domain, addrs).await;
-                match (wait, result) {
-                    (Some(ch), outcome) => {
-                        let _ = ch.send(outcome);
+    // commands into the mailbox and never mutates manager state directly.
+    let mut prefer_control = true;
+    loop {
+        let command = if prefer_control {
+            tokio::select! {
+                biased;
+                shutdown = &mut shutdown_rx => {
+                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
+                        if let Err(e) = manager.shutdown(cleanup).await {
+                            warn!(plugin = %tag, err = %e, "ros_address_list shutdown cleanup failed");
+                        }
+                        let _ = done.send(());
                     }
-                    (None, Ok(())) => {}
-                    (None, Err(e)) => {
+                    break;
+                }
+                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+                observation = handle.observations.recv() => observation.map(|(domain, command)| WorkerCommand::Observe(domain, command)),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                shutdown = &mut shutdown_rx => {
+                    if let Ok(ShutdownRequest { cleanup, done }) = shutdown {
+                        if let Err(e) = manager.shutdown(cleanup).await {
+                            warn!(plugin = %tag, err = %e, "ros_address_list shutdown cleanup failed");
+                        }
+                        let _ = done.send(());
+                    }
+                    break;
+                }
+                observation = handle.observations.recv() => observation.map(|(domain, command)| WorkerCommand::Observe(domain, command)),
+                control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+            }
+        };
+        let Some(command) = command else {
+            break;
+        };
+        match command {
+            WorkerCommand::Observe(domain, ObservationCommand { addrs, waiters }) => {
+                prefer_control = true;
+                let result = manager.observe_domain(domain, addrs).await;
+                if waiters.is_empty() {
+                    if let Err(e) = result {
                         warn!(
                             plugin = %tag,
                             err = %e,
                             "ros_address_list observe failed in async mode"
                         );
                     }
+                } else {
+                    let outcome = result.map_err(|error| error.to_string());
+                    for waiter in waiters {
+                        let result = outcome
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|message| DnsError::plugin(message.clone()));
+                        let _ = waiter.send(result);
+                    }
                 }
             }
-            ManagerCommand::Reconcile => {
-                manager.spawn_background_reconcile(tag.clone());
-            }
-            ManagerCommand::PruneDynamicCache => {
-                if let Err(e) = manager.prune_dynamic_cache_now().await {
-                    warn!(
-                        plugin = %tag,
-                        err = %e,
-                        "ros_address_list dynamic cache prune failed"
-                    );
+            WorkerCommand::Control(command) => {
+                prefer_control = false;
+                match command {
+                    ControlCommand::Reconcile => {
+                        manager.spawn_background_reconcile(tag.clone());
+                    }
+                    ControlCommand::PruneDynamicCache => {
+                        if let Err(e) = manager.prune_dynamic_cache_now().await {
+                            warn!(
+                                plugin = %tag,
+                                err = %e,
+                                "ros_address_list dynamic cache prune failed"
+                            );
+                        }
+                    }
                 }
-            }
-            ManagerCommand::Shutdown { cleanup, done } => {
-                if let Err(e) = manager.shutdown(cleanup).await {
-                    warn!(plugin = %tag, err = %e, "ros_address_list shutdown cleanup failed");
-                }
-                let _ = done.send(());
-                break;
             }
         }
     }

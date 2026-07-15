@@ -41,7 +41,7 @@ use ahash::AHashSet;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::warn;
 
 use self::api::{
@@ -50,7 +50,7 @@ use self::api::{
 };
 use self::manager::{
     AddressListFamily, AddressListKey, AddressListManager, AddressListManagerConfig,
-    AddressListManagerRuntime, ManagerCommand,
+    AddressListManagerHandle, AddressListManagerRuntime, ObserveEnqueueError,
 };
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
@@ -308,9 +308,8 @@ struct MikrotikExecutor {
     config: MikrotikConfig,
     /// Pre-built manager consumed during `init()`.
     manager: Option<AddressListManager>,
-    /// Sender exposed to continuation post-stage after the background runtime
-    /// starts.
-    command_tx: Option<mpsc::Sender<ManagerCommand>>,
+    /// Coalescing mailbox handle exposed after the background runtime starts.
+    manager_handle: Option<AddressListManagerHandle>,
     /// Runtime handle stored so `destroy()` can stop worker tasks.
     runtime: Mutex<Option<AddressListManagerRuntime>>,
 }
@@ -326,7 +325,7 @@ impl Plugin for MikrotikExecutor {
 
         // `init()` may be called more than once by the plugin framework.
         // Keep it idempotent and only build the runtime once.
-        if self.manager.is_none() || self.command_tx.is_some() {
+        if self.manager.is_none() || self.manager_handle.is_some() {
             return Ok(());
         }
 
@@ -335,7 +334,7 @@ impl Plugin for MikrotikExecutor {
         };
 
         let runtime = AddressListManagerRuntime::start(self.tag.clone(), manager);
-        self.command_tx = Some(runtime.sender());
+        self.manager_handle = Some(runtime.handle());
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = Some(runtime);
         }
@@ -370,7 +369,7 @@ impl Executor for MikrotikExecutor {
     ) -> Result<ExecStep> {
         let step = continue_next!(next, context)?;
         // If the runtime never started, the plugin stays side-effect free.
-        let Some(tx) = self.command_tx.as_ref() else {
+        let Some(handle) = self.manager_handle.as_ref() else {
             return Ok(step);
         };
 
@@ -382,20 +381,16 @@ impl Executor for MikrotikExecutor {
 
         if self.config.async_mode {
             // Async mode keeps RouterOS I/O fully off the request path.
-            match tx.try_send(ManagerCommand::ObserveDomain {
-                domain,
-                addrs,
-                wait: None,
-            }) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
+            match handle.try_observe(domain, addrs, None) {
+                Ok(_) => {}
+                Err(ObserveEnqueueError::Full) => {
                     self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         plugin = %self.tag,
                         "ros_address_list observe queue is full, observation dropped"
                     );
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(ObserveEnqueueError::Closed) => {
                     self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         plugin = %self.tag,
@@ -409,15 +404,11 @@ impl Executor for MikrotikExecutor {
         // Sync mode still preserves DNS behavior on RouterOS failures. The only
         // difference is that we wait for the manager to attempt the write.
         let (wait_tx, wait_rx) = oneshot::channel::<Result<()>>();
-        let send_cmd = ManagerCommand::ObserveDomain {
-            domain,
-            addrs,
-            wait: Some(wait_tx),
-        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS);
-        let send_outcome = tokio::time::timeout_at(deadline, tx.send(send_cmd)).await;
+        let send_outcome =
+            tokio::time::timeout_at(deadline, handle.observe(domain, addrs, wait_tx)).await;
         match send_outcome {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(_)) => {
                 self.metrics
                     .sync_error_total
@@ -515,7 +506,7 @@ impl PluginFactory for MikrotikFactory {
             metrics: Arc::new(RosMetrics::new(plugin_config.tag.clone())),
             config,
             manager: Some(manager),
-            command_tx: None,
+            manager_handle: None,
             runtime: Mutex::new(None),
         })))
     }
@@ -1130,6 +1121,31 @@ mod tests {
         assert_eq!(api.max_active.load(Ordering::Acquire), 16);
     }
 
+    #[test]
+    fn observation_mailbox_coalesces_repeated_domain_updates() {
+        let handle = AddressListManagerHandle::new();
+        let first = vec![ObservedAddr {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            ttl_secs: 60,
+        }];
+        let latest = vec![ObservedAddr {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+            ttl_secs: 300,
+        }];
+
+        assert!(
+            handle
+                .try_observe("busy.example.".to_string(), first, None)
+                .is_ok()
+        );
+        assert!(
+            handle
+                .try_observe("busy.example.".to_string(), latest, None)
+                .is_ok()
+        );
+        assert_eq!(handle.queued_observations(), 1);
+    }
+
     fn a_record(ip: Ipv4Addr, ttl: u32) -> Record {
         Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
@@ -1182,7 +1198,7 @@ mod tests {
             metrics: Arc::new(RosMetrics::new(tag.to_string())),
             config,
             manager: Some(AddressListManager::new(api, manager_cfg)),
-            command_tx: None,
+            manager_handle: None,
             runtime: Mutex::new(None),
         }
     }
