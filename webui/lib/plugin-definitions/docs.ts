@@ -355,15 +355,22 @@ export const pluginFieldDocs = {
       "- 类型：`string`；必填：是\n- RouterOS API 地址，通常为 `host:port`。",
     username: "- 类型：`string`；必填：是\n- RouterOS API 登录用户名。",
     password: "- 类型：`string`；必填：是\n- RouterOS API 登录密码。",
+    connect_timeout: "- 类型：`u64`；默认：`5`\n- RouterOS API 连接超时秒数，必须大于 `0`。",
+    send_timeout: "- 类型：`u64`；默认：`5`\n- RouterOS API 命令发送超时秒数，必须大于 `0`。",
+    receive_timeout: "- 类型：`u64`；默认：`5`\n- RouterOS API 单段响应等待超时秒数，必须大于 `0`。",
+    async: "- 类型：`bool`；默认：`true`\n- `true` 只投递后台同步；`false` 等待当前观测的一次同步尝试，但不会改变 DNS 应答。",
     routing_table:
       "- 类型：`string`；必填：是\n- 写入静态路由的 RouterOS routing table；插件不会创建该表或对应 routing rule。",
     gateway4: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv4 路由下一跳。",
     gateway6: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv6 路由下一跳。",
     distance: "- 类型：`u8`；默认：`100`\n- RouterOS 静态路由 distance。",
+    comment_prefix: "- 类型：`string`；默认：`fdns`\n- 路由注释归属前缀；该值及插件 tag 不能包含 `;` 或 `=`。",
     "persistent_route.ips":
       "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由；单 IP 会标准化为主机路由，`/0` 会被忽略。",
     "persistent_route.files":
       "- 类型：`array<string>`\n- 固定路由来源文件，每分钟重新读取并对账。",
+    min_ttl: "- 类型：`u32`；默认：`60`\n- 动态 DNS 路由 TTL 的最小钳制值。",
+    max_ttl: "- 类型：`u32`；默认：`3600`\n- 动态 DNS 路由 TTL 的最大钳制值。",
     fixed_ttl:
       "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL。设为 `0` 时不按时间过期，但同一域名后续应答移除该 IP 时仍会撤销引用。",
     cleanup_on_shutdown:

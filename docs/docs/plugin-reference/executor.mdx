@@ -2736,6 +2736,7 @@ old-static.example.com static.example.net
     gateway4: "192.168.88.2@main"
     gateway6: "fe80::2%ether1"
     fixed_ttl: 0
+    conntrack_guard: true
     cleanup_on_shutdown: true
     persistent_route:
       ips: ["198.51.100.0/24"]
@@ -2743,8 +2744,10 @@ old-static.example.com static.example.net
 
 - `routing_table`、`gateway4`/`gateway6` 定义写入目标；路由表、routing rule 和默认路由需预先在 RouterOS 配好。
 - `min_ttl`/`max_ttl` 默认分别为 `60`/`3600` 秒。`fixed_ttl` 覆盖 DNS TTL；其中 `fixed_ttl: 0` 表示动态路由不按时间过期，但同一域名后续应答移除该 IP 时会撤销其引用。
+- `ros_route` 与 `ros_address_list` 都会收集 Answer 区中所有已启用地址族的 A/AAAA 记录，不再重建 CNAME 链或用 CNAME TTL 截断地址 TTL。对 `ros_route` 而言，A 查询只替换/撤销 IPv4 路由，AAAA 查询只替换/撤销 IPv6 路由；但同一 Answer 中的两种地址都会作为新增或刷新候选。
 - `persistent_route` 是独立于 DNS 的常驻 IP/CIDR 集合；文件内容每分钟重载并周期对账。
 - RouterOS 不可达时 DNS 服务仍会启动，路由操作在后台重试。`async: false` 只等待一次同步尝试，失败不会改变 DNS 应答。
+- `conntrack_guard` 默认关闭。启用后，动态撤销、过期和移除 persistent 配置前会检查 RouterOS conntrack；目标地址仍有任意跟踪连接时保留路由并在 30 秒后重试。CIDR 会检查网段内连接。连接跟踪关闭、RAW `notrack` 流量或查询失败无法证明安全时都会保留路由。关闭清理、校验残留、重复项和禁用地址族清理仍会立即删除。
 - `cleanup_on_shutdown: true` 会删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。
 
 ---

@@ -1674,6 +1674,10 @@ export const enUSPluginDefined = {
         min_ttl: { label: "Minimum dynamic-route TTL" },
         max_ttl: { label: "Maximum dynamic-route TTL" },
         fixed_ttl: { label: "Fixed dynamic-route TTL", description: "Set to 0 to disable time-based expiry." },
+        conntrack_guard: {
+          label: "Connection tracking guard",
+          description: "Check RouterOS conntrack before normal route deletion and defer when a target connection exists.",
+        },
         cleanup_on_shutdown: { label: "Clean up on shutdown" },
       },
       metrics: {
@@ -1682,6 +1686,8 @@ export const enUSPluginDefined = {
           ros_route_dropped_total: "Async drops",
           ros_route_sync_error_total: "Sync failures",
           ros_route_sync_timeout_total: "Sync timeouts",
+          ros_route_delete_deferred_total: "Deferred deletions",
+          ros_route_connection_check_error_total: "Connection check failures",
         },
         help: {
           ros_route_observe_total:
@@ -1692,6 +1698,10 @@ export const enUSPluginDefined = {
             "The total number of synchronous observations that failed in the RouterOS route manager.",
           ros_route_sync_timeout_total:
             "The total number of synchronous observations that timed out while enqueuing or waiting.",
+          ros_route_delete_deferred_total:
+            "The total number of route deletions deferred because RouterOS conntrack still has a target connection.",
+          ros_route_connection_check_error_total:
+            "The total number of RouterOS conntrack queries that failed during route deletion.",
         },
       },
     },

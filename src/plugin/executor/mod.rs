@@ -72,6 +72,8 @@ pub mod response;
 pub mod reverse_lookup;
 #[cfg(feature = "plugin-mikrotik")]
 pub mod ros_address_list;
+#[cfg(any(feature = "plugin-mikrotik", feature = "plugin-ros-route"))]
+pub(crate) mod ros_common;
 #[cfg(feature = "plugin-ros-route")]
 pub mod ros_route;
 #[cfg(feature = "plugin-script")]
