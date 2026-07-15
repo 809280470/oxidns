@@ -1838,6 +1838,35 @@ persistent:
     }
 
     #[tokio::test]
+    async fn unchanged_persistent_reconcile_does_not_upsert() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let key = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(100, 64, 1, 9)),
+            "oxidns_ipv4".to_string(),
+        );
+        api.seed_entry(RouterListEntry {
+            id: "*unchanged".to_string(),
+            key: key.clone(),
+            timeout: None,
+            comment: Some(encode_comment(
+                "oxidns",
+                "mk",
+                OwnedCommentKind::Persistent,
+                None,
+            )),
+        });
+        let mut cfg = default_cfg("mk");
+        cfg.persistent_items.insert(key);
+        let mut manager = AddressListManager::new(api.clone(), cfg);
+
+        manager.reconcile().await.unwrap();
+
+        let state = api.state.lock().unwrap();
+        assert_eq!(state.upsert_v4, 0);
+        assert_eq!(state.update_ops, 0);
+    }
+
+    #[tokio::test]
     async fn persistent_update_replaces_removed_entries() {
         let api = Arc::new(MockMikrotikApi::default());
         let mut cfg = default_cfg("mk");
@@ -1895,7 +1924,12 @@ persistent:
             state.convert_persistent_to_dynamic_after_list = true;
         }
 
-        let mut manager = AddressListManager::new(api.clone(), default_cfg("mk"));
+        let mut cfg = default_cfg("mk");
+        cfg.persistent_items.insert(AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(15, 15, 15, 16)),
+            "oxidns_ipv4".to_string(),
+        ));
+        let mut manager = AddressListManager::new(api.clone(), cfg);
         manager.reconcile().await.unwrap();
 
         let state = api.state.lock().unwrap();
@@ -2020,9 +2054,76 @@ persistent:
     }
 
     #[tokio::test]
+    async fn reconcile_preserves_remote_dynamic_over_capacity_and_rejects_new_key() {
+        let api = Arc::new(MockMikrotikApi::default());
+        let mut cfg = default_cfg("over-capacity");
+        cfg.max_entries = 2;
+        let mut manager = AddressListManager::new(api.clone(), cfg);
+        let first = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        manager
+            .observe_domain_at_for_test(
+                "first.example".to_string(),
+                vec![ObservedAddr {
+                    addr: first,
+                    ttl_secs: 300,
+                }],
+                0,
+            )
+            .await
+            .unwrap();
+
+        for last in [2, 3] {
+            let key = AddressListKey::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, last)),
+                "oxidns_ipv4".to_string(),
+            );
+            api.seed_entry(RouterListEntry {
+                id: format!("*remote-{last}"),
+                key,
+                timeout: Some("300s".to_string()),
+                comment: Some(encode_comment(
+                    "oxidns",
+                    "over-capacity",
+                    OwnedCommentKind::Dynamic,
+                    Some("remote.example"),
+                )),
+            });
+        }
+
+        manager.reconcile().await.unwrap();
+        assert_eq!(manager.dynamic_cache_len(), 3);
+
+        let rejected = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4)),
+            "oxidns_ipv4".to_string(),
+        );
+        manager
+            .observe_domain_at_for_test(
+                "new.example".to_string(),
+                vec![ObservedAddr {
+                    addr: rejected.address,
+                    ttl_secs: 300,
+                }],
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.dynamic_cache_len(), 3);
+        assert!(
+            !api.state
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&MockMikrotikApi::storage_key(&rejected))
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_accepts_manual_dynamic_deletion_until_next_observation() {
         let api = Arc::new(MockMikrotikApi::default());
-        let mut manager = AddressListManager::new(api.clone(), default_cfg("manual-delete"));
+        let mut cfg = default_cfg("manual-delete");
+        cfg.fixed_ttl = Some(0);
+        let mut manager = AddressListManager::new(api.clone(), cfg);
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
         let key = AddressListKey::new(ip, "oxidns_ipv4".to_string());
         let observed = vec![ObservedAddr {

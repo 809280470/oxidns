@@ -408,7 +408,7 @@ impl Coalesce for ControlCommand {
 #[derive(Debug)]
 struct ReconcileSnapshot {
     scan_generation: u64,
-    remote_dynamic: AHashSet<AddressListKey>,
+    entries: Vec<RouterListEntry>,
 }
 
 #[derive(Debug)]
@@ -816,32 +816,35 @@ impl AddressListManager {
         true
     }
 
-    async fn reconcile_persistent_inner(&mut self) -> Result<AHashSet<AddressListKey>> {
-        // Persistent reconcile treats RouterOS as a converged desired-set target:
-        // ensure every configured persistent item exists, then remove stale owned
-        // persistent entries that are no longer desired.
-        let existing = self
-            .api
-            .list_entries(
-                self.cfg.address_list4.as_deref(),
-                self.cfg.address_list6.as_deref(),
-            )
-            .await?;
-        let remote_dynamic = existing
+    async fn apply_reconcile_snapshot(
+        &mut self,
+        existing: Vec<RouterListEntry>,
+        scan_generation: u64,
+    ) -> Result<()> {
+        // The background task only reads RouterOS. The single state owner
+        // classifies the snapshot, mutates local state, and executes the
+        // resulting precise persistent diff.
+        let desired_comment = self.comment_for_persistent();
+        let correct_persistent = existing
             .iter()
             .filter(|entry| {
-                decode_owned_comment(
-                    self.cfg.comment_prefix.as_str(),
-                    self.cfg.plugin_tag.as_str(),
-                    entry.comment.as_deref(),
-                )
-                .is_some_and(|meta| meta.kind == OwnedCommentKind::Dynamic)
+                self.persistent_items.contains(&entry.key)
+                    && entry.timeout.is_none()
+                    && entry.comment.as_deref() == Some(desired_comment.as_str())
+                    && decode_owned_comment(
+                        self.cfg.comment_prefix.as_str(),
+                        self.cfg.plugin_tag.as_str(),
+                        entry.comment.as_deref(),
+                    )
+                    .is_some_and(|meta| meta.kind == OwnedCommentKind::Persistent)
             })
             .map(|entry| entry.key.clone())
             .collect::<AHashSet<_>>();
-
-        let desired_comment = self.comment_for_persistent();
-        let persistent = self.persistent_items.iter().collect::<Vec<_>>();
+        let persistent = self
+            .persistent_items
+            .iter()
+            .filter(|key| !correct_persistent.contains(*key))
+            .collect::<Vec<_>>();
         let results = join_all_bounded(
             persistent.iter().map(|key| {
                 self.api.upsert_owned_entry(
@@ -873,11 +876,7 @@ impl AddressListManager {
                 }
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-
-        for entry in existing {
+        for entry in &existing {
             let Some(meta) = decode_owned_comment(
                 self.cfg.comment_prefix.as_str(),
                 self.cfg.plugin_tag.as_str(),
@@ -891,18 +890,65 @@ impl AddressListManager {
             if self.persistent_items.contains(&entry.key) {
                 continue;
             }
-            if !self
-                .is_stale_persistent_entry_still_deletable(&entry)
-                .await?
-            {
-                continue;
+            match self.is_stale_persistent_entry_still_deletable(entry).await {
+                Ok(true) => {
+                    if let Err(error) = self
+                        .api
+                        .delete_entry_by_id(&entry.id, entry.key.family)
+                        .await
+                    {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
-            self.api
-                .delete_entry_by_id(&entry.id, entry.key.family)
-                .await?;
         }
 
-        Ok(remote_dynamic)
+        let now = now_millis();
+        let remote_dynamic = existing
+            .iter()
+            .filter_map(|entry| {
+                decode_owned_comment(
+                    self.cfg.comment_prefix.as_str(),
+                    self.cfg.plugin_tag.as_str(),
+                    entry.comment.as_deref(),
+                )
+                .filter(|meta| meta.kind == OwnedCommentKind::Dynamic)
+                .map(|_| {
+                    let state = entry
+                        .timeout
+                        .as_deref()
+                        .and_then(parse_routeros_duration_secs)
+                        .filter(|seconds| *seconds > 0)
+                        .map_or_else(DynamicRefreshState::timeless, |seconds| {
+                            DynamicRefreshState::from_write(now, seconds)
+                        });
+                    (entry.key.clone(), state)
+                })
+            })
+            .collect::<AHashMap<_, _>>();
+
+        // A snapshot may race successful writes. Newer generations win;
+        // everything else follows actual RouterOS state, including timeless
+        // rows and remote counts above max_entries.
+        self.dynamic_refresh_cache.retain(|key, state| {
+            state.generation > scan_generation || remote_dynamic.contains_key(key)
+        });
+        for (key, mut remote_state) in remote_dynamic {
+            let keep_newer = self
+                .dynamic_refresh_cache
+                .get(&key)
+                .is_some_and(|state| state.generation > scan_generation);
+            if !keep_newer {
+                remote_state.generation = scan_generation;
+                self.dynamic_refresh_cache.insert(key, remote_state);
+            }
+        }
+        self.prune_dynamic_cache(now);
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn is_stale_persistent_entry_still_deletable(
@@ -935,18 +981,24 @@ impl AddressListManager {
             return;
         }
 
+        if self.persistent_items.is_empty() && self.dynamic_refresh_cache.is_empty() {
+            debug!(
+                plugin = %tag,
+                "ros_address_list reconcile has no desired or observed state, skipping remote scan"
+            );
+            return;
+        }
+
         let api = self.api.clone();
-        let mut cfg = self.cfg.clone();
-        cfg.persistent_items = self.persistent_items.clone();
+        let list4 = self.cfg.address_list4.clone();
+        let list6 = self.cfg.address_list6.clone();
         let scan_generation = self.dynamic_generation;
         self.reconcile_handle = Some(tokio::spawn(async move {
-            let mut manager = AddressListManager::new(api, cfg);
-            manager
-                .reconcile_persistent_inner()
+            api.list_entries(list4.as_deref(), list6.as_deref())
                 .await
-                .map(|remote_dynamic| ReconcileSnapshot {
+                .map(|entries| ReconcileSnapshot {
                     scan_generation,
-                    remote_dynamic,
+                    entries,
                 })
         }));
     }
@@ -965,12 +1017,23 @@ impl AddressListManager {
         match handle.await {
             Ok(Ok(ReconcileSnapshot {
                 scan_generation,
-                remote_dynamic,
+                entries,
             })) => {
-                self.dynamic_refresh_cache.retain(|key, state| {
-                    state.generation > scan_generation || remote_dynamic.contains(key)
-                });
-                debug!(plugin = %tag, "ros_address_list background reconcile completed");
+                match self
+                    .apply_reconcile_snapshot(entries, scan_generation)
+                    .await
+                {
+                    Ok(()) => {
+                        debug!(plugin = %tag, "ros_address_list background reconcile completed");
+                    }
+                    Err(error) => {
+                        warn!(
+                            plugin = %tag,
+                            err = %error,
+                            "ros_address_list background reconcile diff failed"
+                        );
+                    }
+                }
             }
             Ok(Err(error)) => {
                 warn!(
@@ -1028,9 +1091,15 @@ impl AddressListManager {
         // Phase 1: collect entries that actually need a remote write, along with
         // their pre-formatted timeout strings so the borrow checker lets us hand
         // shared references to the concurrent futures below.
+        let mut reserved_new = AHashSet::new();
         let to_refresh: Vec<(AddressListKey, DynamicTimeout, Option<String>)> = dedup
             .into_iter()
             .filter_map(|(key, timeout)| {
+                if !self.dynamic_refresh_cache.contains_key(&key)
+                    && self.dynamic_refresh_cache.len() + reserved_new.len() >= self.cfg.max_entries
+                {
+                    return None;
+                }
                 if !self.should_refresh_dynamic_entry(&key, timeout, now_ms) {
                     return None;
                 }
@@ -1038,6 +1107,9 @@ impl AddressListManager {
                     DynamicTimeout::Timed(ttl) => Some(format!("{ttl}s")),
                     DynamicTimeout::Timeless => None,
                 };
+                if !self.dynamic_refresh_cache.contains_key(&key) {
+                    reserved_new.insert(key.clone());
+                }
                 Some((key, timeout, timeout_value))
             })
             .collect();
@@ -1246,20 +1318,33 @@ impl AddressListManager {
         // Persistent ownership takes precedence over any cached dynamic state.
         self.persistent_items = items;
         self.prune_dynamic_cache(now_millis());
-        let remote_dynamic = self.reconcile_persistent_inner().await?;
-        self.dynamic_refresh_cache
-            .retain(|key, _| remote_dynamic.contains(key));
-        Ok(())
+        let entries = self
+            .api
+            .list_entries(
+                self.cfg.address_list4.as_deref(),
+                self.cfg.address_list6.as_deref(),
+            )
+            .await?;
+        self.apply_reconcile_snapshot(entries, self.dynamic_generation)
+            .await
     }
 
     #[cfg(test)]
     pub(super) async fn reconcile(&mut self) -> Result<()> {
         self.ensure_initialized().await?;
         self.prune_dynamic_cache(now_millis());
-        let remote_dynamic = self.reconcile_persistent_inner().await?;
-        self.dynamic_refresh_cache
-            .retain(|key, _| remote_dynamic.contains(key));
-        Ok(())
+        if self.persistent_items.is_empty() && self.dynamic_refresh_cache.is_empty() {
+            return Ok(());
+        }
+        let entries = self
+            .api
+            .list_entries(
+                self.cfg.address_list4.as_deref(),
+                self.cfg.address_list6.as_deref(),
+            )
+            .await?;
+        self.apply_reconcile_snapshot(entries, self.dynamic_generation)
+            .await
     }
 
     pub(super) async fn prune_dynamic_cache_now(&mut self) -> Result<()> {
@@ -1572,6 +1657,40 @@ fn dynamic_refresh_lead_ms(timeout_ms: u64) -> u64 {
     (timeout_ms / 4).clamp(MIN_DYNAMIC_REFRESH_LEAD_MS, MAX_DYNAMIC_REFRESH_LEAD_MS)
 }
 
+fn parse_routeros_duration_secs(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    let mut total = 0u64;
+    while index < bytes.len() {
+        let number_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if number_start == index {
+            return None;
+        }
+        let value = raw[number_start..index].parse::<u64>().ok()?;
+        let unit_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+            index += 1;
+        }
+        let multiplier = match &raw[unit_start..index] {
+            "w" => 7 * 24 * 60 * 60,
+            "d" => 24 * 60 * 60,
+            "h" => 60 * 60,
+            "m" => 60,
+            "s" => 1,
+            _ => return None,
+        };
+        total = total.saturating_add(value.saturating_mul(multiplier));
+    }
+    Some(total.min(u64::from(u32::MAX)) as u32)
+}
+
 fn now_millis() -> u64 {
     AppClock::elapsed_millis()
 }
@@ -1625,6 +1744,14 @@ mod observation_tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
+
+    #[test]
+    fn routeros_duration_parser_accepts_composite_values() {
+        assert_eq!(parse_routeros_duration_secs("1w2d3h4m5s"), Some(788_645));
+        assert_eq!(parse_routeros_duration_secs("300s"), Some(300));
+        assert_eq!(parse_routeros_duration_secs("none"), None);
+        assert_eq!(parse_routeros_duration_secs("5m30"), None);
+    }
 
     #[tokio::test]
     async fn mailbox_is_bounded_by_address_list_key() {
