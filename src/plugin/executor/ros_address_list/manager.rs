@@ -398,10 +398,8 @@ impl AddressListManager {
             return Ok(());
         }
 
-        // Cold remote-state operations validate connectivity once. Dynamic
-        // observations do not need a full address-list scan before they can
-        // submit exact-key upserts.
-        self.api.healthcheck().await?;
+        // Reconcile and cleanup immediately follow with real address-list
+        // commands, so no separate identity-read permission is required.
         self.initialized = true;
         Ok(())
     }

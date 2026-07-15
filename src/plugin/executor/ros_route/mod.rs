@@ -80,6 +80,8 @@ struct MikrotikConfigArgs {
     send_timeout: Option<u64>,
     /// RouterOS API response receive timeout in seconds.
     receive_timeout: Option<u64>,
+    /// Optional RouterOS API-SSL configuration. Presence enables TLS.
+    tls: Option<RouterOsTlsArgs>,
     /// Whether post stage waits RouterOS writes (`false`) or queues work
     /// (`true`).
     #[serde(rename = "async")]
@@ -124,12 +126,8 @@ struct PersistentRouteArgs {
 struct MikrotikConfig {
     /// RouterOS API endpoint.
     address: String,
-    /// RouterOS login username.
-    username: String,
-    /// RouterOS login password.
-    password: String,
-    /// RouterOS API operation timeouts.
-    api_timeouts: MikrotikApiTimeouts,
+    /// Connection settings consumed when the API transport is constructed.
+    connection: Option<RouterOsConnectionConfig>,
     /// Async mode switch for post stage RouterOS writes.
     async_mode: bool,
     /// Dedicated RouterOS routing table for this plugin.
@@ -189,6 +187,13 @@ impl MikrotikConfigArgs {
                 DEFAULT_RECEIVE_TIMEOUT_SECS,
             )?,
         );
+        let connection = RouterOsConnectionConfig::new(
+            address.clone(),
+            username,
+            password,
+            api_timeouts,
+            self.tls,
+        )?;
         let routing_table = required_non_empty(self.routing_table, "routing_table")?;
         let comment_prefix = optional_non_empty(self.comment_prefix)
             .unwrap_or_else(|| DEFAULT_COMMENT_PREFIX.to_string());
@@ -234,9 +239,7 @@ impl MikrotikConfigArgs {
 
         Ok(MikrotikConfig {
             address,
-            username,
-            password,
-            api_timeouts,
+            connection: Some(connection),
             async_mode: self.async_mode.unwrap_or(DEFAULT_ASYNC_MODE),
             routing_table,
             gateway4,
@@ -268,6 +271,7 @@ use self::manager::{
     ManagerCommand, ObservationScope, PersistentReloadConfig, RouteManager, RouteManagerConfig,
     RouteManagerRuntime,
 };
+use crate::plugin::executor::ros_common::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
 use crate::plugin::executor::ros_common::{
     ObservedAddr, collect_answer_addrs, response_question_matches_request,
 };
@@ -687,13 +691,12 @@ impl PluginFactory for MikrotikFactory {
         _init_context: &crate::plugin::PluginInitContext<'_>,
     ) -> Result<UninitializedPlugin> {
         validate_comment_token("plugin tag", plugin_config.tag.as_str())?;
-        let config = parse_plugin_config(plugin_config.args.clone(), true)?;
-        let api = Arc::new(MikrotikRsClient::new(
-            config.address.clone(),
-            config.username.clone(),
-            config.password.clone(),
-            config.api_timeouts,
-        )) as Arc<dyn MikrotikApi>;
+        let mut config = parse_plugin_config(plugin_config.args.clone(), true)?;
+        let connection = config
+            .connection
+            .take()
+            .ok_or_else(|| DnsError::plugin("ros_route connection config already consumed"))?;
+        let api = Arc::new(MikrotikRsClient::new(connection)) as Arc<dyn MikrotikApi>;
 
         let manager_cfg = RouteManagerConfig {
             plugin_tag: plugin_config.tag.clone(),

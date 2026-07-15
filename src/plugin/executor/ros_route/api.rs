@@ -7,15 +7,17 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::IpAddr;
-use std::time::Duration;
 
 use ahash::AHashSet;
 use async_trait::async_trait;
-use mikrotik_rs::{Command, CommandBuilder, Event, MikrotikDevice, QueryOperator};
+use mikrotik_rs::{Command, CommandBuilder, QueryOperator};
 use tracing::warn;
 
 use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
+use crate::plugin::executor::ros_common::transport::{
+    RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
+};
 
 const ROUTER_ID_FIELD: &str = ".id";
 const ROUTE_DST_FIELD: &str = "dst-address";
@@ -25,7 +27,7 @@ const ROUTE_DISTANCE_FIELD: &str = "distance";
 const ROUTE_COMMENT_FIELD: &str = "comment";
 const ROUTE_DISABLED_FIELD: &str = "disabled";
 const CONNECTION_DST_FIELD: &str = "dst-address";
-const COMMAND_SYSTEM_IDENTITY_PRINT: &str = "/system/identity/print";
+const ROUTE_PROPLIST: &str = ".id,dst-address,routing-table,gateway,distance,comment,disabled";
 
 const COMMAND_IP_ROUTE_PRINT: &str = "/ip/route/print";
 const COMMAND_IP_ROUTE_ADD: &str = "/ip/route/add";
@@ -44,32 +46,7 @@ pub(super) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
 pub(super) const DEFAULT_SEND_TIMEOUT_SECS: u64 = 5;
 pub(super) const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 5;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) struct MikrotikApiTimeouts {
-    connect: Duration,
-    send: Duration,
-    receive: Duration,
-}
-
-impl MikrotikApiTimeouts {
-    pub(super) fn from_secs(connect_secs: u64, send_secs: u64, receive_secs: u64) -> Self {
-        Self {
-            connect: Duration::from_secs(connect_secs),
-            send: Duration::from_secs(send_secs),
-            receive: Duration::from_secs(receive_secs),
-        }
-    }
-}
-
-impl Default for MikrotikApiTimeouts {
-    fn default() -> Self {
-        Self::from_secs(
-            DEFAULT_CONNECT_TIMEOUT_SECS,
-            DEFAULT_SEND_TIMEOUT_SECS,
-            DEFAULT_RECEIVE_TIMEOUT_SECS,
-        )
-    }
-}
+pub(super) type MikrotikApiTimeouts = RouterOsTimeouts;
 
 #[derive(Debug, Clone)]
 pub(super) struct RouterRoute {
@@ -139,8 +116,6 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         family: RouteFamily,
         destinations: &[IpAddr],
     ) -> Result<AHashSet<IpAddr>>;
-    /// Lightweight command that verifies RouterOS API availability.
-    async fn healthcheck(&self) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -162,131 +137,43 @@ impl RouterReply {
 }
 
 pub(super) struct MikrotikRsClient {
-    address: String,
-    username: String,
-    password: String,
-    timeouts: MikrotikApiTimeouts,
-    connection: tokio::sync::Mutex<ConnectionSlot>,
-}
-
-struct ConnectionSlot {
-    generation: u64,
-    device: Option<MikrotikDevice>,
+    transport: RouterOsTransport,
 }
 
 impl Debug for MikrotikRsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MikrotikRsClient")
-            .field("address", &self.address)
-            .field("username", &self.username)
-            .finish_non_exhaustive()
+            .field("transport", &self.transport)
+            .finish()
     }
 }
 
 impl MikrotikRsClient {
-    pub(super) fn new(
-        address: String,
-        username: String,
-        password: String,
-        timeouts: MikrotikApiTimeouts,
-    ) -> Self {
+    pub(super) fn new(config: RouterOsConnectionConfig) -> Self {
         Self {
-            address,
-            username,
-            password,
-            timeouts,
-            connection: tokio::sync::Mutex::new(ConnectionSlot {
-                generation: 0,
-                device: None,
-            }),
+            transport: RouterOsTransport::new(config),
         }
-    }
-
-    async fn invalidate_connection(&self, generation: u64) {
-        let mut guard = self.connection.lock().await;
-        if guard.generation == generation {
-            guard.device = None;
-        }
-    }
-
-    async fn get_or_connect(&self) -> Result<(MikrotikDevice, u64)> {
-        // Keep the lock for the full connect attempt. Concurrent route
-        // pipelines then share one login instead of opening one RouterOS
-        // session per in-flight command after startup or reconnect.
-        let mut guard = self.connection.lock().await;
-        if let Some(device) = guard.device.as_ref() {
-            return Ok((device.clone(), guard.generation));
-        }
-
-        let password = if self.password.is_empty() {
-            None
-        } else {
-            Some(self.password.as_str())
-        };
-        let connect_result = tokio::time::timeout(
-            self.timeouts.connect,
-            MikrotikDevice::connect(self.address.as_str(), &self.username, password),
-        )
-        .await;
-        let device = match connect_result {
-            Ok(Ok(device)) => device,
-            Ok(Err(error)) => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route connect failed to {}: {}",
-                    self.address, error
-                )));
-            }
-            Err(_) => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route connect timeout after {}s to {}",
-                    self.timeouts.connect.as_secs(),
-                    self.address
-                )));
-            }
-        };
-
-        guard.generation = guard.generation.wrapping_add(1);
-        guard.device = Some(device.clone());
-        Ok((device, guard.generation))
-    }
-
-    async fn send_command_receiver(
-        &self,
-        action: &str,
-        command: Command,
-    ) -> Result<(tokio::sync::mpsc::Receiver<Event>, u64)> {
-        let (device, generation) = self.get_or_connect().await?;
-        let send_result =
-            tokio::time::timeout(self.timeouts.send, device.send_command(command)).await;
-        match send_result {
-            Ok(Ok(receiver)) => Ok((receiver, generation)),
-            Ok(Err(error)) => {
-                self.invalidate_connection(generation).await;
-                Err(DnsError::plugin(format!(
-                    "ros_route {action} send failed: {error}"
-                )))
-            }
-            Err(_) => {
-                self.invalidate_connection(generation).await;
-                Err(DnsError::plugin(format!(
-                    "ros_route {action} send timeout after {}s",
-                    self.timeouts.send.as_secs()
-                )))
-            }
-        }
-    }
-
-    async fn finish_receive<T>(&self, generation: u64, result: Result<T>) -> Result<T> {
-        if result.is_err() {
-            self.invalidate_connection(generation).await;
-        }
-        result
     }
 
     async fn send_rows(&self, action: &str, command: Command) -> Result<Vec<RouterReply>> {
-        let (mut receiver, generation) = self.send_command_receiver(action, command).await?;
-        let result = receive_rows(action, self.timeouts.receive, &mut receiver).await;
-        self.finish_receive(generation, result).await
+        self.send_rows_transport(action, command)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn send_rows_transport(
+        &self,
+        action: &str,
+        command: Command,
+    ) -> RouterOsResult<Vec<RouterReply>> {
+        let mut stream = self.transport.send_command(action, command).await?;
+        let mut rows = Vec::new();
+        loop {
+            match stream.next().await? {
+                RouterOsEvent::Reply(attributes) => rows.push(RouterReply { attributes }),
+                RouterOsEvent::Complete => return Ok(rows),
+            }
+        }
     }
 
     async fn find_route_by_exact_comment(
@@ -296,6 +183,7 @@ impl MikrotikRsClient {
     ) -> Result<Option<RouterRoute>> {
         let print = CommandBuilder::new()
             .command(route_command(key.family(), RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
             .query_equal(ROUTE_TABLE_FIELD, &key.table)
             .query_equal(ROUTE_DST_FIELD, &key.dst_address())
             .query_equal(ROUTE_COMMENT_FIELD, comment)
@@ -327,6 +215,7 @@ impl MikrotikRsClient {
     ) -> Result<ExactRouteOwnership> {
         let print = CommandBuilder::new()
             .command(route_command(key.family(), RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
             .query_equal(ROUTE_TABLE_FIELD, &key.table)
             .query_equal(ROUTE_DST_FIELD, &key.dst_address())
             .build();
@@ -357,6 +246,7 @@ impl MikrotikRsClient {
     ) -> Result<Vec<RouterRoute>> {
         let print = CommandBuilder::new()
             .command(route_command(family, RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
             .query_equal(ROUTE_TABLE_FIELD, table)
             .build();
         let action = match family {
@@ -377,50 +267,6 @@ impl MikrotikRsClient {
                 Ok(route)
             })
             .collect()
-    }
-}
-
-async fn receive_rows(
-    action: &str,
-    receive_timeout: Duration,
-    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
-) -> Result<Vec<RouterReply>> {
-    let mut rows = Vec::new();
-    loop {
-        match receive_event(action, receive_timeout, receiver).await? {
-            Event::Reply { response, .. } => rows.push(RouterReply {
-                attributes: response.attributes,
-            }),
-            Event::Done { .. } | Event::Empty { .. } => return Ok(rows),
-            Event::Trap { response, .. } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} trap: {}",
-                    response.message
-                )));
-            }
-            Event::Fatal { reason } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} fatal: {reason}"
-                )));
-            }
-        }
-    }
-}
-
-async fn receive_event(
-    action: &str,
-    receive_timeout: Duration,
-    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
-) -> Result<Event> {
-    match tokio::time::timeout(receive_timeout, receiver.recv()).await {
-        Ok(Some(event)) => Ok(event),
-        Ok(None) => Err(DnsError::plugin(format!(
-            "ros_route {action} response channel closed before a terminal event"
-        ))),
-        Err(_) => Err(DnsError::plugin(format!(
-            "ros_route {action} receive timeout after {}s",
-            receive_timeout.as_secs()
-        ))),
     }
 }
 
@@ -450,37 +296,6 @@ fn insert_connection_destination(
     }
     destinations.insert(ip);
     Ok(())
-}
-
-async fn receive_connection_destinations(
-    action: &str,
-    family: RouteFamily,
-    receive_timeout: Duration,
-    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
-) -> Result<AHashSet<IpAddr>> {
-    let mut destinations = AHashSet::new();
-    loop {
-        match receive_event(action, receive_timeout, receiver).await? {
-            Event::Reply { response, .. } => insert_connection_destination(
-                action,
-                family,
-                response.attributes,
-                &mut destinations,
-            )?,
-            Event::Done { .. } | Event::Empty { .. } => return Ok(destinations),
-            Event::Trap { response, .. } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} trap: {}",
-                    response.message
-                )));
-            }
-            Event::Fatal { reason } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} fatal: {reason}"
-                )));
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -822,10 +637,10 @@ impl MikrotikApi for MikrotikRsClient {
             .command(route_command(family, RouteOp::Remove))
             .attribute(ROUTER_ID_FIELD, Some(id))
             .build();
-        match self.send_rows("remove route", remove).await {
+        match self.send_rows_transport("remove route", remove).await {
             Ok(_) => Ok(()),
-            Err(e) if is_not_found_error(&e) => Ok(()),
-            Err(e) => Err(e),
+            Err(error) if error.is_missing_item() => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -847,28 +662,17 @@ impl MikrotikApi for MikrotikRsClient {
             RouteFamily::Ipv6 => "print ipv6 connection destinations",
         };
         let command = connection_destinations_command(family, destinations);
-        let (mut receiver, generation) = self.send_command_receiver(action, command).await?;
-        let result =
-            receive_connection_destinations(action, family, self.timeouts.receive, &mut receiver)
-                .await;
-        self.finish_receive(generation, result).await
+        let mut stream = self.transport.send_command(action, command).await?;
+        let mut found = AHashSet::new();
+        loop {
+            match stream.next().await? {
+                RouterOsEvent::Reply(attributes) => {
+                    insert_connection_destination(action, family, attributes, &mut found)?;
+                }
+                RouterOsEvent::Complete => return Ok(found),
+            }
+        }
     }
-
-    async fn healthcheck(&self) -> Result<()> {
-        // Identity print is cheap and available on all RouterOS v7 targets.
-        let command = CommandBuilder::new()
-            .command(COMMAND_SYSTEM_IDENTITY_PRINT)
-            .build();
-        let _ = self.send_rows("healthcheck", command).await?;
-        Ok(())
-    }
-}
-
-fn is_not_found_error(err: &DnsError) -> bool {
-    let lower = err.to_string().to_ascii_lowercase();
-    lower.contains("no such item")
-        || lower.contains("not found")
-        || lower.contains("does not exist")
 }
 
 #[cfg(test)]

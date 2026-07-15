@@ -801,12 +801,8 @@ impl RouteManager {
         let now = unix_now();
         self.prune_expired_local_state(now);
 
-        // One-time bootstrap:
-        // 1) transport healthcheck
-        // 2) validate configured gateways against RouterOS
-        // 3) seed persistent routes
-        // 4) reconcile local state from RouterOS
-        self.api.healthcheck().await?;
+        // One-time bootstrap uses real route commands for connectivity and
+        // permission validation instead of requiring identity-read access.
         self.validate_gateways().await?;
         self.ensure_persistent_routes(now);
         let mut first_error = self.reconcile_from_router_inner().await?;
@@ -2573,10 +2569,6 @@ mod tests {
         ) -> Result<AHashSet<IpAddr>> {
             unreachable!("this test only mutates local route state")
         }
-
-        async fn healthcheck(&self) -> Result<()> {
-            unreachable!("this test only mutates local route state")
-        }
     }
 
     #[derive(Debug, Default)]
@@ -2670,10 +2662,6 @@ mod tests {
         ) -> Result<AHashSet<IpAddr>> {
             Ok(AHashSet::new())
         }
-
-        async fn healthcheck(&self) -> Result<()> {
-            Ok(())
-        }
     }
 
     #[async_trait::async_trait]
@@ -2685,6 +2673,9 @@ mod tests {
             require_ipv6: bool,
         ) -> Result<Vec<RouterRoute>> {
             let mut state = self.state.lock().expect("mock lock");
+            if state.fail_healthcheck {
+                return Err(DnsError::plugin("mock route scan failure"));
+            }
             state.list_requirements.push((require_ipv4, require_ipv6));
             Ok(state.routes.clone())
         }
@@ -2786,13 +2777,6 @@ mod tests {
                 })
                 .collect();
             Ok(active)
-        }
-
-        async fn healthcheck(&self) -> Result<()> {
-            if self.state.lock().expect("mock lock").fail_healthcheck {
-                return Err(DnsError::plugin("mock healthcheck failure"));
-            }
-            Ok(())
         }
     }
 
@@ -3665,7 +3649,6 @@ mod tests {
                     disabled: true,
                 },
             ],
-            fail_healthcheck: true,
             ..MockApiState::default()
         }));
         let mut manager = RouteManager::new(api.clone(), manager_config(Some(0)));

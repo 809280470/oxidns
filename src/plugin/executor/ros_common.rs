@@ -9,6 +9,8 @@ use ahash::AHashMap;
 
 use crate::proto::Message;
 
+pub(crate) mod transport;
+
 /// Return whether an echoed response question is compatible with the request.
 ///
 /// Some upstreams omit the question section, which is tolerated for observer

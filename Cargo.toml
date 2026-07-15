@@ -252,10 +252,10 @@ upstream-doh3 = ["upstream-doh", "_dns-client-doh3"]
 # --- Granular plugin features ----------------------------------------------
 
 # `ros_address_list` executor (MikroTik RouterOS API integration).
-plugin-mikrotik = ["dep:mikrotik-rs"]
+plugin-mikrotik = ["dep:mikrotik-rs", "mikrotik-rs/tokio-tls", "_tls-client"]
 
 # `ros_route` executor (MikroTik RouterOS dynamic-route integration).
-plugin-ros-route = ["dep:mikrotik-rs"]
+plugin-ros-route = ["dep:mikrotik-rs", "mikrotik-rs/tokio-tls", "_tls-client"]
 
 # `query_recorder` executor backed by bundled SQLite. Its management API
 # surface is part of the build, hence the `api` requirement.

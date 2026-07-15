@@ -1771,8 +1771,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a223d8a1a4e0646071ed7afc8a7d59edb7e14af3471713e2def2838025cde101"
 dependencies = [
  "mikrotik-proto",
+ "rustls",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

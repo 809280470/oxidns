@@ -24,7 +24,9 @@ mod client;
 mod server;
 
 #[cfg(feature = "_tls-client")]
-pub(crate) use client::{insecure_client_config, secure_client_config};
+pub(crate) use client::{
+    insecure_client_config, secure_client_config, secure_client_config_with_additional_roots,
+};
 #[cfg(feature = "_tls-server")]
 pub use server::{load_server_tls_config, load_tls_config};
 

@@ -59,6 +59,7 @@ use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
     unregister_metric_source,
 };
+use crate::plugin::executor::ros_common::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
 use crate::plugin::executor::ros_common::{
     ObservedAddr, collect_answer_addrs, response_question_matches_request,
 };
@@ -98,6 +99,8 @@ struct MikrotikConfigArgs {
     send_timeout: Option<u64>,
     /// RouterOS API response receive timeout in seconds.
     receive_timeout: Option<u64>,
+    /// Optional RouterOS API-SSL configuration. Presence enables TLS.
+    tls: Option<RouterOsTlsArgs>,
     /// Whether post stage waits RouterOS writes (`false`) or queues work
     /// (`true`).
     #[serde(rename = "async")]
@@ -133,14 +136,8 @@ struct PersistentArgs {
 
 #[derive(Debug, Clone)]
 struct MikrotikConfig {
-    /// RouterOS API endpoint used by the shared client.
-    address: String,
-    /// Login username for RouterOS API.
-    username: String,
-    /// Login password for RouterOS API.
-    password: String,
-    /// RouterOS API operation timeouts.
-    api_timeouts: MikrotikApiTimeouts,
+    /// Connection settings consumed when the API transport is constructed.
+    connection: Option<RouterOsConnectionConfig>,
     /// Async mode switch for post stage writes.
     async_mode: bool,
     /// IPv4 address-list name managed by this plugin.
@@ -185,6 +182,13 @@ impl MikrotikConfigArgs {
                 DEFAULT_RECEIVE_TIMEOUT_SECS,
             )?,
         );
+        let connection = RouterOsConnectionConfig::new(
+            address.clone(),
+            username,
+            password,
+            api_timeouts,
+            self.tls,
+        )?;
         let address_list4 = optional_non_empty(self.address_list4);
         let address_list6 = optional_non_empty(self.address_list6);
         if address_list4.is_none() && address_list6.is_none() {
@@ -219,10 +223,7 @@ impl MikrotikConfigArgs {
         }
 
         Ok(MikrotikConfig {
-            address,
-            username,
-            password,
-            api_timeouts,
+            connection: Some(connection),
             async_mode: self.async_mode.unwrap_or(DEFAULT_ASYNC_MODE),
             address_list4,
             address_list6,
@@ -491,13 +492,11 @@ impl PluginFactory for MikrotikFactory {
     ) -> Result<UninitializedPlugin> {
         // Plugin tag is reused inside RouterOS comment ownership metadata.
         validate_comment_token("plugin tag", plugin_config.tag.as_str())?;
-        let config = parse_plugin_config(plugin_config.args.clone(), true)?;
-        let api = Arc::new(MikrotikRsClient::new(
-            config.address.clone(),
-            config.username.clone(),
-            config.password.clone(),
-            config.api_timeouts,
-        )) as Arc<dyn MikrotikApi>;
+        let mut config = parse_plugin_config(plugin_config.args.clone(), true)?;
+        let connection = config.connection.take().ok_or_else(|| {
+            DnsError::plugin("ros_address_list connection config already consumed")
+        })?;
+        let api = Arc::new(MikrotikRsClient::new(connection)) as Arc<dyn MikrotikApi>;
 
         let manager_cfg = AddressListManagerConfig {
             plugin_tag: plugin_config.tag.clone(),
@@ -895,10 +894,6 @@ mod tests {
         async fn delete_entry_by_id(&self, _id: &str, _family: AddressListFamily) -> Result<()> {
             Ok(())
         }
-
-        async fn healthcheck(&self) -> Result<()> {
-            Ok(())
-        }
     }
 
     #[async_trait]
@@ -908,11 +903,16 @@ mod tests {
             list4: Option<&str>,
             list6: Option<&str>,
         ) -> Result<Vec<RouterListEntry>> {
-            let delay = self
-                .state
-                .lock()
-                .map_err(|_| DnsError::plugin("mock api lock poisoned"))?
-                .list_entries_delay;
+            let (fail_scan, delay) = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| DnsError::plugin("mock api lock poisoned"))?;
+                (state.fail_healthcheck, state.list_entries_delay)
+            };
+            if fail_scan {
+                return Err(DnsError::plugin("mock address-list scan failure"));
+            }
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -1049,17 +1049,6 @@ mod tests {
             }
             Ok(())
         }
-
-        async fn healthcheck(&self) -> Result<()> {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| DnsError::plugin("mock api lock poisoned"))?;
-            if state.fail_healthcheck {
-                return Err(DnsError::plugin("mock healthcheck failure"));
-            }
-            Ok(())
-        }
     }
 
     fn default_cfg(tag: &str) -> AddressListManagerConfig {
@@ -1098,10 +1087,7 @@ mod tests {
     #[test]
     fn observation_with_mismatched_response_question_is_ignored() {
         let config = MikrotikConfig {
-            address: "127.0.0.1:8728".to_string(),
-            username: "u".to_string(),
-            password: "p".to_string(),
-            api_timeouts: MikrotikApiTimeouts::default(),
+            connection: None,
             async_mode: true,
             address_list4: Some("oxidns_ipv4".to_string()),
             address_list6: None,
@@ -1170,10 +1156,7 @@ mod tests {
     ) -> MikrotikExecutor {
         AppClock::start();
         let config = MikrotikConfig {
-            address: "127.0.0.1:8728".to_string(),
-            username: "u".to_string(),
-            password: "p".to_string(),
-            api_timeouts: MikrotikApiTimeouts::default(),
+            connection: None,
             async_mode,
             address_list4: address_list4.map(|v| v.to_string()),
             address_list6: address_list6.map(|v| v.to_string()),
@@ -1275,7 +1258,10 @@ address_list4: "oxidns_ipv4"
         .unwrap();
         let parsed = parse_plugin_config(Some(cfg), false).unwrap();
         assert_eq!(parsed.comment_prefix, DEFAULT_COMMENT_PREFIX);
-        assert_eq!(parsed.api_timeouts, MikrotikApiTimeouts::default());
+        assert_eq!(
+            parsed.connection.as_ref().expect("connection").timeouts,
+            MikrotikApiTimeouts::default()
+        );
     }
 
     #[test]
@@ -1294,9 +1280,46 @@ address_list4: "oxidns_ipv4"
         .unwrap();
         let parsed = parse_plugin_config(Some(cfg), false).unwrap();
         assert_eq!(
-            parsed.api_timeouts,
+            parsed.connection.as_ref().expect("connection").timeouts,
             MikrotikApiTimeouts::from_secs(10, 11, 60)
         );
+    }
+
+    #[test]
+    fn config_validation_enables_verified_routeros_tls() {
+        let cfg = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "router.example:8729"
+username: "user"
+password: "sensitive-credential"
+tls: {}
+address_list4: "oxidns_ipv4"
+"#,
+        )
+        .unwrap();
+
+        let parsed = parse_plugin_config(Some(cfg), false).unwrap();
+        let debug = format!("{:?}", parsed.connection.expect("connection"));
+        assert!(debug.contains("Secure"));
+        assert!(debug.contains("router.example"));
+        assert!(!debug.contains("sensitive-credential"));
+    }
+
+    #[test]
+    fn config_validation_keeps_plaintext_when_tls_is_omitted() {
+        let cfg = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "router.example:8728"
+username: "user"
+password: "pass"
+address_list4: "oxidns_ipv4"
+"#,
+        )
+        .unwrap();
+
+        let parsed = parse_plugin_config(Some(cfg), false).unwrap();
+        let debug = format!("{:?}", parsed.connection.expect("connection"));
+        assert!(debug.contains("tls: None"));
     }
 
     #[test]
