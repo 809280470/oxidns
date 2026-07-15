@@ -1157,7 +1157,7 @@ impl RouteManager {
         &mut self,
         domain: String,
         replace_scope: ObservationScope,
-        addrs: Vec<ObservedAddr>,
+        mut addrs: Vec<ObservedAddr>,
         negative_ttl_secs: Option<u32>,
         observed_at_unix: u64,
     ) {
@@ -1177,6 +1177,56 @@ impl RouteManager {
                 observation.domain != domain || !observation.name_level_negative
             });
         }
+
+        // Keep only the newest replacement for a (domain, scope) pair. Merely
+        // dropping older entries is not sufficient because an A response may
+        // also carry additive AAAA answers (and vice versa). Carry forward
+        // those opposite-family additions unless a later queued observation
+        // has already replaced that family.
+        let mut carried_expiries = AHashMap::<IpAddr, u64>::new();
+        self.pending_observations.retain(|observation| {
+            if observation.domain != domain {
+                return true;
+            }
+            if observation.replace_scope == replace_scope {
+                for observed in &observation.addrs {
+                    if replace_scope.contains(observed.addr) {
+                        continue;
+                    }
+                    let expires_at = observation
+                        .observed_at_unix
+                        .saturating_add(u64::from(observed.ttl_secs));
+                    carried_expiries
+                        .entry(observed.addr)
+                        .and_modify(|current| *current = (*current).max(expires_at))
+                        .or_insert(expires_at);
+                }
+                return false;
+            }
+
+            // A retained replacement after an older same-scope observation
+            // is authoritative for its family, including an empty NODATA set.
+            carried_expiries.retain(|ip, _| !observation.replace_scope.contains(*ip));
+            true
+        });
+        let current_ips = addrs
+            .iter()
+            .map(|observed| observed.addr)
+            .collect::<AHashSet<_>>();
+        for (addr, expires_at) in carried_expiries {
+            if current_ips.contains(&addr) {
+                continue;
+            }
+            let remaining = expires_at.saturating_sub(observed_at_unix);
+            if remaining == 0 {
+                continue;
+            }
+            addrs.push(ObservedAddr {
+                addr,
+                ttl_secs: u32::try_from(remaining).unwrap_or(u32::MAX),
+            });
+        }
+
         let replay_until_unix = if addrs.is_empty() {
             // A negative response without an SOA is not safely cacheable, and
             // an explicit zero TTL expires immediately.
@@ -3112,6 +3162,98 @@ mod tests {
 
         assert!(manager.routes.contains_key(&ipv4_key));
         assert!(manager.routes.contains_key(&ipv6_key));
+    }
+
+    #[test]
+    fn pending_same_scope_observations_replace_stale_queue_entries() {
+        let domain = "pending-replacement.example.".to_string();
+        let mut config = manager_config(Some(0));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        let now = unix_now();
+
+        for last_octet in 1..=32 {
+            manager.queue_pending_observation(
+                domain.clone(),
+                ObservationScope::Ipv4,
+                vec![ObservedAddr {
+                    addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, last_octet)),
+                    ttl_secs: 60,
+                }],
+                None,
+                now,
+            );
+        }
+
+        assert_eq!(manager.pending_observations.len(), 1);
+        assert_eq!(
+            manager.pending_observations[0].addrs,
+            vec![ObservedAddr {
+                addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 32)),
+                ttl_secs: 60,
+            }]
+        );
+    }
+
+    #[test]
+    fn pending_compaction_respects_later_cross_family_replacements() {
+        let domain = "pending-cross-replacement.example.".to_string();
+        let stale_ipv6 = "2001:db8::71".parse::<IpAddr>().expect("IPv6 address");
+        let current_ipv6 = "2001:db8::72".parse::<IpAddr>().expect("IPv6 address");
+        let current_ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 72));
+        let mut config = manager_config(Some(0));
+        config.gateway6 = Some("2001:db8::1".to_string());
+        let mut manager = RouteManager::new(Arc::new(NoopApi), config);
+        let now = unix_now();
+
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: stale_ipv6,
+                ttl_secs: 60,
+            }],
+            None,
+            now,
+        );
+        manager.queue_pending_observation(
+            domain.clone(),
+            ObservationScope::Ipv6,
+            vec![ObservedAddr {
+                addr: current_ipv6,
+                ttl_secs: 60,
+            }],
+            None,
+            now,
+        );
+        manager.queue_pending_observation(
+            domain,
+            ObservationScope::Ipv4,
+            vec![ObservedAddr {
+                addr: current_ipv4,
+                ttl_secs: 60,
+            }],
+            None,
+            now,
+        );
+
+        manager.replay_pending_observations();
+
+        assert!(
+            !manager
+                .routes
+                .contains_key(&RouteKey::new(stale_ipv6, "via_proxy".to_string()))
+        );
+        assert!(
+            manager
+                .routes
+                .contains_key(&RouteKey::new(current_ipv6, "via_proxy".to_string()))
+        );
+        assert!(
+            manager
+                .routes
+                .contains_key(&RouteKey::new(current_ipv4, "via_proxy".to_string()))
+        );
     }
 
     #[tokio::test]
