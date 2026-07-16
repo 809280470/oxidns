@@ -120,9 +120,6 @@ struct MikrotikConfigArgs {
     fixed_ttl: Option<u32>,
     /// Whether to clean managed address-list entries on shutdown.
     cleanup_on_shutdown: Option<bool>,
-    /// Deprecated compatibility field. It is accepted but no longer limits
-    /// dynamic lease projection.
-    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -211,11 +208,6 @@ impl MikrotikConfigArgs {
             )));
         }
         let fixed_ttl = self.fixed_ttl;
-        if emit_warnings && self.max_entries.is_some() {
-            warn!(
-                "ros_address_list max_entries is deprecated and ignored; dynamic leases are governed by TTL and bounded work queues"
-            );
-        }
 
         let parsed_persistent = parse_persistent_items(
             self.persistent,
@@ -1930,33 +1922,6 @@ address_list4: "oxidns_ipv4"
         .unwrap();
         let err = parse_plugin_config(Some(cfg), false).unwrap_err();
         assert!(err.to_string().contains("receive_timeout"));
-    }
-
-    #[test]
-    fn config_validation_accepts_deprecated_max_entries_without_enforcing_it() {
-        let cfg = serde_yaml_ng::from_str::<Value>(
-            r#"
-address: "1.1.1.1:8728"
-username: "user"
-password: "pass"
-address_list4: "oxidns_ipv4"
-max_entries: 2048
-"#,
-        )
-        .unwrap();
-        parse_plugin_config(Some(cfg), false).expect("deprecated field");
-
-        let cfg = serde_yaml_ng::from_str::<Value>(
-            r#"
-address: "1.1.1.1:8728"
-username: "user"
-password: "pass"
-address_list4: "oxidns_ipv4"
-max_entries: 0
-"#,
-        )
-        .unwrap();
-        parse_plugin_config(Some(cfg), false).expect("zero is ignored");
     }
 
     #[test]

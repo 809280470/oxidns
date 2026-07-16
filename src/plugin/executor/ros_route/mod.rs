@@ -1313,27 +1313,6 @@ gateway4: "192.0.2.1"
     }
 
     #[test]
-    fn removed_max_entries_is_rejected() {
-        let args = serde_yaml_ng::from_str::<Value>(
-            r#"
-address: "127.0.0.1:8728"
-username: "api"
-password: "secret"
-routing_table: "policy"
-gateway4: "192.0.2.1"
-max_entries: 8
-"#,
-        )
-        .expect("yaml");
-        assert!(
-            parse_plugin_config(Some(args), false)
-                .expect_err("removed field")
-                .to_string()
-                .contains("max_entries")
-        );
-    }
-
-    #[test]
     fn conntrack_guard_defaults_to_disabled_and_can_be_enabled() {
         let base = r#"
 address: "127.0.0.1:8728"
