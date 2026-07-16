@@ -160,12 +160,20 @@ impl Debug for MikrotikRsClient {
 }
 
 impl MikrotikRsClient {
-    async fn remove_route_by_id(&self, id: &str, family: RouteFamily) -> Result<()> {
+    async fn remove_route_by_id(
+        &self,
+        id: &str,
+        family: RouteFamily,
+        bypass_backoff: bool,
+    ) -> Result<()> {
         let remove = CommandBuilder::new()
             .command(route_command(family, RouteOp::Remove))
             .attribute(ROUTER_ID_FIELD, Some(id))
             .build();
-        match self.send_rows_transport("remove route", remove).await {
+        match self
+            .send_rows_transport("remove route", remove, bypass_backoff)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(error) if error.is_missing_item() => Ok(()),
             Err(error) => Err(error.into()),
@@ -179,7 +187,17 @@ impl MikrotikRsClient {
     }
 
     async fn send_rows(&self, action: &str, command: Command) -> Result<Vec<RouterReply>> {
-        self.send_rows_transport(action, command)
+        self.send_rows_transport(action, command, false)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn send_rows_bypassing_backoff(
+        &self,
+        action: &str,
+        command: Command,
+    ) -> Result<Vec<RouterReply>> {
+        self.send_rows_transport(action, command, true)
             .await
             .map_err(Into::into)
     }
@@ -188,8 +206,15 @@ impl MikrotikRsClient {
         &self,
         action: &str,
         command: Command,
+        bypass_backoff: bool,
     ) -> RouterOsResult<Vec<RouterReply>> {
-        let mut stream = self.transport.send_command(action, command).await?;
+        let mut stream = if bypass_backoff {
+            self.transport
+                .send_command_bypassing_backoff(action, command)
+                .await?
+        } else {
+            self.transport.send_command(action, command).await?
+        };
         let mut rows = Vec::new();
         loop {
             match stream.next().await? {
@@ -203,6 +228,7 @@ impl MikrotikRsClient {
         &self,
         key: &RouteKey,
         comment: &str,
+        bypass_backoff: bool,
     ) -> Result<Option<RouterRoute>> {
         let print = CommandBuilder::new()
             .command(route_command(key.family(), RouteOp::Print))
@@ -211,7 +237,12 @@ impl MikrotikRsClient {
             .query_equal(ROUTE_DST_FIELD, &key.dst_address())
             .query_equal(ROUTE_COMMENT_FIELD, comment)
             .build();
-        let rows = self.send_rows("find route by comment", print).await?;
+        let rows = if bypass_backoff {
+            self.send_rows_bypassing_backoff("find route by comment", print)
+                .await?
+        } else {
+            self.send_rows("find route by comment", print).await?
+        };
         if let Some(row) = rows.into_iter().next() {
             let mut route =
                 parse_router_route_from_reply("find route by comment parse", key.family(), &row)?;
@@ -224,10 +255,57 @@ impl MikrotikRsClient {
     }
 
     async fn cleanup_validation_route(&self, key: &RouteKey, comment: &str) -> Result<()> {
-        if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
-            self.delete_route_if_matches(&route).await?;
+        if let Some(route) = self.find_route_by_exact_comment(key, comment, true).await? {
+            self.delete_route_if_matches_with_backoff(&route, true)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn delete_route_if_matches_with_backoff(
+        &self,
+        expected: &RouterRoute,
+        bypass_backoff: bool,
+    ) -> Result<bool> {
+        // Re-query by every stable key component before comparing the mutable
+        // fields. Besides avoiding an accidental id-reuse deletion, filtering
+        // by table also compensates for RouterOS versions that omit
+        // `routing-table` from an id-only print reply.
+        let print = CommandBuilder::new()
+            .command(route_command(expected.family, RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
+            .query_equal(ROUTER_ID_FIELD, &expected.id)
+            .query_equal(ROUTE_TABLE_FIELD, &expected.routing_table)
+            .query_equal(ROUTE_DST_FIELD, &expected.dst_address)
+            .build();
+        let rows = if bypass_backoff {
+            self.send_rows_bypassing_backoff("verify route before delete", print)
+                .await?
+        } else {
+            self.send_rows("verify route before delete", print).await?
+        };
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(false);
+        };
+        let mut current = parse_router_route_from_reply(
+            "verify route before delete parse",
+            expected.family,
+            &row,
+        )?;
+        if current.routing_table.is_empty() {
+            current.routing_table.clone_from(&expected.routing_table);
+        }
+        if current != *expected {
+            return Ok(false);
+        }
+        // The RouterOS API has no conditional remove primitive. This final
+        // id-only command is safe against OxiDNS reload races because the
+        // ownership namespace has one in-process writer. The fresh full-row
+        // comparison above is the best available guard against external
+        // changes; operators must not concurrently edit plugin-owned rows.
+        self.remove_route_by_id(&expected.id, expected.family, bypass_backoff)
+            .await?;
+        Ok(true)
     }
 
     async fn inspect_exact_routes(
@@ -588,7 +666,10 @@ impl MikrotikApi for MikrotikRsClient {
             .build();
         let _ = self.send_rows("add host route", add).await?;
 
-        let created = if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
+        let created = if let Some(route) = self
+            .find_route_by_exact_comment(key, comment, false)
+            .await?
+        {
             route
         } else {
             self.find_route(key, comment_prefix, plugin_tag)
@@ -632,7 +713,7 @@ impl MikrotikApi for MikrotikRsClient {
 
         let validation_result = async {
             let route = self
-                .find_route_by_exact_comment(key, comment)
+                .find_route_by_exact_comment(key, comment, false)
                 .await?
                 .ok_or_else(|| {
                     DnsError::plugin(
@@ -661,44 +742,8 @@ impl MikrotikApi for MikrotikRsClient {
     }
 
     async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool> {
-        // Re-query by every stable key component before comparing the mutable
-        // fields. Besides avoiding an accidental id-reuse deletion, filtering
-        // by table also compensates for RouterOS versions that omit
-        // `routing-table` from an id-only print reply.
-        let print = CommandBuilder::new()
-            .command(route_command(expected.family, RouteOp::Print))
-            .attribute(".proplist", Some(ROUTE_PROPLIST))
-            .query_equal(ROUTER_ID_FIELD, &expected.id)
-            .query_equal(ROUTE_TABLE_FIELD, &expected.routing_table)
-            .query_equal(ROUTE_DST_FIELD, &expected.dst_address)
-            .build();
-        let Some(row) = self
-            .send_rows("verify route before delete", print)
-            .await?
-            .into_iter()
-            .next()
-        else {
-            return Ok(false);
-        };
-        let mut current = parse_router_route_from_reply(
-            "verify route before delete parse",
-            expected.family,
-            &row,
-        )?;
-        if current.routing_table.is_empty() {
-            current.routing_table.clone_from(&expected.routing_table);
-        }
-        if current != *expected {
-            return Ok(false);
-        }
-        // The RouterOS API has no conditional remove primitive. This final
-        // id-only command is safe against OxiDNS reload races because the
-        // ownership namespace has one in-process writer. The fresh full-row
-        // comparison above is the best available guard against external
-        // changes; operators must not concurrently edit plugin-owned rows.
-        self.remove_route_by_id(&expected.id, expected.family)
-            .await?;
-        Ok(true)
+        self.delete_route_if_matches_with_backoff(expected, false)
+            .await
     }
 
     async fn connection_destinations(

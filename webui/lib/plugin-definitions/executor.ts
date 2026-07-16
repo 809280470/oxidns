@@ -1780,6 +1780,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "tls",
         label: "TLS",
         type: "object",
+        preserveEmptyObject: true,
         description: "启用 RouterOS API-SSL（通常为 8729 端口）。",
         fields: [
           { key: "server_name", label: "服务器名称", type: "text" },
@@ -1933,6 +1934,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "tls",
         label: "TLS",
         type: "object",
+        preserveEmptyObject: true,
         description: "启用 RouterOS API-SSL（通常为 8729 端口）。",
         fields: [
           { key: "server_name", label: "服务器名称", type: "text" },

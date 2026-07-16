@@ -356,6 +356,19 @@ impl RouterOsTransport {
             .await
     }
 
+    /// Sends one command without waiting for the current reconnect backoff.
+    ///
+    /// This is reserved for bounded cleanup operations whose objects may have
+    /// reached RouterOS before the response failed. A failed bypass attempt
+    /// still records the connection failure and schedules the next backoff.
+    pub(crate) async fn send_command_bypassing_backoff(
+        &self,
+        action: &str,
+        command: Command,
+    ) -> RouterOsResult<RouterOsCommandStream> {
+        self.send_command_with_backoff(action, command, true).await
+    }
+
     async fn send_command_with_backoff(
         &self,
         action: &str,
@@ -804,5 +817,39 @@ mod tests {
         let snapshot = transport.snapshot().await;
         assert!(snapshot.degraded);
         assert!(snapshot.retry_after.is_some());
+    }
+
+    #[tokio::test]
+    async fn operation_level_bypass_attempts_reconnect_during_backoff() {
+        let mut config = RouterOsConnectionConfig::plaintext_for_test();
+        config.address = "127.0.0.1:0".to_string();
+        let transport = RouterOsTransport::new(config);
+        {
+            let mut state = transport.state.lock().await;
+            state.consecutive_failures = 1;
+            state.retry_at = Some(Instant::now() + Duration::from_secs(30));
+        }
+        let command = || {
+            CommandBuilder::new()
+                .command("/system/identity/print")
+                .build()
+        };
+
+        let blocked = match transport.send_command("normal command", command()).await {
+            Ok(_) => panic!("normal command must respect reconnect backoff"),
+            Err(error) => error,
+        };
+        assert_eq!(blocked.kind, RouterOsErrorKind::Backoff);
+        assert_eq!(transport.snapshot().await.connect_attempt_total, 0);
+
+        let bypassed = match transport
+            .send_command_bypassing_backoff("cleanup command", command())
+            .await
+        {
+            Ok(_) => panic!("test endpoint cannot connect"),
+            Err(error) => error,
+        };
+        assert_ne!(bypassed.kind, RouterOsErrorKind::Backoff);
+        assert_eq!(transport.snapshot().await.connect_attempt_total, 1);
     }
 }

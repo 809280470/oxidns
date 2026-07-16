@@ -189,6 +189,19 @@ describe("optional object config fields", () => {
         .toHaveProperty("tls");
     }
   });
+
+  it("preserves an explicitly enabled empty RouterOS TLS object", () => {
+    expect(routerOsDefinitions).toHaveLength(2);
+    for (const definition of routerOsDefinitions) {
+      const values = createPluginConfigFormValues(definition.configSchema, {
+        tls: {},
+      });
+
+      expect(
+        serializePluginConfigValues(definition.configSchema, values),
+      ).toHaveProperty("tls", {});
+    }
+  });
 });
 
 describe("item option arrays", () => {
