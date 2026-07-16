@@ -58,7 +58,9 @@ struct CompletionNotify(Arc<Notify>);
 
 impl Drop for CompletionNotify {
     fn drop(&mut self) {
-        self.0.notify_one();
+        // `wait()` registers its waiter before checking `JoinHandle` state, so
+        // no stored permit is required when completion wins that race.
+        self.0.notify_waiters();
     }
 }
 
@@ -80,11 +82,6 @@ impl<T: Send + 'static> BackgroundReconcile<T> {
         self.handle.is_some()
     }
 
-    #[cfg(feature = "plugin-ros-route")]
-    pub(crate) fn notifier(&self) -> Arc<Notify> {
-        self.completed.clone()
-    }
-
     pub(crate) fn start<F>(&mut self, generation: u64, future: F) -> bool
     where
         F: Future<Output = Result<T>> + Send + 'static,
@@ -102,17 +99,30 @@ impl<T: Send + 'static> BackgroundReconcile<T> {
         true
     }
 
-    #[cfg(any(test, feature = "plugin-ros-route"))]
+    #[cfg(any(
+        test,
+        feature = "plugin-ros-address-list",
+        feature = "plugin-ros-route"
+    ))]
     pub(crate) fn is_finished(&self) -> bool {
         self.handle.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
-    #[cfg(feature = "plugin-ros-address-list")]
+    #[cfg(any(feature = "plugin-ros-address-list", feature = "plugin-ros-route"))]
     pub(crate) async fn wait(&self) {
         if self.handle.is_none() {
             std::future::pending::<()>().await;
         }
-        self.completed.notified().await;
+        let notified = self.completed.notified();
+        tokio::pin!(notified);
+        // Register first, then inspect the level-triggered JoinHandle state.
+        // Completion before registration is observed by `is_finished`, while
+        // completion after registration wakes this waiter.
+        notified.as_mut().enable();
+        if self.is_finished() {
+            return;
+        }
+        notified.await;
     }
 
     #[cfg(any(test, feature = "plugin-ros-route"))]
@@ -143,5 +153,55 @@ impl<T: Send + 'static> BackgroundReconcile<T> {
 impl<T: Send + 'static> Default for BackgroundReconcile<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_observes_completion_that_precedes_waiter_registration() {
+        let mut reconcile = BackgroundReconcile::new();
+        assert!(reconcile.start(7, async { Ok::<_, crate::infra::error::DnsError>("done") }));
+        while !reconcile.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::timeout(Duration::from_millis(100), reconcile.wait())
+            .await
+            .expect("finished reconcile must not lose its completion signal");
+        let result = reconcile
+            .take_finished()
+            .await
+            .expect("finished reconcile result")
+            .expect("reconcile task")
+            .expect("reconcile result");
+        assert_eq!(result.generation, 7);
+        assert_eq!(result.value, "done");
+    }
+
+    #[tokio::test]
+    async fn wait_wakes_when_reconcile_finishes_after_registration() {
+        let mut reconcile = BackgroundReconcile::new();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        assert!(reconcile.start(8, async move {
+            wait_release.await.expect("release reconcile");
+            Ok::<_, crate::infra::error::DnsError>("done")
+        }));
+
+        let wait = reconcile.wait();
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), wait.as_mut())
+                .await
+                .is_err()
+        );
+        release.send(()).expect("release reconcile");
+        tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("registered waiter must be notified");
     }
 }

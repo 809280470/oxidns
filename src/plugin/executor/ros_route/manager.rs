@@ -577,13 +577,11 @@ impl RouteManagerRuntime {
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
         let handle =
             RouteManagerHandle::new(&manager.cfg, manager.metrics.clone(), Some(lifecycle_tx));
-        let reconcile_notify = manager.reconcile.notifier();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker_handle = Some(tokio::spawn(run_manager_worker(
             tag.clone(),
             manager,
             handle.clone(),
-            reconcile_notify,
             lifecycle_rx,
             active,
             shutdown_rx,
@@ -1477,7 +1475,6 @@ async fn run_manager_worker(
     tag: String,
     mut manager: RouteManager,
     handle: RouteManagerHandle,
-    reconcile_notify: Arc<tokio::sync::Notify>,
     mut lifecycle_rx: mpsc::Receiver<LifecycleCommand>,
     mut active: bool,
     mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
@@ -1515,7 +1512,7 @@ async fn run_manager_worker(
                 break;
             }
             lifecycle = lifecycle_rx.recv() => lifecycle.map(Event::Lifecycle),
-            _ = reconcile_notify.notified(), if active && manager.reconcile.is_running() => Some(Event::ReconcileCompleted),
+            _ = manager.reconcile.wait(), if active && manager.reconcile.is_running() => Some(Event::ReconcileCompleted),
             control = handle.controls.recv(), if active => control.map(|(_, command)| Event::Control(command)),
             _ = retry_wakeup, if active => {
                 let now = tokio::time::Instant::now();
@@ -1848,7 +1845,7 @@ mod tests {
             self.validation_attempts.fetch_add(1, Ordering::Relaxed);
             if self
                 .validation_failures
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
