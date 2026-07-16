@@ -886,10 +886,24 @@ impl AddressListManager {
         // classifies the snapshot, mutates local state, and executes the
         // resulting precise persistent diff.
         let desired_comment = self.comment_for_persistent();
+        let mut owned_counts = AHashMap::<AddressListKey, usize>::new();
+        for entry in &existing {
+            if self.persistent_items.contains(&entry.key)
+                && decode_owned_comment(
+                    self.cfg.comment_prefix.as_str(),
+                    self.cfg.plugin_tag.as_str(),
+                    entry.comment.as_deref(),
+                )
+                .is_some()
+            {
+                *owned_counts.entry(entry.key.clone()).or_default() += 1;
+            }
+        }
         let correct_persistent = existing
             .iter()
             .filter(|entry| {
                 self.persistent_items.contains(&entry.key)
+                    && owned_counts.get(&entry.key) == Some(&1)
                     && entry.timeout.is_none()
                     && entry.comment.as_deref() == Some(desired_comment.as_str())
                     && decode_owned_comment(
@@ -951,51 +965,89 @@ impl AddressListManager {
             if self.persistent_items.contains(&entry.key) {
                 continue;
             }
-            match self.is_stale_persistent_entry_still_deletable(entry).await {
-                Ok(true) => {
-                    if let Err(error) = self
-                        .api
-                        .delete_entry_by_id(&entry.id, entry.key.family)
-                        .await
-                    {
-                        first_error.get_or_insert(error);
-                    }
+            if let Err(error) = self.api.delete_entry_if_matches(entry).await {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        let now = captured_at_ms;
+        let policy = LeasePolicy::new(self.cfg.min_ttl, self.cfg.max_ttl, self.cfg.fixed_ttl);
+        let mut remote_dynamic =
+            AHashMap::<AddressListKey, (LeaseDeadline, LeaseDeadline, usize)>::new();
+        for entry in &existing {
+            if self.persistent_items.contains(&entry.key)
+                || !decode_owned_comment(
+                    self.cfg.comment_prefix.as_str(),
+                    self.cfg.plugin_tag.as_str(),
+                    entry.comment.as_deref(),
+                )
+                .is_some_and(|meta| meta.kind == OwnedCommentKind::Dynamic)
+            {
+                continue;
+            }
+            let remote = entry
+                .timeout
+                .as_deref()
+                .and_then(parse_routeros_duration_secs)
+                .filter(|seconds| *seconds > 0)
+                .map_or(LeaseDeadline::Timeless, |seconds| {
+                    LeaseDeadline::At(now.saturating_add(u64::from(seconds).saturating_mul(1_000)))
+                });
+            let desired = policy.cap_recovered(remote, now);
+            remote_dynamic
+                .entry(entry.key.clone())
+                .and_modify(|(current_desired, current_remote, count)| {
+                    *current_desired = current_desired.max(desired);
+                    *current_remote = current_remote.max(remote);
+                    *count = count.saturating_add(1);
+                })
+                .or_insert((desired, remote, 1));
+        }
+
+        let duplicate_dynamic = remote_dynamic
+            .iter()
+            .filter(|(key, (_, _, count))| {
+                *count > 1
+                    && !self
+                        .leases
+                        .get(*key)
+                        .is_some_and(|lease| lease.desired_revision() > scan_generation)
+            })
+            .map(|(key, (_, remote, _))| {
+                (
+                    key.clone(),
+                    remote
+                        .remaining_secs(now)
+                        .map(|seconds| format!("{seconds}s")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let dynamic_comment = self.comment_for_dynamic();
+        let duplicate_results = join_all_bounded(
+            duplicate_dynamic.iter().map(|(key, timeout)| {
+                self.api.upsert_owned_entry(
+                    key,
+                    timeout.as_deref(),
+                    dynamic_comment.as_str(),
+                    self.cfg.comment_prefix.as_str(),
+                    self.cfg.plugin_tag.as_str(),
+                    false,
+                )
+            }),
+            UPSERT_PIPELINE_SIZE,
+        )
+        .await;
+        for ((key, _), result) in duplicate_dynamic.iter().zip(duplicate_results) {
+            match result {
+                Ok(Some(())) => {}
+                Ok(None) => {
+                    remote_dynamic.remove(key);
                 }
-                Ok(false) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
             }
         }
-
-        let now = captured_at_ms;
-        let remote_dynamic = existing
-            .iter()
-            .filter_map(|entry| {
-                decode_owned_comment(
-                    self.cfg.comment_prefix.as_str(),
-                    self.cfg.plugin_tag.as_str(),
-                    entry.comment.as_deref(),
-                )
-                .filter(|meta| meta.kind == OwnedCommentKind::Dynamic)
-                .map(|_| {
-                    let remote = entry
-                        .timeout
-                        .as_deref()
-                        .and_then(parse_routeros_duration_secs)
-                        .filter(|seconds| *seconds > 0)
-                        .map_or(LeaseDeadline::Timeless, |seconds| {
-                            LeaseDeadline::At(
-                                now.saturating_add(u64::from(seconds).saturating_mul(1_000)),
-                            )
-                        });
-                    let desired =
-                        LeasePolicy::new(self.cfg.min_ttl, self.cfg.max_ttl, self.cfg.fixed_ttl)
-                            .cap_recovered(remote, now);
-                    (entry.key.clone(), (desired, remote))
-                })
-            })
-            .collect::<AHashMap<_, _>>();
 
         // A snapshot may race successful writes. Newer generations win;
         // everything else follows actual RouterOS state, including timeless
@@ -1012,7 +1064,7 @@ impl AddressListManager {
         for key in missing_newer {
             self.leases.mark_unsynced(&key);
         }
-        for (key, (desired, remote)) in remote_dynamic {
+        for (key, (desired, remote, _)) in remote_dynamic {
             let keep_newer = self
                 .leases
                 .get(&key)
@@ -1031,23 +1083,6 @@ impl AddressListManager {
             self.empty_state_needs_reconcile = false;
         }
         Ok(())
-    }
-
-    async fn is_stale_persistent_entry_still_deletable(
-        &self,
-        entry: &RouterListEntry,
-    ) -> Result<bool> {
-        let current_entries = self.api.list_entries_by_key(&entry.key).await?;
-        Ok(current_entries.into_iter().any(|current| {
-            current.id == entry.id
-                && !self.persistent_items.contains(&current.key)
-                && decode_owned_comment(
-                    self.cfg.comment_prefix.as_str(),
-                    self.cfg.plugin_tag.as_str(),
-                    current.comment.as_deref(),
-                )
-                .is_some_and(|meta| meta.kind == OwnedCommentKind::Persistent)
-        }))
     }
 
     fn spawn_background_reconcile(&mut self, tag: String) {
@@ -1349,22 +1384,7 @@ impl AddressListManager {
     }
 
     async fn cleanup_entry_if_still_owned(&self, entry: &RouterListEntry) -> Result<()> {
-        let current = self.api.list_entries_by_key(&entry.key).await?;
-        let still_owned = current.iter().any(|candidate| {
-            candidate.id == entry.id
-                && candidate.key == entry.key
-                && decode_owned_comment(
-                    self.cfg.comment_prefix.as_str(),
-                    self.cfg.plugin_tag.as_str(),
-                    candidate.comment.as_deref(),
-                )
-                .is_some()
-        });
-        if still_owned {
-            self.api
-                .delete_entry_by_id(&entry.id, entry.key.family)
-                .await?;
-        }
+        self.api.delete_entry_if_matches(entry).await?;
         Ok(())
     }
 
@@ -1833,7 +1853,7 @@ fn defer_address_observation(
     }
 }
 
-fn parse_routeros_duration_secs(raw: &str) -> Option<u32> {
+pub(super) fn parse_routeros_duration_secs(raw: &str) -> Option<u32> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -1896,8 +1916,104 @@ pub(super) fn parse_router_address(family: AddressListFamily, raw: &str) -> Opti
 #[cfg(test)]
 mod observation_tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct DuplicateApi {
+        entries: Mutex<Vec<RouterListEntry>>,
+    }
+
+    #[async_trait]
+    impl MikrotikApi for DuplicateApi {
+        async fn list_entries(
+            &self,
+            _list4: Option<&str>,
+            _list6: Option<&str>,
+        ) -> Result<Vec<RouterListEntry>> {
+            Ok(self.entries.lock().expect("entries").clone())
+        }
+
+        async fn upsert_owned_entry(
+            &self,
+            key: &AddressListKey,
+            timeout: Option<&str>,
+            comment: &str,
+            comment_prefix: &str,
+            plugin_tag: &str,
+            _refresh_timeout: bool,
+        ) -> Result<Option<()>> {
+            let mut entries = self.entries.lock().expect("entries");
+            let canonical = entries
+                .iter()
+                .find(|entry| {
+                    entry.key == *key
+                        && decode_owned_comment(
+                            comment_prefix,
+                            plugin_tag,
+                            entry.comment.as_deref(),
+                        )
+                        .is_some()
+                })
+                .map(|entry| entry.id.clone());
+            let Some(canonical) = canonical else {
+                return Ok(None);
+            };
+            entries.retain(|entry| {
+                entry.key != *key
+                    || entry.id == canonical
+                    || decode_owned_comment(comment_prefix, plugin_tag, entry.comment.as_deref())
+                        .is_none()
+            });
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == canonical)
+                .expect("canonical entry");
+            entry.timeout = timeout.map(str::to_string);
+            entry.comment = Some(comment.to_string());
+            Ok(Some(()))
+        }
+
+        async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool> {
+            let mut entries = self.entries.lock().expect("entries");
+            let Some(index) = entries.iter().position(|entry| entry == expected) else {
+                return Ok(false);
+            };
+            entries.remove(index);
+            Ok(true)
+        }
+    }
+
+    fn duplicate_config() -> AddressListManagerConfig {
+        AppClock::start();
+        AddressListManagerConfig {
+            plugin_tag: "duplicate-test".to_string(),
+            address_list4: Some("policy".to_string()),
+            address_list6: None,
+            persistent_items: AHashSet::new(),
+            comment_prefix: "oxi".to_string(),
+            min_ttl: 1,
+            max_ttl: 3_600,
+            fixed_ttl: None,
+        }
+    }
+
+    fn list_entry(
+        id: &str,
+        key: &AddressListKey,
+        timeout: Option<&str>,
+        kind: OwnedCommentKind,
+    ) -> RouterListEntry {
+        RouterListEntry {
+            id: id.to_string(),
+            key: key.clone(),
+            timeout: timeout.map(str::to_string),
+            comment: Some(encode_comment("oxi", "duplicate-test", kind)),
+        }
+    }
 
     #[test]
     fn routeros_duration_parser_accepts_composite_values() {
@@ -1905,6 +2021,61 @@ mod observation_tests {
         assert_eq!(parse_routeros_duration_secs("300s"), Some(300));
         assert_eq!(parse_routeros_duration_secs("none"), None);
         assert_eq!(parse_routeros_duration_secs("5m30"), None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_longest_dynamic_timeout_and_removes_duplicates() {
+        let api = Arc::new(DuplicateApi::default());
+        let key = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)),
+            "policy".to_string(),
+        );
+        let short = list_entry("*short", &key, Some("30s"), OwnedCommentKind::Dynamic);
+        let long = list_entry("*long", &key, Some("300s"), OwnedCommentKind::Dynamic);
+        api.entries
+            .lock()
+            .expect("entries")
+            .extend([short.clone(), long.clone()]);
+        let mut manager = AddressListManager::new(api.clone(), duplicate_config());
+        let now = now_millis();
+
+        manager
+            .apply_reconcile_snapshot_at(vec![short, long], 0, now)
+            .await
+            .expect("reconcile");
+
+        let entries = api.entries.lock().expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].timeout.as_deref(), Some("300s"));
+        assert_eq!(
+            manager.leases.get(&key).expect("lease").desired(),
+            LeaseDeadline::At(now + 300_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_removes_duplicate_correct_persistent_entries() {
+        let api = Arc::new(DuplicateApi::default());
+        let key = AddressListKey::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 21)),
+            "policy".to_string(),
+        );
+        let first = list_entry("*first", &key, None, OwnedCommentKind::Persistent);
+        let second = list_entry("*second", &key, None, OwnedCommentKind::Persistent);
+        api.entries
+            .lock()
+            .expect("entries")
+            .extend([first.clone(), second.clone()]);
+        let mut config = duplicate_config();
+        config.persistent_items.insert(key);
+        let mut manager = AddressListManager::new(api.clone(), config);
+
+        manager
+            .apply_reconcile_snapshot_at(vec![first, second], 0, now_millis())
+            .await
+            .expect("reconcile");
+
+        assert_eq!(api.entries.lock().expect("entries").len(), 1);
     }
 
     #[tokio::test]

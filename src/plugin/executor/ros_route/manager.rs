@@ -238,6 +238,14 @@ fn is_validation_comment(prefix: &str, plugin_tag: &str, comment: &str) -> bool 
         ))
 }
 
+fn deadline_is_later(candidate: LeaseDeadline, current: LeaseDeadline) -> bool {
+    match (candidate, current) {
+        (LeaseDeadline::Timeless, LeaseDeadline::At(_)) => true,
+        (LeaseDeadline::At(candidate), LeaseDeadline::At(current)) => candidate > current,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SyncState {
     PendingCreate,
@@ -1228,12 +1236,6 @@ impl RouteManager {
 
         let mut seen = AHashSet::new();
         for (key, mut candidates) in owned {
-            let (route, meta) = candidates.remove(0);
-            for (duplicate, _) in candidates {
-                if let Err(error) = self.delete_route_if_still_owned(&duplicate).await {
-                    first_error.get_or_insert(error);
-                }
-            }
             seen.insert(key.clone());
             let Some(gateway) = self.gateway_for(key.family()).map(str::to_string) else {
                 continue;
@@ -1243,6 +1245,22 @@ impl RouteManager {
                     &self.cfg.comment_prefix,
                     &self.cfg.plugin_tag,
                 );
+                let canonical = candidates
+                    .iter()
+                    .position(|(route, meta)| {
+                        meta.kind == RouteCommentKind::Persistent
+                            && route.gateway.as_deref() == Some(gateway.as_str())
+                            && route.distance == Some(self.cfg.distance)
+                            && !route.disabled
+                            && route.comment.as_deref() == Some(expected.as_str())
+                    })
+                    .unwrap_or_default();
+                let (route, meta) = candidates.swap_remove(canonical);
+                for (duplicate, _) in candidates {
+                    if let Err(error) = self.delete_route_if_still_owned(&duplicate).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
                 let dirty = meta.kind != RouteCommentKind::Persistent
                     || route.gateway.as_deref() != Some(gateway.as_str())
                     || route.distance != Some(self.cfg.distance)
@@ -1262,6 +1280,93 @@ impl RouteManager {
                     },
                 );
                 continue;
+            }
+
+            let newer = self
+                .leases
+                .get(&key)
+                .is_some_and(|lease| lease.desired_revision() > snapshot.generation);
+            let mut recovered_deadline = None;
+            let mut recovered_seen = 0;
+            let mut canonical_dynamic = None;
+            for (index, (_, meta)) in candidates.iter().enumerate() {
+                if meta.kind != RouteCommentKind::Dynamic {
+                    continue;
+                }
+                let deadline = self
+                    .policy()
+                    .cap_recovered(meta.expires_at_ms, meta.last_seen_ms);
+                if recovered_deadline.is_none_or(|current| deadline_is_later(deadline, current)) {
+                    recovered_deadline = Some(deadline);
+                    canonical_dynamic = Some(index);
+                }
+                recovered_seen = recovered_seen.max(meta.last_seen_ms);
+            }
+
+            if let Some(canonical) = canonical_dynamic {
+                let (route, _) = candidates.swap_remove(canonical);
+                for (duplicate, _) in candidates {
+                    if let Err(error) = self.delete_route_if_still_owned(&duplicate).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                let deadline = recovered_deadline.expect("dynamic candidate has a deadline");
+                if deadline.is_expired(now) && !newer {
+                    self.routes.insert(
+                        key,
+                        RouteState {
+                            gateway,
+                            distance: self.cfg.distance,
+                            router_id: Some(route.id),
+                            sync_state: SyncState::PendingDynamicDelete,
+                        },
+                    );
+                    continue;
+                }
+                if !newer {
+                    self.leases.recover(
+                        key.clone(),
+                        deadline,
+                        recovered_seen,
+                        snapshot.generation,
+                        now,
+                    );
+                }
+                let lease = self.leases.get(&key).copied();
+                let expected = lease.map(|lease| {
+                    RouteCommentCodec::encode_dynamic(
+                        &self.cfg.comment_prefix,
+                        &self.cfg.plugin_tag,
+                        lease.desired(),
+                        lease.last_observed_ms(),
+                    )
+                });
+                let dirty = newer
+                    || route.gateway.as_deref() != Some(gateway.as_str())
+                    || route.distance != Some(self.cfg.distance)
+                    || route.disabled
+                    || expected.as_deref() != route.comment.as_deref();
+                self.routes.insert(
+                    key,
+                    RouteState {
+                        gateway,
+                        distance: self.cfg.distance,
+                        router_id: Some(route.id),
+                        sync_state: if dirty {
+                            SyncState::Dirty
+                        } else {
+                            SyncState::Synced
+                        },
+                    },
+                );
+                continue;
+            }
+
+            let (route, meta) = candidates.swap_remove(0);
+            for (duplicate, _) in candidates {
+                if let Err(error) = self.delete_route_if_still_owned(&duplicate).await {
+                    first_error.get_or_insert(error);
+                }
             }
             if meta.kind == RouteCommentKind::Persistent {
                 if self
@@ -1291,61 +1396,6 @@ impl RouteManager {
                 );
                 continue;
             }
-            let deadline = self
-                .policy()
-                .cap_recovered(meta.expires_at_ms, meta.last_seen_ms);
-            let newer = self
-                .leases
-                .get(&key)
-                .is_some_and(|lease| lease.desired_revision() > snapshot.generation);
-            if deadline.is_expired(now) && !newer {
-                self.routes.insert(
-                    key,
-                    RouteState {
-                        gateway,
-                        distance: self.cfg.distance,
-                        router_id: Some(route.id),
-                        sync_state: SyncState::PendingDynamicDelete,
-                    },
-                );
-                continue;
-            }
-            if !newer {
-                self.leases.recover(
-                    key.clone(),
-                    deadline,
-                    meta.last_seen_ms,
-                    snapshot.generation,
-                    now,
-                );
-            }
-            let lease = self.leases.get(&key).copied();
-            let expected = lease.map(|lease| {
-                RouteCommentCodec::encode_dynamic(
-                    &self.cfg.comment_prefix,
-                    &self.cfg.plugin_tag,
-                    lease.desired(),
-                    lease.last_observed_ms(),
-                )
-            });
-            let dirty = newer
-                || route.gateway.as_deref() != Some(gateway.as_str())
-                || route.distance != Some(self.cfg.distance)
-                || route.disabled
-                || expected.as_deref() != route.comment.as_deref();
-            self.routes.insert(
-                key,
-                RouteState {
-                    gateway,
-                    distance: self.cfg.distance,
-                    router_id: Some(route.id),
-                    sync_state: if dirty {
-                        SyncState::Dirty
-                    } else {
-                        SyncState::Synced
-                    },
-                },
-            );
         }
 
         let local_keys = self.routes.keys().cloned().collect::<Vec<_>>();
@@ -1377,7 +1427,11 @@ impl RouteManager {
         if let Err(error) = self.sync_keys(keys, now).await {
             first_error.get_or_insert(error);
         }
-        if self.persistent.is_empty() && self.leases.is_empty() {
+        if first_error.is_none()
+            && self.persistent.is_empty()
+            && self.leases.is_empty()
+            && self.routes.is_empty()
+        {
             self.empty_state_needs_reconcile = false;
         }
         first_error.map_or(Ok(()), Err)
@@ -1766,6 +1820,7 @@ mod tests {
         connections: Mutex<AHashSet<IpAddr>>,
         validation_attempts: AtomicUsize,
         validation_failures: AtomicUsize,
+        delete_failures: AtomicUsize,
     }
 
     impl MockApi {
@@ -1877,6 +1932,15 @@ mod tests {
         }
 
         async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool> {
+            if self
+                .delete_failures
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(DnsError::plugin("route delete unavailable"));
+            }
             let mut routes = self.routes.lock().expect("routes");
             let Some(index) = routes.iter().position(|route| route == expected) else {
                 return Ok(false);
@@ -2149,6 +2213,105 @@ mod tests {
 
         assert_eq!(api.routes().len(), 1);
         assert_eq!(api.routes()[0].comment.as_deref(), Some("operator-owned"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_the_longest_dynamic_duplicate_lease() {
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), config(None, false));
+        let key = RouteKey::new("203.0.113.94".parse().expect("ip"), "policy".to_string());
+        let now = now_millis();
+        let route = |id: &str, deadline, seen| RouterRoute {
+            id: id.to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: key.dst_address(),
+            routing_table: key.table.clone(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(RouteCommentCodec::encode_dynamic(
+                "fdns",
+                "route-test",
+                deadline,
+                seen,
+            )),
+            disabled: false,
+        };
+        let expired = route(
+            "*expired",
+            LeaseDeadline::At(now.saturating_sub(1_000)),
+            now.saturating_sub(60_000),
+        );
+        let valid = route(
+            "*valid",
+            LeaseDeadline::At(now.saturating_add(300_000)),
+            now,
+        );
+        api.routes
+            .lock()
+            .expect("routes")
+            .extend([expired.clone(), valid.clone()]);
+
+        manager
+            .apply_snapshot(VersionedSnapshot {
+                generation: 0,
+                value: vec![expired, valid],
+            })
+            .await
+            .expect("reconcile");
+
+        let routes = api.routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].id, "*valid");
+        assert!(
+            manager
+                .leases
+                .get(&key)
+                .is_some_and(|lease| !lease.desired().is_expired(now))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_validation_cleanup_keeps_empty_reconcile_retry_enabled() {
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), config(None, false));
+        let key = RouteKey::new("198.18.0.11".parse().expect("ip"), "policy".to_string());
+        let route = RouterRoute {
+            id: "*validation-retry".to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: key.dst_address(),
+            routing_table: key.table,
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(format!(
+                "{};nonce=2",
+                RouteCommentCodec::prefix("fdns", "route-test", COMMENT_KIND_GATEWAY_CHECK)
+            )),
+            disabled: true,
+        };
+        api.routes.lock().expect("routes").push(route.clone());
+        api.delete_failures.store(1, Ordering::Release);
+
+        assert!(
+            manager
+                .apply_snapshot(VersionedSnapshot {
+                    generation: 0,
+                    value: vec![route],
+                })
+                .await
+                .is_err()
+        );
+        assert!(manager.empty_state_needs_reconcile);
+        assert_eq!(api.routes().len(), 1);
+
+        manager
+            .apply_snapshot(VersionedSnapshot {
+                generation: 0,
+                value: api.routes(),
+            })
+            .await
+            .expect("retry cleanup");
+        assert!(api.routes().is_empty());
+        assert!(!manager.empty_state_needs_reconcile);
     }
 
     #[tokio::test]

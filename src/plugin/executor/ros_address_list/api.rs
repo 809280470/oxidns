@@ -13,6 +13,7 @@ use mikrotik_rs::{Command, CommandBuilder};
 
 use super::manager::{
     AddressListFamily, AddressListKey, decode_owned_comment, parse_router_address,
+    parse_routeros_duration_secs,
 };
 use crate::infra::error::{DnsError, Result};
 use crate::infra::mikrotik::transport::{
@@ -59,7 +60,7 @@ pub(super) const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 5;
 
 pub(super) type MikrotikApiTimeouts = RouterOsTimeouts;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct RouterListEntry {
     /// RouterOS internal row id (for example `*123`).
     pub(super) id: String,
@@ -86,8 +87,6 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         list4: Option<&str>,
         list6: Option<&str>,
     ) -> Result<Vec<RouterListEntry>>;
-    /// List entries matching one exact normalized key.
-    async fn list_entries_by_key(&self, key: &AddressListKey) -> Result<Vec<RouterListEntry>>;
     /// Upsert one plugin-owned address-list entry.
     ///
     /// Returning `Ok(None)` means a foreign entry already occupies the same
@@ -101,8 +100,9 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         plugin_tag: &str,
         refresh_timeout: bool,
     ) -> Result<Option<()>>;
-    /// Delete one row by RouterOS internal id.
-    async fn delete_entry_by_id(&self, id: &str, family: AddressListFamily) -> Result<()>;
+    /// Re-read one row and delete it only while the ownership-relevant
+    /// snapshot still matches.
+    async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool>;
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +210,21 @@ impl MikrotikRsClient {
             .await?;
         Ok(())
     }
+
+    async fn remove_entry_by_id(&self, id: &str, family: AddressListFamily) -> Result<()> {
+        let remove = CommandBuilder::new()
+            .command(address_list_command(family, ListOp::Remove))
+            .attribute(ADDRESS_ID_FIELD, Some(id))
+            .build();
+        match self
+            .send_rows_transport("remove address-list entry", remove)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.is_missing_item() => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -272,6 +287,32 @@ fn parse_router_list_entry(
         timeout,
         comment,
     }))
+}
+
+fn timeout_snapshot_matches(expected: Option<&str>, current: Option<&str>) -> bool {
+    match (expected, current) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            match (
+                parse_routeros_duration_secs(expected),
+                parse_routeros_duration_secs(current),
+            ) {
+                // RouterOS counts timed entries down between the two reads.
+                // A larger current value means the row was refreshed after
+                // the snapshot and must not be removed by the older action.
+                (Some(expected), Some(current)) => current <= expected,
+                _ => current == expected,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn entry_matches_delete_snapshot(expected: &RouterListEntry, current: &RouterListEntry) -> bool {
+    current.id == expected.id
+        && current.key == expected.key
+        && current.comment == expected.comment
+        && timeout_snapshot_matches(expected.timeout.as_deref(), current.timeout.as_deref())
 }
 
 #[async_trait]
@@ -338,10 +379,6 @@ impl MikrotikApi for MikrotikRsClient {
         Ok(entries)
     }
 
-    async fn list_entries_by_key(&self, key: &AddressListKey) -> Result<Vec<RouterListEntry>> {
-        self.find_entries_by_key(key).await
-    }
-
     async fn upsert_owned_entry(
         &self,
         key: &AddressListKey,
@@ -373,10 +410,13 @@ impl MikrotikApi for MikrotikRsClient {
             return Ok(None);
         }
 
-        let mut iter = owned.into_iter();
-        let mut canonical = iter.next();
-        for extra in iter {
-            self.delete_entry_by_id(&extra.id, extra.key.family).await?;
+        let canonical = owned
+            .iter()
+            .position(|entry| entry.timeout.is_some() == timeout.is_some())
+            .unwrap_or_default();
+        let mut canonical = (!owned.is_empty()).then(|| owned.swap_remove(canonical));
+        for extra in owned {
+            self.delete_entry_if_matches(&extra).await?;
         }
 
         if let Some(existing) = canonical.take() {
@@ -384,8 +424,11 @@ impl MikrotikApi for MikrotikRsClient {
             // safest transition is delete-and-add when the timeout kind changes.
             let timeout_kind_changed = existing.timeout.is_some() != timeout.is_some();
             if timeout_kind_changed {
-                self.delete_entry_by_id(&existing.id, existing.key.family)
-                    .await?;
+                if !self.delete_entry_if_matches(&existing).await? {
+                    return Err(DnsError::plugin(
+                        "ros_address_list entry changed during timeout-kind transition",
+                    ));
+                }
                 self.add_entry(key, timeout, comment).await?;
                 return Ok(Some(()));
             }
@@ -413,19 +456,17 @@ impl MikrotikApi for MikrotikRsClient {
         Ok(Some(()))
     }
 
-    async fn delete_entry_by_id(&self, id: &str, family: AddressListFamily) -> Result<()> {
-        let remove = CommandBuilder::new()
-            .command(address_list_command(family, ListOp::Remove))
-            .attribute(ADDRESS_ID_FIELD, Some(id))
-            .build();
-        match self
-            .send_rows_transport("remove address-list entry", remove)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(error) if error.is_missing_item() => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+    async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool> {
+        let current = self.find_entries_by_key(&expected.key).await?;
+        let Some(current) = current
+            .into_iter()
+            .find(|current| entry_matches_delete_snapshot(expected, current))
+        else {
+            return Ok(false);
+        };
+        self.remove_entry_by_id(&current.id, current.key.family)
+            .await?;
+        Ok(true)
     }
 }
 
@@ -471,5 +512,26 @@ mod tests {
         .expect_err("missing address field must remain an error");
 
         assert!(error.to_string().contains("missing 'address'"));
+    }
+
+    #[test]
+    fn delete_snapshot_allows_countdown_but_rejects_refresh_or_ownership_change() {
+        let key = AddressListKey::new("192.0.2.10".parse().expect("ip"), "policy".to_string());
+        let expected = RouterListEntry {
+            id: "*1".to_string(),
+            key,
+            timeout: Some("300s".to_string()),
+            comment: Some("oxi;pg=test;kind=D".to_string()),
+        };
+        let mut current = expected.clone();
+        current.timeout = Some("299s".to_string());
+        assert!(entry_matches_delete_snapshot(&expected, &current));
+
+        current.timeout = Some("301s".to_string());
+        assert!(!entry_matches_delete_snapshot(&expected, &current));
+
+        current.timeout = Some("299s".to_string());
+        current.comment = Some("operator-owned".to_string());
+        assert!(!entry_matches_delete_snapshot(&expected, &current));
     }
 }
