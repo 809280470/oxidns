@@ -1290,6 +1290,16 @@ mod tests {
             Ok(Some(()))
         }
 
+        async fn dedupe_owned_entries(
+            &self,
+            _key: &AddressListKey,
+            _comment_prefix: &str,
+            _plugin_tag: &str,
+            _kind: OwnedCommentKind,
+        ) -> Result<Option<RouterListEntry>> {
+            Ok(None)
+        }
+
         async fn delete_entry_if_matches(&self, _expected: &RouterListEntry) -> Result<bool> {
             Ok(false)
         }
@@ -1420,6 +1430,32 @@ mod tests {
                 },
             );
             Ok(Some(()))
+        }
+
+        async fn dedupe_owned_entries(
+            &self,
+            key: &AddressListKey,
+            comment_prefix: &str,
+            plugin_tag: &str,
+            kind: OwnedCommentKind,
+        ) -> Result<Option<RouterListEntry>> {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| DnsError::plugin("mock api lock poisoned"))?;
+            Ok(state
+                .entries
+                .values()
+                .find(|entry| {
+                    entry.key == *key
+                        && decode_owned_comment(
+                            comment_prefix,
+                            plugin_tag,
+                            entry.comment.as_deref(),
+                        )
+                        .is_some_and(|meta| meta.kind == kind)
+                })
+                .cloned())
         }
 
         async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool> {

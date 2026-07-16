@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder};
 
 use super::manager::{
-    AddressListFamily, AddressListKey, decode_owned_comment, parse_router_address,
-    parse_routeros_duration_secs,
+    AddressListFamily, AddressListKey, OwnedCommentKind, decode_owned_comment,
+    parse_router_address, parse_routeros_duration_secs,
 };
 use crate::infra::error::{DnsError, Result};
 use crate::infra::mikrotik::transport::{
@@ -100,6 +100,15 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         plugin_tag: &str,
         refresh_timeout: bool,
     ) -> Result<Option<()>>;
+    /// Collapse duplicate rows of one owned kind without creating or
+    /// refreshing an entry. The returned row is re-read after cleanup.
+    async fn dedupe_owned_entries(
+        &self,
+        key: &AddressListKey,
+        comment_prefix: &str,
+        plugin_tag: &str,
+        kind: OwnedCommentKind,
+    ) -> Result<Option<RouterListEntry>>;
     /// Re-read one row and delete it only while the ownership-relevant
     /// snapshot still matches.
     async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool>;
@@ -315,6 +324,18 @@ fn entry_matches_delete_snapshot(expected: &RouterListEntry, current: &RouterLis
         && timeout_snapshot_matches(expected.timeout.as_deref(), current.timeout.as_deref())
 }
 
+fn timeout_rank(entry: &RouterListEntry) -> (bool, u32) {
+    match entry
+        .timeout
+        .as_deref()
+        .and_then(parse_routeros_duration_secs)
+        .filter(|seconds| *seconds > 0)
+    {
+        Some(seconds) => (false, seconds),
+        None => (true, 0),
+    }
+}
+
 #[async_trait]
 impl MikrotikApi for MikrotikRsClient {
     fn begin_shutdown_cleanup(&self) {
@@ -454,6 +475,58 @@ impl MikrotikApi for MikrotikRsClient {
 
         self.add_entry(key, timeout, comment).await?;
         Ok(Some(()))
+    }
+
+    async fn dedupe_owned_entries(
+        &self,
+        key: &AddressListKey,
+        comment_prefix: &str,
+        plugin_tag: &str,
+        kind: OwnedCommentKind,
+    ) -> Result<Option<RouterListEntry>> {
+        let mut owned = self
+            .find_entries_by_key(key)
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                decode_owned_comment(comment_prefix, plugin_tag, entry.comment.as_deref())
+                    .is_some_and(|meta| meta.kind == kind)
+            })
+            .collect::<Vec<_>>();
+
+        if owned.len() <= 1 {
+            return Ok(owned.pop());
+        }
+
+        let canonical = owned
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, entry)| timeout_rank(entry))
+            .map(|(index, _)| index)
+            .expect("duplicate owned rows are non-empty");
+        owned.swap_remove(canonical);
+        for extra in owned {
+            // A false result can mean either natural expiry or a concurrent
+            // refresh. Re-read below to distinguish convergence from a race.
+            self.delete_entry_if_matches(&extra).await?;
+        }
+
+        let mut current = self
+            .find_entries_by_key(key)
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                decode_owned_comment(comment_prefix, plugin_tag, entry.comment.as_deref())
+                    .is_some_and(|meta| meta.kind == kind)
+            })
+            .collect::<Vec<_>>();
+        match current.len() {
+            0 => Ok(None),
+            1 => Ok(current.pop()),
+            _ => Err(DnsError::plugin(
+                "ros_address_list entries changed during duplicate cleanup",
+            )),
+        }
     }
 
     async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool> {
