@@ -87,13 +87,14 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         require_ipv4: bool,
         require_ipv6: bool,
     ) -> Result<Vec<RouterRoute>>;
-    /// Find one route by route key (family + table + destination).
-    async fn find_route(
+    /// Find all plugin-owned routes by route key (family + table +
+    /// destination).
+    async fn find_routes(
         &self,
         key: &RouteKey,
         comment_prefix: &str,
         plugin_tag: &str,
-    ) -> Result<Option<RouterRoute>>;
+    ) -> Result<Vec<RouterRoute>>;
     /// Create or update one host route and return its RouterOS internal id.
     async fn upsert_host_route(
         &self,
@@ -587,16 +588,23 @@ impl MikrotikApi for MikrotikRsClient {
         Ok(routes)
     }
 
-    async fn find_route(
+    async fn find_routes(
         &self,
         key: &RouteKey,
         comment_prefix: &str,
         plugin_tag: &str,
-    ) -> Result<Option<RouterRoute>> {
-        let inspection = self
+    ) -> Result<Vec<RouterRoute>> {
+        let mut inspection = self
             .inspect_exact_routes(key, comment_prefix, plugin_tag)
             .await?;
-        Ok(inspection.owned)
+        let mut routes = Vec::with_capacity(
+            usize::from(inspection.owned.is_some()) + inspection.duplicate_owned.len(),
+        );
+        if let Some(route) = inspection.owned.take() {
+            routes.push(route);
+        }
+        routes.append(&mut inspection.duplicate_owned);
+        Ok(routes)
     }
 
     async fn upsert_host_route(
@@ -672,8 +680,10 @@ impl MikrotikApi for MikrotikRsClient {
         {
             route
         } else {
-            self.find_route(key, comment_prefix, plugin_tag)
+            self.find_routes(key, comment_prefix, plugin_tag)
                 .await?
+                .into_iter()
+                .next()
                 .ok_or_else(|| {
                     DnsError::plugin("ros_route upsert route succeeded but route id not found")
                 })?

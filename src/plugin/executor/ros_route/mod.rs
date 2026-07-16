@@ -257,7 +257,7 @@ use self::manager::{
 use crate::infra::mikrotik::ip_prefix::IpPrefix;
 use crate::infra::mikrotik::lifecycle::{ActiveInstanceRegistry, WriterGate};
 use crate::infra::mikrotik::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
-use crate::infra::mikrotik::{ObservedAddr, collect_observed_addrs};
+use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
 
 #[derive(Debug)]
 struct MikrotikExecutor {
@@ -404,6 +404,19 @@ async fn commit_prepared_route_instance(tag: &str, instance_id: u64) {
 /// not suppress cleanup of the old namespace. The stack also restores the
 /// previous metric source when candidate initialization later rolls back.
 async fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
+    release_active_route_instance_until(
+        tag,
+        instance_id,
+        tokio::time::Instant::now() + SHUTDOWN_TIMEOUT,
+    )
+    .await
+}
+
+async fn release_active_route_instance_until(
+    tag: &str,
+    instance_id: u64,
+    deadline: tokio::time::Instant,
+) -> bool {
     let _transition = route_lifecycle_transition().lock().await;
     let Some((
         cleanup_allowed,
@@ -451,23 +464,45 @@ async fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
         return false;
     };
 
-    removed_writer_gate.wait_idle().await;
-    let pending = if let Some(handle) = removed_handle {
-        handle.quiesce().await
+    let (pending, handoff_ready) = if transfer.is_some() {
+        let handoff_deadline = deadline
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(deadline);
+        if tokio::time::timeout_at(handoff_deadline, removed_writer_gate.wait_idle())
+            .await
+            .is_err()
+        {
+            warn!(plugin = %tag, "ros_route writer drain exceeded shutdown deadline");
+            (RoutePendingWork::default(), false)
+        } else if let Some(handle) = removed_handle {
+            match tokio::time::timeout_at(handoff_deadline, handle.quiesce()).await {
+                Ok(pending) => (pending, true),
+                Err(_) => {
+                    warn!(plugin = %tag, "ros_route manager quiesce exceeded shutdown deadline");
+                    (RoutePendingWork::default(), false)
+                }
+            }
+        } else {
+            (RoutePendingWork::default(), true)
+        }
     } else {
-        RoutePendingWork::default()
+        (RoutePendingWork::default(), false)
     };
     removed_manager_active.store(false, Ordering::Release);
-    if let Some(transfer) = transfer
+    if handoff_ready
+        && let Some(transfer) = transfer
         && let Some(handle) = &transfer.manager_handle
     {
-        match handle.activate(pending).await {
-            Ok(()) => {
+        match tokio::time::timeout_at(deadline, handle.activate(pending)).await {
+            Ok(Ok(())) => {
                 transfer.manager_active.store(true, Ordering::Release);
                 handle.request_reconcile();
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 warn!(plugin = %tag, err = %error, "ros_route failed to transfer manager ownership")
+            }
+            Err(_) => {
+                warn!(plugin = %tag, "ros_route manager activation exceeded shutdown deadline")
             }
         }
     }
@@ -669,14 +704,18 @@ impl Plugin for MikrotikExecutor {
     }
 
     async fn destroy(&self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         let is_last_instance = if self.active_registered.swap(false, Ordering::AcqRel) {
-            release_active_route_instance(&self.tag, self.instance_id).await
+            release_active_route_instance_until(&self.tag, self.instance_id, deadline).await
         } else {
             false
         };
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
             return runtime
-                .shutdown(self.config.cleanup_on_shutdown && is_last_instance)
+                .shutdown_until(
+                    self.config.cleanup_on_shutdown && is_last_instance,
+                    deadline,
+                )
                 .await;
         }
         Ok(())
@@ -1591,5 +1630,52 @@ gateway4: "192.0.2.1"
         assert!(!release_active_route_instance(&tag, sequence + 1).await);
         assert!(old_handle.take_reconcile_for_test());
         assert!(release_active_route_instance(&tag, sequence).await);
+    }
+
+    #[tokio::test]
+    async fn compatible_release_bounds_writer_drain_by_shutdown_deadline() {
+        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
+        let tag = format!("route-release-deadline-{sequence}");
+        let namespace = RouteOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            routing_table: "policy".to_string(),
+            comment_prefix: "fdns".to_string(),
+        };
+        let (old_gate, old_active) = register_prepared_route_instance(
+            &tag,
+            sequence,
+            namespace.clone(),
+            Arc::new(RosRouteMetrics::new(tag.clone())),
+            None,
+        )
+        .await
+        .expect("old runtime");
+        old_active.store(true, Ordering::Release);
+        let permit = old_gate.enter().expect("in-flight writer");
+        let (_, replacement_active) = register_prepared_route_instance(
+            &tag,
+            sequence + 1,
+            namespace,
+            Arc::new(RosRouteMetrics::new(tag.clone())),
+            None,
+        )
+        .await
+        .expect("replacement runtime");
+
+        let released = tokio::time::timeout(
+            Duration::from_millis(200),
+            release_active_route_instance_until(
+                &tag,
+                sequence,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("release must respect deadline");
+        assert!(!released);
+
+        drop(permit);
+        replacement_active.store(true, Ordering::Release);
+        assert!(release_active_route_instance(&tag, sequence + 1).await);
     }
 }

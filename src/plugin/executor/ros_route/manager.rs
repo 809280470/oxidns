@@ -623,8 +623,16 @@ impl RouteManagerRuntime {
         self.handle.clone()
     }
 
-    pub(super) async fn shutdown(mut self, cleanup: bool) -> Result<()> {
+    pub(super) async fn shutdown(self, cleanup: bool) -> Result<()> {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        self.shutdown_until(cleanup, deadline).await
+    }
+
+    pub(super) async fn shutdown_until(
+        mut self,
+        cleanup: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let tasks = [self.sweep_task_id.take(), self.reconcile_task_id.take()]
             .into_iter()
             .flatten()
@@ -968,13 +976,14 @@ impl RouteManager {
         now_ms: u64,
         first_error: &mut Option<DnsError>,
     ) {
-        let mut dynamic = AHashMap::<RouteFamily, Vec<(RouteKey, RouterRoute)>>::new();
+        let mut dynamic = AHashMap::<RouteFamily, Vec<(RouteKey, Vec<RouterRoute>)>>::new();
         let mut immediate = Vec::new();
         for key in keys {
             let Some(state) = self.routes.get(&key) else {
                 continue;
             };
-            if matches!(state.sync_state, SyncState::PendingDynamicDelete)
+            let pending_dynamic = matches!(state.sync_state, SyncState::PendingDynamicDelete);
+            if pending_dynamic
                 && self.cfg.conntrack_guard
                 && self
                     .connection_retry_after
@@ -985,23 +994,22 @@ impl RouteManager {
             }
             match self
                 .api
-                .find_route(&key, &self.cfg.comment_prefix, &self.cfg.plugin_tag)
+                .find_routes(&key, &self.cfg.comment_prefix, &self.cfg.plugin_tag)
                 .await
             {
-                Ok(Some(route)) if matches!(state.sync_state, SyncState::PendingDynamicDelete) => {
-                    dynamic.entry(key.family()).or_default().push((key, route));
+                Ok(routes) if routes.is_empty() => self.forget_deleted(&key),
+                Ok(routes) if pending_dynamic => {
+                    dynamic.entry(key.family()).or_default().push((key, routes));
                 }
-                Ok(Some(route)) => immediate.push((key, route)),
-                Ok(None) => self.forget_deleted(&key),
+                Ok(routes) => immediate.push((key, routes)),
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
             }
         }
-        for (key, route) in immediate {
-            match self.delete_route_if_still_owned(&route).await {
-                Ok(true) => self.forget_deleted(&key),
-                Ok(false) => self.forget_deleted(&key),
+        for (key, routes) in immediate {
+            match self.delete_routes_if_still_owned(&routes).await {
+                Ok(()) => self.forget_deleted(&key),
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }
@@ -1041,7 +1049,7 @@ impl RouteManager {
             } else {
                 AHashSet::new()
             };
-            for (key, route) in candidates {
+            for (key, routes) in candidates {
                 if active.contains(&key.ip) {
                     self.defer_connection_check(&key, now_ms);
                     if let Some(metrics) = &self.metrics {
@@ -1051,9 +1059,8 @@ impl RouteManager {
                     }
                     continue;
                 }
-                match self.delete_route_if_still_owned(&route).await {
-                    Ok(true) => self.forget_deleted(&key),
-                    Ok(false) => self.forget_deleted(&key),
+                match self.delete_routes_if_still_owned(&routes).await {
+                    Ok(()) => self.forget_deleted(&key),
                     Err(error) => {
                         first_error.get_or_insert(error);
                     }
@@ -1407,6 +1414,16 @@ impl RouteManager {
             return Ok(false);
         }
         self.api.delete_route_if_matches(route).await
+    }
+
+    async fn delete_routes_if_still_owned(&self, routes: &[RouterRoute]) -> Result<()> {
+        let mut first_error = None;
+        for route in routes {
+            if let Err(error) = self.delete_route_if_still_owned(route).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn cleanup_route_if_still_owned(&self, route: &RouterRoute) -> Result<()> {
@@ -1778,28 +1795,32 @@ mod tests {
                 .collect())
         }
 
-        async fn find_route(
+        async fn find_routes(
             &self,
             key: &RouteKey,
             comment_prefix: &str,
             plugin_tag: &str,
-        ) -> Result<Option<RouterRoute>> {
-            Ok(self.routes().into_iter().find(|route| {
-                route.dst_address == key.dst_address()
-                    && route.routing_table == key.table
-                    && route.comment.as_deref().is_some_and(|comment| {
-                        matches!(
-                            RouteCommentCodec::decode(
-                                comment_prefix,
-                                plugin_tag,
-                                route.family,
-                                &route.dst_address,
-                                comment,
-                            ),
-                            Ok(Some(_))
-                        )
-                    })
-            }))
+        ) -> Result<Vec<RouterRoute>> {
+            Ok(self
+                .routes()
+                .into_iter()
+                .filter(|route| {
+                    route.dst_address == key.dst_address()
+                        && route.routing_table == key.table
+                        && route.comment.as_deref().is_some_and(|comment| {
+                            matches!(
+                                RouteCommentCodec::decode(
+                                    comment_prefix,
+                                    plugin_tag,
+                                    route.family,
+                                    &route.dst_address,
+                                    comment,
+                                ),
+                                Ok(Some(_))
+                            )
+                        })
+                })
+                .collect())
         }
 
         async fn upsert_host_route(
@@ -2291,7 +2312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conntrack_guard_defers_only_dynamic_host_deletion() {
+    async fn conntrack_guard_defers_all_dynamic_duplicate_deletions() {
         let api = Arc::new(MockApi::default());
         let mut manager = RouteManager::new(api.clone(), config(Some(1), true));
         let ip = "203.0.113.12".parse().expect("ip");
@@ -2308,12 +2329,15 @@ mod tests {
             )
             .await
             .expect("observation");
+        let mut duplicate = api.routes()[0].clone();
+        duplicate.id = "*dynamic-duplicate".to_string();
+        api.routes.lock().expect("routes").push(duplicate);
         manager.leases.remove(&key);
         manager.leases.observe(key.clone(), LeaseDeadline::At(0), 0);
         api.connections.lock().expect("connections").insert(ip);
 
         manager.sweep().await.expect("guarded sweep");
-        assert_eq!(api.routes().len(), 1);
+        assert_eq!(api.routes().len(), 2);
 
         api.connections.lock().expect("connections").clear();
         manager.connection_retry_after.clear();
@@ -2322,7 +2346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_persistent_route_bypasses_conntrack_guard() {
+    async fn removed_persistent_route_deletes_all_duplicates_without_conntrack_guard() {
         let api = Arc::new(MockApi::default());
         let ip = "203.0.113.13".parse().expect("ip");
         let key = RouteKey::new(ip, "policy".to_string());
@@ -2335,6 +2359,9 @@ mod tests {
             .sync_keys(vec![key.clone()], now_millis())
             .await
             .expect("persistent upsert");
+        let mut duplicate = api.routes()[0].clone();
+        duplicate.id = "*persistent-duplicate".to_string();
+        api.routes.lock().expect("routes").push(duplicate);
         api.connections.lock().expect("connections").insert(ip);
 
         manager.persistent.remove(&key);

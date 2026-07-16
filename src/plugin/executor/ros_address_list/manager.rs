@@ -683,8 +683,16 @@ impl AddressListManagerRuntime {
         self.handle.clone()
     }
 
-    pub(super) async fn shutdown(mut self, cleanup: AddressListCleanupScope) -> Result<()> {
+    pub(super) async fn shutdown(self, cleanup: AddressListCleanupScope) -> Result<()> {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        self.shutdown_until(cleanup, deadline).await
+    }
+
+    pub(super) async fn shutdown_until(
+        mut self,
+        cleanup: AddressListCleanupScope,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let tasks = [self.prune_task_id.take(), self.reconcile_task_id.take()]
             .into_iter()
             .flatten()

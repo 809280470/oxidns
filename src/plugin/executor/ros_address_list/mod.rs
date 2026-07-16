@@ -55,7 +55,7 @@ use crate::core::context::DnsContext;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::mikrotik::lifecycle::{ActiveInstanceRegistry, WriterGate};
 use crate::infra::mikrotik::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
-use crate::infra::mikrotik::{ObservedAddr, collect_observed_addrs};
+use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
 use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
     unregister_metric_source,
@@ -414,6 +414,19 @@ async fn release_active_address_list_instance(
     tag: &str,
     instance_id: u64,
 ) -> AddressListCleanupScope {
+    release_active_address_list_instance_until(
+        tag,
+        instance_id,
+        tokio::time::Instant::now() + SHUTDOWN_TIMEOUT,
+    )
+    .await
+}
+
+async fn release_active_address_list_instance_until(
+    tag: &str,
+    instance_id: u64,
+    deadline: tokio::time::Instant,
+) -> AddressListCleanupScope {
     let _transition = address_list_lifecycle_transition().lock().await;
     let Some((
         cleanup_scope,
@@ -464,27 +477,49 @@ async fn release_active_address_list_instance(
         return AddressListCleanupScope::none();
     };
 
-    removed_writer_gate.wait_idle().await;
     let targets = transfer
         .as_ref()
         .map(|target| target.namespace.shared_targets(&removed_namespace))
         .unwrap_or_default();
-    let pending = if let Some(handle) = removed_handle {
-        handle.quiesce_targets(targets).await
+    let (pending, handoff_ready) = if transfer.is_some() {
+        let handoff_deadline = deadline
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(deadline);
+        if tokio::time::timeout_at(handoff_deadline, removed_writer_gate.wait_idle())
+            .await
+            .is_err()
+        {
+            warn!(plugin = %tag, "ros_address_list writer drain exceeded shutdown deadline");
+            (AddressListPendingWork::default(), false)
+        } else if let Some(handle) = removed_handle {
+            match tokio::time::timeout_at(handoff_deadline, handle.quiesce_targets(targets)).await {
+                Ok(pending) => (pending, true),
+                Err(_) => {
+                    warn!(plugin = %tag, "ros_address_list manager quiesce exceeded shutdown deadline");
+                    (AddressListPendingWork::default(), false)
+                }
+            }
+        } else {
+            (AddressListPendingWork::default(), true)
+        }
     } else {
-        AddressListPendingWork::default()
+        (AddressListPendingWork::default(), false)
     };
     removed_manager_active.store(false, Ordering::Release);
-    if let Some(transfer) = transfer
+    if handoff_ready
+        && let Some(transfer) = transfer
         && let Some(handle) = &transfer.manager_handle
     {
-        match handle.activate(pending).await {
-            Ok(()) => {
+        match tokio::time::timeout_at(deadline, handle.activate(pending)).await {
+            Ok(Ok(())) => {
                 transfer.manager_active.store(true, Ordering::Release);
                 handle.request_reconcile();
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 warn!(plugin = %tag, err = %error, "ros_address_list failed to transfer manager ownership")
+            }
+            Err(_) => {
+                warn!(plugin = %tag, "ros_address_list manager activation exceeded shutdown deadline")
             }
         }
     }
@@ -694,8 +729,9 @@ impl Plugin for MikrotikExecutor {
     }
 
     async fn destroy(&self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         let cleanup_scope = if self.active_registered.swap(false, Ordering::AcqRel) {
-            release_active_address_list_instance(&self.tag, self.instance_id).await
+            release_active_address_list_instance_until(&self.tag, self.instance_id, deadline).await
         } else {
             AddressListCleanupScope::none()
         };
@@ -705,7 +741,7 @@ impl Plugin for MikrotikExecutor {
             } else {
                 AddressListCleanupScope::none()
             };
-            return runtime.shutdown(cleanup_scope).await;
+            return runtime.shutdown_until(cleanup_scope, deadline).await;
         }
         Ok(())
     }
@@ -2835,6 +2871,60 @@ persistent:
         assert_eq!(
             release_active_address_list_instance(&tag, sequence + 1).await,
             AddressListCleanupScope::all()
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_release_bounds_writer_drain_by_shutdown_deadline() {
+        let sequence = NEXT_ADDRESS_LIST_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
+        let tag = format!("address-list-release-deadline-{sequence}");
+        let namespace = AddressListOwnershipNamespace {
+            address: "192.0.2.10:8728".to_string(),
+            address_list4: Some("shared-v4".to_string()),
+            address_list6: None,
+            comment_prefix: "fdns".to_string(),
+        };
+        let (old_gate, old_active) = register_prepared_address_list_instance(
+            &tag,
+            sequence,
+            namespace.clone(),
+            Arc::new(RosMetrics::new(tag.clone())),
+            None,
+        )
+        .await
+        .expect("old runtime");
+        old_active.store(true, Ordering::Release);
+        let permit = old_gate.enter().expect("in-flight writer");
+        let (_, replacement_active) = register_prepared_address_list_instance(
+            &tag,
+            sequence + 1,
+            namespace,
+            Arc::new(RosMetrics::new(tag.clone())),
+            None,
+        )
+        .await
+        .expect("replacement runtime");
+
+        let scope = tokio::time::timeout(
+            Duration::from_millis(200),
+            release_active_address_list_instance_until(
+                &tag,
+                sequence,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("release must respect deadline");
+        assert_eq!(scope, AddressListCleanupScope::none());
+
+        drop(permit);
+        replacement_active.store(true, Ordering::Release);
+        assert_eq!(
+            release_active_address_list_instance(&tag, sequence + 1).await,
+            AddressListCleanupScope {
+                ipv4: true,
+                ipv6: false,
+            }
         );
     }
 

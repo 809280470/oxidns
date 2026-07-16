@@ -179,12 +179,14 @@ impl MikrotikRsClient {
         let rows = self.send_rows("find address-list entries", print).await?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(parse_router_list_entry(
+            if let Some(entry) = parse_router_list_entry(
                 "find address-list entries parse",
                 key.family,
                 &row,
                 Some(key.list.as_str()),
-            )?);
+            )? {
+                entries.push(entry);
+            }
         }
         Ok(entries)
     }
@@ -237,7 +239,7 @@ fn parse_router_list_entry(
     family: AddressListFamily,
     reply: &RouterReply,
     fallback_list: Option<&str>,
-) -> Result<RouterListEntry> {
+) -> Result<Option<RouterListEntry>> {
     // RouterOS may omit the list name in some filtered query paths, so callers
     // can provide the already-known list as a fallback.
     let id = reply.require(ADDRESS_ID_FIELD, action)?;
@@ -251,12 +253,12 @@ fn parse_router_list_entry(
             ))
         })?;
     let address_raw = reply.require(ADDRESS_FIELD, action)?;
-    let (address, prefix) =
-        parse_router_address(family, address_raw.as_str()).ok_or_else(|| {
-            DnsError::plugin(format!(
-                "ros_address_list {action} response has invalid '{ADDRESS_FIELD}' value '{address_raw}'"
-            ))
-        })?;
+    let Some((address, prefix)) = parse_router_address(family, address_raw.as_str()) else {
+        // RouterOS address lists also accept DNS names and other address
+        // forms that are not IP/CIDR lease keys. They are outside this
+        // plugin's projection and must not make a shared-list scan fail.
+        return Ok(None);
+    };
     let key = AddressListKey::new_with_prefix(address, prefix, list).ok_or_else(|| {
         DnsError::plugin(format!(
             "ros_address_list {action} response has invalid normalized address '{address_raw}'"
@@ -264,12 +266,12 @@ fn parse_router_list_entry(
     })?;
     let timeout = reply.get(TIMEOUT_FIELD).map(str::to_string);
     let comment = reply.get(COMMENT_FIELD).map(str::to_string);
-    Ok(RouterListEntry {
+    Ok(Some(RouterListEntry {
         id,
         key,
         timeout,
         comment,
-    })
+    }))
 }
 
 #[async_trait]
@@ -301,12 +303,14 @@ impl MikrotikApi for MikrotikRsClient {
                 .send_rows("print ipv4 address-list entries", print)
                 .await?
             {
-                entries.push(parse_router_list_entry(
+                if let Some(entry) = parse_router_list_entry(
                     "parse ipv4 address-list entry",
                     AddressListFamily::Ipv4,
                     &row,
                     Some(list4),
-                )?);
+                )? {
+                    entries.push(entry);
+                }
             }
         }
 
@@ -320,12 +324,14 @@ impl MikrotikApi for MikrotikRsClient {
                 .send_rows("print ipv6 address-list entries", print)
                 .await?
             {
-                entries.push(parse_router_list_entry(
+                if let Some(entry) = parse_router_list_entry(
                     "parse ipv6 address-list entry",
                     AddressListFamily::Ipv6,
                     &row,
                     Some(list6),
-                )?);
+                )? {
+                    entries.push(entry);
+                }
             }
         }
 
@@ -420,5 +426,50 @@ impl MikrotikApi for MikrotikRsClient {
             Err(error) if error.is_missing_item() => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(address: Option<&str>) -> RouterReply {
+        RouterReply {
+            attributes: HashMap::from([
+                (ADDRESS_ID_FIELD.to_string(), Some("*1".to_string())),
+                (ADDRESS_LIST_FIELD.to_string(), Some("policy".to_string())),
+                (ADDRESS_FIELD.to_string(), address.map(ToString::to_string)),
+                (
+                    COMMENT_FIELD.to_string(),
+                    Some("operator-owned".to_string()),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn list_parser_skips_supported_routeros_non_ip_addresses() {
+        let parsed = parse_router_list_entry(
+            "parse shared list",
+            AddressListFamily::Ipv4,
+            &reply(Some("example.com")),
+            None,
+        )
+        .expect("DNS names are valid foreign RouterOS entries");
+
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn list_parser_keeps_missing_address_as_protocol_error() {
+        let error = parse_router_list_entry(
+            "parse shared list",
+            AddressListFamily::Ipv4,
+            &reply(None),
+            None,
+        )
+        .expect_err("missing address field must remain an error");
+
+        assert!(error.to_string().contains("missing 'address'"));
     }
 }
