@@ -364,17 +364,19 @@ export const pluginFieldDocs = {
     gateway4: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv4 路由下一跳。",
     gateway6: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv6 路由下一跳。",
     distance: "- 类型：`u8`；默认：`100`\n- RouterOS 静态路由 distance。",
-    comment_prefix: "- 类型：`string`；默认：`fdns`\n- 路由注释归属前缀；该值及插件 tag 不能包含 `;` 或 `=`。",
-    "persistent_route.ips":
+    comment_prefix: "- 类型：`string`；默认：`oxi`\n- 路由注释归属前缀；该值及插件 tag 不能包含 `;` 或 `=`。",
+    "persistent.ips":
       "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由；单 IP 会标准化为主机路由，`/0` 会被忽略。",
-    "persistent_route.files":
-      "- 类型：`array<string>`\n- 固定路由来源文件，每分钟重新读取并对账。",
+    "persistent.files":
+      "- 类型：`array<string>`\n- 固定路由来源文件，仅在插件初始化时读取；内容变化需重载插件或应用。",
     min_ttl: "- 类型：`u32`；默认：`60`\n- 动态 DNS 路由 TTL 的最小钳制值。",
     max_ttl: "- 类型：`u32`；默认：`3600`\n- 动态 DNS 路由 TTL 的最大钳制值。",
     fixed_ttl:
-      "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL。设为 `0` 时不按时间过期，但同一域名后续应答移除该 IP 时仍会撤销引用。",
+      "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL。设为 `0` 时不按时间过期；后续应答缺少该 IP 不会主动撤销。",
+    conntrack_guard:
+      "- 类型：`bool`；默认：`false`\n- 仅在删除到期动态 `/32`、`/128` 主机路由前查询精确目标 IP；有连接或查询失败时延后 30 秒。persistent 删除和关闭清理不受影响。",
     cleanup_on_shutdown:
-      "- 类型：`bool`；默认：`true`\n- 正常关闭时清理该插件 tag 拥有的动态和固定路由。",
+      "- 类型：`bool`；默认：`true`\n- 正常关闭时清理该插件 tag 拥有的动态和固定路由；清理总预算为 30 秒。生产重启或滚动发布需要策略连续性时建议设为 `false`。",
   },
   ros_address_list: {
     address:
@@ -396,7 +398,7 @@ export const pluginFieldDocs = {
     address_list6:
       "- 类型：`string`；必填：否；默认值：无\n- 作用：指定 IPv6 地址写入的目标 `address-list` 名称。插件从 DNS 应答中提取到 AAAA 记录后，将写入该列表。\n- 配置建议：如果策略需要覆盖 IPv6，应同时配置本项，并在 RouterOS 侧建立对应的匹配与路由规则。",
     comment_prefix:
-      "- 类型：`string`；必填：否；默认值：`fdns`\n- 作用：指定插件写入 RouterOS 条目时使用的注释前缀。该前缀用于区分 OxiDNS 创建的动态项和常驻项，便于后续刷新、重载与清理。\n- 注意事项：该值及插件 `tag` 不应包含 `;` 或 `=`，以避免影响内部标记格式。",
+      "- 类型：`string`；必填：否；默认值：`oxi`\n- 作用：指定插件写入 RouterOS 条目时使用的注释前缀。该前缀用于区分 OxiDNS 创建的动态项和常驻项，便于后续刷新、重载与清理。\n- 注意事项：该值及插件 `tag` 不应包含 `;` 或 `=`，以避免影响内部标记格式。",
     persistent:
       "- 类型：`object`；必填：否；默认值：无\n- 作用：定义需要长期保留的静态地址集合。该部分不依赖 DNS 应答触发，可在插件启动后直接同步到 RouterOS，并由后台 reconcile 保持一致性。\n- 子字段：\n  - `ips`\n  - `files`",
     "persistent.ips":

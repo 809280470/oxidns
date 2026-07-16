@@ -80,7 +80,7 @@ OxiDNS 不试图替你隐藏复杂性。
 | 匹配器 | `qname`、`question`、`qtype`、`qclass`、`client_ip`、`resp_ip`、`rcode`、`time`、`rate_limiter` 等 |
 | 数据集 | `domain_set`、`dynamic_domain_set`、`ip_set`、`geoip`、`geosite`、`adguard_rule` |
 | 出站网络 | `network.outbound` 统一配置 HTTP 下载、升级检查、webhook 与 upstream 使用的 nameservers 与 SOCKS5 |
-| 系统联动 | `ipset`、`nftset`、`ros_address_list`、`ros_route`、`reverse_lookup` |
+| 系统联动 | `ipset`、`nftset`、`ros_address_list`（推荐的 RouterOS 地址集联动）、`ros_route`（逐 IP 路由高级方式；两者均支持 TLS）、`reverse_lookup` |
 | 调试与运维 | 健康检查、配置校验、热重载、查询记录、Prometheus 插件指标、实时日志 |
 | 部署能力 | 多平台构建、Debian 包、OpenWrt LuCI 插件、独立 WebUI 托管、服务化安装 |
 

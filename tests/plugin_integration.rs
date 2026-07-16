@@ -691,6 +691,41 @@ plugins:
     Ok(())
 }
 
+#[cfg(feature = "plugin-ros-address-list")]
+#[tokio::test]
+async fn test_ros_address_list_plugin_init_accepts_tls_and_deprecated_max_entries() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: ros_address_list_policy
+    type: ros_address_list
+    args:
+      address: "127.0.0.1:9"
+      username: "api-user"
+      password: "secret"
+      tls:
+        insecure: true
+      connect_timeout: 1
+      send_timeout: 1
+      receive_timeout: 1
+      address_list4: "oxidns_ipv4"
+      fixed_ttl: 0
+      max_entries: 1024
+      cleanup_on_shutdown: false
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let address_list = registry
+        .get_plugin("ros_address_list_policy")
+        .expect("ros_address_list plugin should be registered");
+
+    assert_eq!(address_list.plugin_type, PluginType::Executor);
+    assert_eq!(address_list.plugin_name, "ros_address_list");
+
+    registry.destroy().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_plugin_system_init_resolves_sequence_dependency_and_quick_setup() -> Result<()> {
     let yaml = r#"

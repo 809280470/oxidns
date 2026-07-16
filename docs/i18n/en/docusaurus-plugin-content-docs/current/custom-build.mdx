@@ -149,7 +149,8 @@ path.
 
 | Feature | Plugin | Main dependency |
 |---|---|---|
-| `plugin-mikrotik` | `ros_address_list` | `mikrotik-rs` |
+| `plugin-mikrotik` | Aggregate feature for `ros_address_list` + `ros_route` | `mikrotik-rs` |
+| `plugin-ros-address-list` | `ros_address_list` | `mikrotik-rs` |
 | `plugin-ros-route` | `ros_route` | `mikrotik-rs` |
 | `plugin-query-recorder` | `query_recorder` | `rusqlite` (bundled SQLite) |
 | `plugin-ipset` | `ipset` + `nftset` | `ripset` (Linux only) |
@@ -324,8 +325,11 @@ cargo build --release --no-default-features --features minimal
 # Home router (API, DoT/DoH/DoQ, geo, adguard, ...)
 cargo build --release --no-default-features --features standard
 
-# minimal + MikroTik integration on top
+# minimal + both MikroTik plugins on top
 cargo build --release --no-default-features --features "minimal,plugin-mikrotik"
+
+# Or add only one of the plugins
+cargo build --release --no-default-features --features "minimal,plugin-ros-address-list"
 
 # Plain forwarder + management API, no heavy plugins
 cargo build --release --no-default-features --features "minimal,api"

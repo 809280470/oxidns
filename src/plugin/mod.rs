@@ -339,6 +339,11 @@ pub trait Plugin: Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Commit side effects that must not become active while a replacement
+    /// runtime is still being assembled. The runtime manager calls this after
+    /// the previous runtime has stopped accepting and drained requests.
+    async fn commit(&self) {}
+
     #[cfg(test)]
     async fn init_for_test(&mut self) -> Result<()> {
         let registry = std::sync::Arc::new(PluginRegistry::new());

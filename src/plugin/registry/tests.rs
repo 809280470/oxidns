@@ -11,10 +11,12 @@ use super::*;
 #[cfg(feature = "api")]
 use crate::api::{clear_global_api, global_api_test_guard};
 use crate::config::types::{Config, PluginConfig};
+use crate::core::context::DnsContext;
 use crate::plugin::dependency::{
     DependencyGraphEdge, DependencyGraphNode, DependencyGraphReport, DependencySpec,
 };
 use crate::plugin::executor::sequence::SequenceFactory;
+use crate::plugin::executor::{ExecStep, Executor};
 use crate::plugin::matcher::qname::QnameFactory;
 use crate::plugin::provider::Provider;
 use crate::plugin::{Plugin, PluginDependent, UninitializedPlugin};
@@ -133,6 +135,109 @@ impl Provider for CaptureProvider {
 struct CaptureProviderFactory {
     captured: Arc<StdMutex<StdHashMap<String, PluginCreateContext>>>,
     created_tags: Arc<StdMutex<Vec<String>>>,
+}
+
+#[derive(Debug)]
+struct LifecycleProvider {
+    tag: String,
+    events: Arc<StdMutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Plugin for LifecycleProvider {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
+        self.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push(format!("init:{}", self.tag));
+        Ok(())
+    }
+
+    async fn commit(&self) {
+        self.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push(format!("commit:{}", self.tag));
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        self.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push(format!("destroy:{}", self.tag));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Executor for LifecycleProvider {
+    async fn execute(&self, _context: &mut DnsContext) -> Result<ExecStep> {
+        Ok(ExecStep::Next)
+    }
+}
+
+#[derive(Debug)]
+struct LifecycleProviderFactory {
+    events: Arc<StdMutex<Vec<String>>>,
+}
+
+impl PluginFactory for LifecycleProviderFactory {
+    fn create(
+        &self,
+        plugin_config: &PluginConfig,
+        _init_context: &PluginInitContext<'_>,
+    ) -> Result<UninitializedPlugin> {
+        Ok(UninitializedPlugin::Executor(Box::new(LifecycleProvider {
+            tag: plugin_config.tag.clone(),
+            events: self.events.clone(),
+        })))
+    }
+}
+
+async fn lifecycle_runtime(tag: &str, events: Arc<StdMutex<Vec<String>>>) -> Arc<PluginRuntime> {
+    let mut registry = PluginRegistry::new();
+    registry.register_factory(
+        "lifecycle_provider",
+        DependencyKind::Executor,
+        Box::new(LifecycleProviderFactory { events }),
+    );
+    let registry = Arc::new(registry);
+    registry
+        .clone()
+        .init_plugins(vec![PluginConfig {
+            tag: tag.to_string(),
+            plugin_type: "lifecycle_provider".to_string(),
+            args: None,
+        }])
+        .await
+        .expect("lifecycle runtime initialization");
+    registry
+}
+
+#[tokio::test]
+async fn runtime_commits_candidate_only_after_previous_runtime_is_drained() {
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let manager = PluginRuntimeManager::new();
+    let previous = lifecycle_runtime("previous", events.clone()).await;
+    manager.replace_current(previous).await;
+
+    events.lock().expect("events mutex poisoned").clear();
+    let candidate = lifecycle_runtime("candidate", events.clone()).await;
+    manager.replace_current(candidate).await;
+
+    assert_eq!(
+        *events.lock().expect("events mutex poisoned"),
+        vec![
+            "init:candidate".to_string(),
+            "destroy:previous".to_string(),
+            "commit:candidate".to_string(),
+        ]
+    );
+    manager.destroy_runtime().await;
 }
 
 impl PluginFactory for CaptureProviderFactory {

@@ -65,6 +65,7 @@ export interface PluginKindDefinition {
 }
 export type ConfigFieldType =
   | "text"
+  | "password"
   | "time"
   | "number"
   | "select"
@@ -113,6 +114,8 @@ export interface ConfigField {
   /** Group two sibling time fields into one optional start/end range editor. */
   timeRange?: ConfigTimeRangeGroup;
   fields?: ConfigField[];
+  /** Preserve an enabled optional object even when all of its child fields are empty. */
+  preserveEmptyObject?: boolean;
   summaryFields?: string[];
   // Force the field to span both columns in the 2-col config grid. Use this
   // for inherently long single-line values (file paths, URLs) so they do not

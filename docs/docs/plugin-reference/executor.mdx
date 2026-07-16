@@ -2536,7 +2536,7 @@ old-static.example.com static.example.net
 
 ### 作用
 
-把应答 IP 同步到 RouterOS address-list，支持动态项、常驻项、启动时文件加载和关闭时清理。
+把应答 IP 同步到 RouterOS address-list，支持动态项、常驻项、启动时文件加载和关闭时清理。这是推荐的 RouterOS 联动方式，适合让 firewall、mangle 或 routing rule 消费统一地址集合。
 
 ### 配置示例
 
@@ -2550,6 +2550,7 @@ old-static.example.com static.example.net
     username: "api-user"
     # API 密码
     password: "secret"
+    # 默认使用明文 API（通常 8728）；配置 tls 后才启用 API-SSL（通常 8729）
     # RouterOS API 连接超时，单位秒
     connect_timeout: 5
     # RouterOS API 发送命令超时，单位秒
@@ -2563,7 +2564,7 @@ old-static.example.com static.example.net
     # AAAA 记录写入的 address-list
     address_list6: "oxidns_ipv6"
     # 用于标记 OxiDNS 管理条目的注释前缀
-    comment_prefix: "oxidns"
+    comment_prefix: "oxi"
     # 动态项 TTL 下限
     min_ttl: 60
     # 动态项 TTL 上限
@@ -2585,6 +2586,20 @@ old-static.example.com static.example.net
         - "/etc/oxidns/persistent_ips.txt"
 ```
 
+启用 API-SSL 时，将端口改为实际的 TLS 端口（通常为 `8729`），并显式添加 `tls`：
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # 可选；覆盖从 address 推断出的证书服务器名称
+    server_name: "router.example"
+    # 可选；自签名证书或私有 CA 的 PEM 文件
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # 可选，默认 false；设为 true 时跳过证书验证，且不能同时配置 ca
+    insecure: false
+```
+
 ### 配置项
 
 #### `address`
@@ -2604,6 +2619,15 @@ old-static.example.com static.example.net
 - 类型：`string`；必填：是；默认值：无
 - 作用：指定 RouterOS API 登录密码。插件初始化、重连和后台同步均依赖该凭据。
 - 注意事项：应避免在公开仓库或共享示例中直接暴露真实口令。
+
+#### `tls`
+
+- 类型：`object`；必填：否；默认值：无（明文 API）
+- 作用：启用 RouterOS API-SSL。
+- `tls.server_name`：可选字符串；覆盖从 `address` 推断出的证书服务器名称。
+- `tls.ca`：可选字符串；指定自签名证书或私有 CA 的 PEM 文件路径。
+- `tls.insecure`：可选布尔值，默认 `false`；设为 `true` 时跳过证书验证，且不能同时配置 `tls.ca`。
+- 安全建议：明文 API 通常使用 `8728`，API-SSL 通常使用 `8729`；端口仍以 RouterOS 实际配置为准。
 
 #### `connect_timeout`
 
@@ -2643,7 +2667,7 @@ old-static.example.com static.example.net
 
 #### `comment_prefix`
 
-- 类型：`string`；必填：否；默认值：`fdns`
+- 类型：`string`；必填：否；默认值：`oxi`
 - 作用：指定插件写入 RouterOS 条目时使用的注释前缀。该前缀用于区分 OxiDNS 创建的动态项和常驻项，便于后续刷新、重载与清理。
 - 注意事项：该值及插件 `tag` 不应包含 `;` 或 `=`，以避免影响内部标记格式。
 
@@ -2688,8 +2712,8 @@ old-static.example.com static.example.net
 #### `cleanup_on_shutdown`
 
 - 类型：`bool`；必填：否；默认值：`true`
-- 作用：控制插件退出时是否清理由其管理的条目。启用后，插件在正常关闭阶段会删除自身写入并可识别归属的 RouterOS 地址项。
-- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启保留的场景。
+- 作用：控制插件退出时是否清理由其管理的条目。启用后，插件在正常关闭阶段会删除自身写入并可识别归属的 RouterOS 地址项，全部清理共用 30 秒预算；超时后进程继续关闭并报告错误。
+- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启保留的场景。生产重启或滚动发布需要策略连续性时建议设为 `false`。
 
 ### 行为说明
 
@@ -2697,7 +2721,7 @@ old-static.example.com static.example.net
 - 启动阶段不会等待 RouterOS address-list 扫描完成；初始连通性验证和常驻项同步会交给后台 manager 执行，失败只记录日志，不阻塞 DNS 服务启动或动态观察写入。
 - 正向阶段只透传。
 - 回程阶段：
-  - 从 `NOERROR` 响应中提取 A/AAAA。
+  - 仅在 A/AAAA 查询的 `NOERROR` 响应中，提取 Answer 区全部已启用地址族的 A/AAAA；不重建 CNAME 链。
   - 去重并保留最大 TTL。
   - 根据异步或同步模式投递给后台 manager。
 - manager 负责：
@@ -2705,6 +2729,7 @@ old-static.example.com static.example.net
   - 动态项刷新
   - 持久项一致性维护
   - 关闭清理
+- 动态项以 RouterOS 实际状态为准：用户删除后，周期对账清除本地写入抑制状态，下一次 DNS 观测才重新写入；插件不会为每次 DNS 请求读取 RouterOS。persistent 项则以配置为准，被删除后会由对账恢复。
 
 ### 典型用途
 
@@ -2718,12 +2743,14 @@ old-static.example.com static.example.net
 - 建议使用 OxiDNS 专用 `address-list`，避免接入大型共享列表，以降低 RouterOS 管理面扫描成本。
 - `comment_prefix` 与插件 `tag` 不能包含 `;` 或 `=`。
 - 同步模式不会改变 DNS 应答本身，即使 RouterOS 写入失败也会保留 DNS 结果。
+- `fixed_ttl: 0` 的动态项不会自然过期，也没有记录数量上限；用户需要评估 RouterOS 容量并负责显式清理。
+- 应用级 reload 按 shutdown 处理：先停止并销毁旧 runtime，再创建新 runtime，不移交待处理观测。`cleanup_on_shutdown: true` 时会先清理旧实例拥有的条目，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 条目，请设为 `false`。不同进程不能同时使用相同的插件 tag、注释前缀和目标列表；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
 
 </Admonition>
 
 ## `ros_route`
 
-将成功 DNS 应答中的 A/AAAA 地址写入 RouterOS 指定策略路由表。插件是 continuation executor，应放在产生最终应答的 executor 之前。
+将成功 DNS 应答中的 A/AAAA 地址写入 RouterOS 指定策略路由表。这是需要逐 IP 静态路由时使用的高级方式；一般策略联动优先使用 `ros_address_list`。插件是 continuation executor，应放在产生最终应答的 executor 之前。
 
 ```yaml
 - tag: ros_route_policy
@@ -2732,23 +2759,45 @@ old-static.example.com static.example.net
     address: "192.168.88.1:8728"
     username: "api-user"
     password: "secret"
+    # 默认使用明文 API；配置 tls 后才启用 API-SSL
     routing_table: "via_proxy"
     gateway4: "192.168.88.2@main"
     gateway6: "fe80::2%ether1"
     fixed_ttl: 0
     conntrack_guard: true
     cleanup_on_shutdown: true
-    persistent_route:
+    persistent:
       ips: ["198.51.100.0/24"]
 ```
 
+启用 API-SSL 时可使用完整的 TLS 子配置：
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # 可选；覆盖从 address 推断出的证书服务器名称
+    server_name: "router.example"
+    # 可选；自签名证书或私有 CA 的 PEM 文件
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # 可选，默认 false；设为 true 时跳过证书验证，且不能同时配置 ca
+    insecure: false
+```
+
 - `routing_table`、`gateway4`/`gateway6` 定义写入目标；路由表、routing rule 和默认路由需预先在 RouterOS 配好。
-- `min_ttl`/`max_ttl` 默认分别为 `60`/`3600` 秒。`fixed_ttl` 覆盖 DNS TTL；其中 `fixed_ttl: 0` 表示动态路由不按时间过期，但同一域名后续应答移除该 IP 时会撤销其引用。
-- `ros_route` 与 `ros_address_list` 都会收集 Answer 区中所有已启用地址族的 A/AAAA 记录，不再重建 CNAME 链或用 CNAME TTL 截断地址 TTL。对 `ros_route` 而言，A 查询只替换/撤销 IPv4 路由，AAAA 查询只替换/撤销 IPv6 路由；但同一 Answer 中的两种地址都会作为新增或刷新候选。
-- `persistent_route` 是独立于 DNS 的常驻 IP/CIDR 集合；文件内容每分钟重载并周期对账。
+- `min_ttl`/`max_ttl` 默认分别为 `60`/`3600` 秒。`fixed_ttl` 覆盖 DNS TTL；其中 `fixed_ttl: 0` 表示动态路由不按时间过期，只能由用户删除、关闭清理或后续配置操作移除。
+- `ros_route` 与 `ros_address_list` 仅处理 A/AAAA 查询的成功响应，并收集 Answer 区中所有已启用地址族的 A/AAAA 记录；不重建 CNAME 链，也不用 CNAME TTL 截断地址 TTL。每个 IP 独立形成租约；后续应答缺少旧 IP、NODATA 或 NXDOMAIN 都不会立即撤销已有项。
+- `persistent` 是独立于 DNS 的常驻 IP/CIDR 集合；文件仅在插件初始化时读取，内容变化需重载插件或应用。
 - RouterOS 不可达时 DNS 服务仍会启动，路由操作在后台重试。`async: false` 只等待一次同步尝试，失败不会改变 DNS 应答。
-- `conntrack_guard` 默认关闭。启用后，动态撤销、过期和移除 persistent 配置前会检查 RouterOS conntrack；目标地址仍有任意跟踪连接时保留路由并在 30 秒后重试。CIDR 会检查网段内连接。连接跟踪关闭、RAW `notrack` 流量或查询失败无法证明安全时都会保留路由。关闭清理、校验残留、重复项和禁用地址族清理仍会立即删除。
-- `cleanup_on_shutdown: true` 会删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。
+- `conntrack_guard` 默认关闭，仅保护到期的动态 `/32`、`/128` 主机路由。目标 IP 仍有跟踪连接时保留路由并在 30 秒后重试；查询失败时 fail-closed。persistent 配置删除、关闭清理和内部维护清理不执行连接检查，也不支持 CIDR 连接保护。
+- 动态租约没有记录数量上限。尤其是 `fixed_ttl: 0` 路由不会自然过期，用户必须评估 RouterOS 路由表和 OxiDNS 内存容量，并通过用户删除、配置变化或关闭清理回收。
+- 动态路由以 RouterOS 实际状态为准：用户删除后由下一次对账接受删除，下一次 DNS 观测再创建；不会在每次 DNS 请求中读取路由表。persistent 路由仍以配置为准。
+- `comment_prefix` 默认是 `oxi`，并与插件 `tag` 一起构成 RouterOS 条目的 ownership namespace；两者都不能包含 `;` 或 `=`。
+- RouterOS comment 只保存条目类型、过期时间和最近观察时间，不保存域名引用。重启时恢复未过期租约；当前 TTL 策略可以收紧旧期限，但不会在没有新 DNS 观察时延长它。
+- `tls` 启用 API-SSL（通常 `8729`）：`tls.server_name` 覆盖证书服务器名称，`tls.ca` 指定自签名/私有 CA 文件，`tls.insecure` 默认为 `false`，设为 `true` 时跳过证书验证且不能与 `tls.ca` 同时配置。省略 `tls` 时使用明文 API（通常 `8728`）。
+- `cleanup_on_shutdown: true` 会在 30 秒总预算内删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。生产重启或滚动发布需要策略连续性时建议设为 `false`。
+- 应用级 reload 按 shutdown 处理：先停止并销毁旧 runtime，再创建新 runtime，不移交待处理观测。`cleanup_on_shutdown: true` 时会先清理旧实例拥有的路由，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 路由，请设为 `false`。不同进程不能同时使用相同插件 tag、注释前缀和 routing table；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
+- 删除前会重新读取路由并比较完整快照（comment、gateway、distance、disabled 等）。但 RouterOS 最终只提供按内部 ID 删除，不支持原子 compare-and-delete；因此不要在其它进程或 RouterOS 管理界面中并发修改插件拥有的路由。用户直接删除动态路由仍是支持的操作，对账会接受删除事实。
 
 ---
 

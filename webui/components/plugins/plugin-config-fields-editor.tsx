@@ -84,6 +84,16 @@ const ARRAY_SYNTAX_KEYS: Record<ArrayItemSyntax, string> = {
 };
 
 const OPTIONAL_SELECT_VALUE = "__oxidns_unset__";
+const OBJECT_PRESENCE_KEY = "__oxidns_object_present__";
+
+function isPresentOptionalObject(value: unknown): boolean {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>)[OBJECT_PRESENCE_KEY] === true
+  );
+}
 
 function InvertCheckbox({
   checked,
@@ -140,7 +150,11 @@ export function createDefaultPluginConfigValues(fields: ConfigField[]) {
     } else if (field.type === "time" && field.timeRange) {
       defaults[field.key] = field.timeRange.defaultValue;
     } else if (field.type === "object" && field.fields) {
-      defaults[field.key] = createDefaultPluginConfigValues(field.fields);
+      const objectDefaults = createDefaultPluginConfigValues(field.fields);
+      if (field.preserveEmptyObject) {
+        objectDefaults[OBJECT_PRESENCE_KEY] = false;
+      }
+      defaults[field.key] = objectDefaults;
     } else if (field.type === "record") {
       defaults[field.key] = [];
     } else if (field.type === "json") {
@@ -173,13 +187,17 @@ export function createPluginConfigFormValues(
     if (field.type === "array") {
       values[field.key] = normalizeArrayFieldValue(value, field);
     } else if (field.type === "object" && field.fields) {
-      values[field.key] =
+      const objectValues =
         value && typeof value === "object" && !Array.isArray(value)
           ? createPluginConfigFormValues(
               field.fields,
               value as Record<string, unknown>,
             )
           : createDefaultPluginConfigValues(field.fields);
+      if (field.preserveEmptyObject) {
+        objectValues[OBJECT_PRESENCE_KEY] = true;
+      }
+      values[field.key] = objectValues;
     } else if (field.type === "record") {
       values[field.key] = normalizeRecordValue(value);
     } else if (field.type === "json") {
@@ -230,7 +248,11 @@ export function serializePluginConfigValues(
               value as Record<string, unknown>,
             )
           : {};
-      if (!isEmptyConfigValue(serialized) || field.required) {
+      if (
+        !isEmptyConfigValue(serialized) ||
+        field.required ||
+        (field.preserveEmptyObject && isPresentOptionalObject(value))
+      ) {
         config[field.key] = serialized;
       }
     } else if (field.type === "record" && Array.isArray(value)) {
@@ -285,6 +307,9 @@ export function isPluginConfigFormValid(
       typeof value === "object" &&
       !Array.isArray(value)
     ) {
+      if (field.preserveEmptyObject && !isPresentOptionalObject(value)) {
+        return true;
+      }
       if (!field.required && isEmptyConfigValue(value)) return true;
       return isPluginConfigFormValid(
         field.fields,
@@ -629,6 +654,18 @@ function ConfigFieldControl({
           disabled={readOnly}
         />
       );
+    case "password":
+      return (
+        <Input
+          type="password"
+          value={(value as string) || ""}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={defaultPlaceholder}
+          className="font-mono text-sm"
+          disabled={readOnly}
+          autoComplete="new-password"
+        />
+      );
     case "time":
       return (
         <Input
@@ -719,15 +756,48 @@ function ConfigFieldControl({
       );
     case "object":
       if (!field.fields) return null;
+      const objectValue =
+        value && typeof value === "object" && !Array.isArray(value)
+          ? (value as Record<string, unknown>)
+          : createDefaultPluginConfigValues(field.fields);
+      if (field.preserveEmptyObject) {
+        const present = isPresentOptionalObject(objectValue);
+        return (
+          <div className="space-y-4">
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={present}
+                onCheckedChange={(checked) =>
+                  onChange({
+                    ...objectValue,
+                    [OBJECT_PRESENCE_KEY]: checked,
+                  })
+                }
+                disabled={readOnly}
+                aria-label={`${field.label}: ${t(WEBUI.common.enabled)}`}
+              />
+              <span className="text-sm text-muted-foreground">
+                {t(WEBUI.common.enabled)}
+              </span>
+            </div>
+            {present && (
+              <ObjectFieldEditor
+                fields={field.fields}
+                plugins={plugins}
+                value={objectValue}
+                onChange={onChange}
+                defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
+                readOnly={readOnly}
+              />
+            )}
+          </div>
+        );
+      }
       return (
         <ObjectFieldEditor
           fields={field.fields}
           plugins={plugins}
-          value={
-            value && typeof value === "object" && !Array.isArray(value)
-              ? (value as Record<string, unknown>)
-              : createDefaultPluginConfigValues(field.fields)
-          }
+          value={objectValue}
           onChange={onChange}
           defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
           readOnly={readOnly}

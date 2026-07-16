@@ -84,6 +84,14 @@ impl PluginRuntimeManager {
             return Err(err);
         }
 
+        self.replace_current(candidate.clone()).await;
+        Ok(candidate)
+    }
+
+    /// Publish a fully prepared runtime, drain the previous runtime, and only
+    /// then commit candidate side effects. The caller serializes lifecycle
+    /// operations with `self.lifecycle`.
+    pub(super) async fn replace_current(&self, candidate: Arc<PluginRuntime>) {
         // Poison-tolerant swap: the install must always succeed once the
         // candidate is built, otherwise a failed swap would masquerade as a
         // successful reload while readers keep seeing the old/empty runtime.
@@ -91,7 +99,7 @@ impl PluginRuntimeManager {
         if let Some(previous) = previous {
             previous.destroy().await;
         }
-        Ok(candidate)
+        candidate.commit().await;
     }
 
     pub async fn destroy_runtime(&self) {
@@ -161,10 +169,7 @@ impl PluginRuntimeManager {
     #[cfg(test)]
     async fn set_current_runtime_for_test(&self, runtime: Arc<PluginRuntime>) {
         let _guard = self.lifecycle.lock().await;
-        let previous = write_rwlock(&self.current).replace(runtime);
-        if let Some(previous) = previous {
-            previous.destroy().await;
-        }
+        self.replace_current(runtime).await;
     }
 }
 

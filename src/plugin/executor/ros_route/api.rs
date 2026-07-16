@@ -7,15 +7,18 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::IpAddr;
-use std::time::Duration;
 
 use ahash::AHashSet;
 use async_trait::async_trait;
-use mikrotik_rs::{Command, CommandBuilder, Event, MikrotikDevice, QueryOperator};
+use mikrotik_rs::{Command, CommandBuilder, QueryOperator};
 use tracing::warn;
 
 use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
+use crate::infra::mikrotik::transport::{
+    RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
+    RouterOsTransportSnapshot,
+};
 
 const ROUTER_ID_FIELD: &str = ".id";
 const ROUTE_DST_FIELD: &str = "dst-address";
@@ -25,7 +28,7 @@ const ROUTE_DISTANCE_FIELD: &str = "distance";
 const ROUTE_COMMENT_FIELD: &str = "comment";
 const ROUTE_DISABLED_FIELD: &str = "disabled";
 const CONNECTION_DST_FIELD: &str = "dst-address";
-const COMMAND_SYSTEM_IDENTITY_PRINT: &str = "/system/identity/print";
+const ROUTE_PROPLIST: &str = ".id,dst-address,routing-table,gateway,distance,comment,disabled";
 
 const COMMAND_IP_ROUTE_PRINT: &str = "/ip/route/print";
 const COMMAND_IP_ROUTE_ADD: &str = "/ip/route/add";
@@ -44,34 +47,9 @@ pub(super) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
 pub(super) const DEFAULT_SEND_TIMEOUT_SECS: u64 = 5;
 pub(super) const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 5;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) struct MikrotikApiTimeouts {
-    connect: Duration,
-    send: Duration,
-    receive: Duration,
-}
+pub(super) type MikrotikApiTimeouts = RouterOsTimeouts;
 
-impl MikrotikApiTimeouts {
-    pub(super) fn from_secs(connect_secs: u64, send_secs: u64, receive_secs: u64) -> Self {
-        Self {
-            connect: Duration::from_secs(connect_secs),
-            send: Duration::from_secs(send_secs),
-            receive: Duration::from_secs(receive_secs),
-        }
-    }
-}
-
-impl Default for MikrotikApiTimeouts {
-    fn default() -> Self {
-        Self::from_secs(
-            DEFAULT_CONNECT_TIMEOUT_SECS,
-            DEFAULT_SEND_TIMEOUT_SECS,
-            DEFAULT_RECEIVE_TIMEOUT_SECS,
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct RouterRoute {
     /// RouterOS internal route identifier (e.g. `*123`).
     pub(super) id: String,
@@ -94,6 +72,13 @@ pub(super) struct RouterRoute {
 
 #[async_trait]
 pub(super) trait MikrotikApi: Debug + Send + Sync {
+    /// Enter shutdown-cleanup mode, bypassing reconnect backoff while keeping
+    /// per-operation timeouts.
+    fn begin_shutdown_cleanup(&self) {}
+    /// Transport health used by retry scheduling and metrics.
+    async fn transport_snapshot(&self) -> Option<RouterOsTransportSnapshot> {
+        None
+    }
     /// List all routes in target table that can be considered by manager
     /// reconciliation.
     async fn list_managed_routes(
@@ -102,13 +87,14 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         require_ipv4: bool,
         require_ipv6: bool,
     ) -> Result<Vec<RouterRoute>>;
-    /// Find one route by route key (family + table + destination).
-    async fn find_route(
+    /// Find all plugin-owned routes by route key (family + table +
+    /// destination).
+    async fn find_routes(
         &self,
         key: &RouteKey,
         comment_prefix: &str,
         plugin_tag: &str,
-    ) -> Result<Option<RouterRoute>>;
+    ) -> Result<Vec<RouterRoute>>;
     /// Create or update one host route and return its RouterOS internal id.
     async fn upsert_host_route(
         &self,
@@ -128,19 +114,20 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         distance: u8,
         comment: &str,
     ) -> Result<()>;
-    /// Delete route by internal id.
-    async fn delete_route_by_id(&self, id: &str, family: RouteFamily) -> Result<()>;
-    /// Return tracked connection destinations for one address family.
+    /// Re-read the RouterOS row and delete only when it still exactly matches
+    /// the snapshot that authorized the deletion.
     ///
-    /// An empty `destinations` slice requests the full destination snapshot.
-    /// Callers use that only when a CIDR route needs local prefix matching.
+    /// RouterOS exposes the final remove as an id-only command, not an atomic
+    /// compare-and-delete operation. The plugin serializes all in-process
+    /// writers for one ownership namespace; external writers must not mutate
+    /// plugin-owned rows concurrently.
+    async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool>;
+    /// Return tracked connection destinations for exact host IPs in one family.
     async fn connection_destinations(
         &self,
         family: RouteFamily,
         destinations: &[IpAddr],
     ) -> Result<AHashSet<IpAddr>>;
-    /// Lightweight command that verifies RouterOS API availability.
-    async fn healthcheck(&self) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -162,145 +149,101 @@ impl RouterReply {
 }
 
 pub(super) struct MikrotikRsClient {
-    address: String,
-    username: String,
-    password: String,
-    timeouts: MikrotikApiTimeouts,
-    connection: tokio::sync::Mutex<ConnectionSlot>,
-}
-
-struct ConnectionSlot {
-    generation: u64,
-    device: Option<MikrotikDevice>,
+    transport: RouterOsTransport,
 }
 
 impl Debug for MikrotikRsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MikrotikRsClient")
-            .field("address", &self.address)
-            .field("username", &self.username)
-            .finish_non_exhaustive()
+            .field("transport", &self.transport)
+            .finish()
     }
 }
 
 impl MikrotikRsClient {
-    pub(super) fn new(
-        address: String,
-        username: String,
-        password: String,
-        timeouts: MikrotikApiTimeouts,
-    ) -> Self {
-        Self {
-            address,
-            username,
-            password,
-            timeouts,
-            connection: tokio::sync::Mutex::new(ConnectionSlot {
-                generation: 0,
-                device: None,
-            }),
-        }
-    }
-
-    async fn invalidate_connection(&self, generation: u64) {
-        let mut guard = self.connection.lock().await;
-        if guard.generation == generation {
-            guard.device = None;
-        }
-    }
-
-    async fn get_or_connect(&self) -> Result<(MikrotikDevice, u64)> {
-        // Keep the lock for the full connect attempt. Concurrent route
-        // pipelines then share one login instead of opening one RouterOS
-        // session per in-flight command after startup or reconnect.
-        let mut guard = self.connection.lock().await;
-        if let Some(device) = guard.device.as_ref() {
-            return Ok((device.clone(), guard.generation));
-        }
-
-        let password = if self.password.is_empty() {
-            None
-        } else {
-            Some(self.password.as_str())
-        };
-        let connect_result = tokio::time::timeout(
-            self.timeouts.connect,
-            MikrotikDevice::connect(self.address.as_str(), &self.username, password),
-        )
-        .await;
-        let device = match connect_result {
-            Ok(Ok(device)) => device,
-            Ok(Err(error)) => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route connect failed to {}: {}",
-                    self.address, error
-                )));
-            }
-            Err(_) => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route connect timeout after {}s to {}",
-                    self.timeouts.connect.as_secs(),
-                    self.address
-                )));
-            }
-        };
-
-        guard.generation = guard.generation.wrapping_add(1);
-        guard.device = Some(device.clone());
-        Ok((device, guard.generation))
-    }
-
-    async fn send_command_receiver(
+    async fn remove_route_by_id(
         &self,
-        action: &str,
-        command: Command,
-    ) -> Result<(tokio::sync::mpsc::Receiver<Event>, u64)> {
-        let (device, generation) = self.get_or_connect().await?;
-        let send_result =
-            tokio::time::timeout(self.timeouts.send, device.send_command(command)).await;
-        match send_result {
-            Ok(Ok(receiver)) => Ok((receiver, generation)),
-            Ok(Err(error)) => {
-                self.invalidate_connection(generation).await;
-                Err(DnsError::plugin(format!(
-                    "ros_route {action} send failed: {error}"
-                )))
-            }
-            Err(_) => {
-                self.invalidate_connection(generation).await;
-                Err(DnsError::plugin(format!(
-                    "ros_route {action} send timeout after {}s",
-                    self.timeouts.send.as_secs()
-                )))
-            }
+        id: &str,
+        family: RouteFamily,
+        bypass_backoff: bool,
+    ) -> Result<()> {
+        let remove = CommandBuilder::new()
+            .command(route_command(family, RouteOp::Remove))
+            .attribute(ROUTER_ID_FIELD, Some(id))
+            .build();
+        match self
+            .send_rows_transport("remove route", remove, bypass_backoff)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.is_missing_item() => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 
-    async fn finish_receive<T>(&self, generation: u64, result: Result<T>) -> Result<T> {
-        if result.is_err() {
-            self.invalidate_connection(generation).await;
+    pub(super) fn new(config: RouterOsConnectionConfig) -> Self {
+        Self {
+            transport: RouterOsTransport::new(config),
         }
-        result
     }
 
     async fn send_rows(&self, action: &str, command: Command) -> Result<Vec<RouterReply>> {
-        let (mut receiver, generation) = self.send_command_receiver(action, command).await?;
-        let result = receive_rows(action, self.timeouts.receive, &mut receiver).await;
-        self.finish_receive(generation, result).await
+        self.send_rows_transport(action, command, false)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn send_rows_bypassing_backoff(
+        &self,
+        action: &str,
+        command: Command,
+    ) -> Result<Vec<RouterReply>> {
+        self.send_rows_transport(action, command, true)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn send_rows_transport(
+        &self,
+        action: &str,
+        command: Command,
+        bypass_backoff: bool,
+    ) -> RouterOsResult<Vec<RouterReply>> {
+        let mut stream = if bypass_backoff {
+            self.transport
+                .send_command_bypassing_backoff(action, command)
+                .await?
+        } else {
+            self.transport.send_command(action, command).await?
+        };
+        let mut rows = Vec::new();
+        loop {
+            match stream.next().await? {
+                RouterOsEvent::Reply(attributes) => rows.push(RouterReply { attributes }),
+                RouterOsEvent::Complete => return Ok(rows),
+            }
+        }
     }
 
     async fn find_route_by_exact_comment(
         &self,
         key: &RouteKey,
         comment: &str,
+        bypass_backoff: bool,
     ) -> Result<Option<RouterRoute>> {
         let print = CommandBuilder::new()
             .command(route_command(key.family(), RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
             .query_equal(ROUTE_TABLE_FIELD, &key.table)
             .query_equal(ROUTE_DST_FIELD, &key.dst_address())
             .query_equal(ROUTE_COMMENT_FIELD, comment)
             .build();
-        let rows = self.send_rows("find route by comment", print).await?;
+        let rows = if bypass_backoff {
+            self.send_rows_bypassing_backoff("find route by comment", print)
+                .await?
+        } else {
+            self.send_rows("find route by comment", print).await?
+        };
         if let Some(row) = rows.into_iter().next() {
             let mut route =
                 parse_router_route_from_reply("find route by comment parse", key.family(), &row)?;
@@ -313,10 +256,57 @@ impl MikrotikRsClient {
     }
 
     async fn cleanup_validation_route(&self, key: &RouteKey, comment: &str) -> Result<()> {
-        if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
-            self.delete_route_by_id(&route.id, route.family).await?;
+        if let Some(route) = self.find_route_by_exact_comment(key, comment, true).await? {
+            self.delete_route_if_matches_with_backoff(&route, true)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn delete_route_if_matches_with_backoff(
+        &self,
+        expected: &RouterRoute,
+        bypass_backoff: bool,
+    ) -> Result<bool> {
+        // Re-query by every stable key component before comparing the mutable
+        // fields. Besides avoiding an accidental id-reuse deletion, filtering
+        // by table also compensates for RouterOS versions that omit
+        // `routing-table` from an id-only print reply.
+        let print = CommandBuilder::new()
+            .command(route_command(expected.family, RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
+            .query_equal(ROUTER_ID_FIELD, &expected.id)
+            .query_equal(ROUTE_TABLE_FIELD, &expected.routing_table)
+            .query_equal(ROUTE_DST_FIELD, &expected.dst_address)
+            .build();
+        let rows = if bypass_backoff {
+            self.send_rows_bypassing_backoff("verify route before delete", print)
+                .await?
+        } else {
+            self.send_rows("verify route before delete", print).await?
+        };
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(false);
+        };
+        let mut current = parse_router_route_from_reply(
+            "verify route before delete parse",
+            expected.family,
+            &row,
+        )?;
+        if current.routing_table.is_empty() {
+            current.routing_table.clone_from(&expected.routing_table);
+        }
+        if current != *expected {
+            return Ok(false);
+        }
+        // The RouterOS API has no conditional remove primitive. This final
+        // id-only command is safe against OxiDNS reload races because the
+        // ownership namespace has one in-process writer. The fresh full-row
+        // comparison above is the best available guard against external
+        // changes; operators must not concurrently edit plugin-owned rows.
+        self.remove_route_by_id(&expected.id, expected.family, bypass_backoff)
+            .await?;
+        Ok(true)
     }
 
     async fn inspect_exact_routes(
@@ -327,6 +317,7 @@ impl MikrotikRsClient {
     ) -> Result<ExactRouteOwnership> {
         let print = CommandBuilder::new()
             .command(route_command(key.family(), RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
             .query_equal(ROUTE_TABLE_FIELD, &key.table)
             .query_equal(ROUTE_DST_FIELD, &key.dst_address())
             .build();
@@ -344,8 +335,7 @@ impl MikrotikRsClient {
 
     async fn prune_duplicate_owned_routes(&self, duplicates: Vec<RouterRoute>) -> Result<()> {
         for duplicate in duplicates {
-            self.delete_route_by_id(&duplicate.id, duplicate.family)
-                .await?;
+            self.delete_route_if_matches(&duplicate).await?;
         }
         Ok(())
     }
@@ -357,6 +347,7 @@ impl MikrotikRsClient {
     ) -> Result<Vec<RouterRoute>> {
         let print = CommandBuilder::new()
             .command(route_command(family, RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
             .query_equal(ROUTE_TABLE_FIELD, table)
             .build();
         let action = match family {
@@ -377,50 +368,6 @@ impl MikrotikRsClient {
                 Ok(route)
             })
             .collect()
-    }
-}
-
-async fn receive_rows(
-    action: &str,
-    receive_timeout: Duration,
-    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
-) -> Result<Vec<RouterReply>> {
-    let mut rows = Vec::new();
-    loop {
-        match receive_event(action, receive_timeout, receiver).await? {
-            Event::Reply { response, .. } => rows.push(RouterReply {
-                attributes: response.attributes,
-            }),
-            Event::Done { .. } | Event::Empty { .. } => return Ok(rows),
-            Event::Trap { response, .. } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} trap: {}",
-                    response.message
-                )));
-            }
-            Event::Fatal { reason } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} fatal: {reason}"
-                )));
-            }
-        }
-    }
-}
-
-async fn receive_event(
-    action: &str,
-    receive_timeout: Duration,
-    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
-) -> Result<Event> {
-    match tokio::time::timeout(receive_timeout, receiver.recv()).await {
-        Ok(Some(event)) => Ok(event),
-        Ok(None) => Err(DnsError::plugin(format!(
-            "ros_route {action} response channel closed before a terminal event"
-        ))),
-        Err(_) => Err(DnsError::plugin(format!(
-            "ros_route {action} receive timeout after {}s",
-            receive_timeout.as_secs()
-        ))),
     }
 }
 
@@ -450,37 +397,6 @@ fn insert_connection_destination(
     }
     destinations.insert(ip);
     Ok(())
-}
-
-async fn receive_connection_destinations(
-    action: &str,
-    family: RouteFamily,
-    receive_timeout: Duration,
-    receiver: &mut tokio::sync::mpsc::Receiver<Event>,
-) -> Result<AHashSet<IpAddr>> {
-    let mut destinations = AHashSet::new();
-    loop {
-        match receive_event(action, receive_timeout, receiver).await? {
-            Event::Reply { response, .. } => insert_connection_destination(
-                action,
-                family,
-                response.attributes,
-                &mut destinations,
-            )?,
-            Event::Done { .. } | Event::Empty { .. } => return Ok(destinations),
-            Event::Trap { response, .. } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} trap: {}",
-                    response.message
-                )));
-            }
-            Event::Fatal { reason } => {
-                return Err(DnsError::plugin(format!(
-                    "ros_route {action} fatal: {reason}"
-                )));
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -633,6 +549,14 @@ fn classify_exact_routes(
 
 #[async_trait]
 impl MikrotikApi for MikrotikRsClient {
+    fn begin_shutdown_cleanup(&self) {
+        self.transport.begin_shutdown_cleanup();
+    }
+
+    async fn transport_snapshot(&self) -> Option<RouterOsTransportSnapshot> {
+        Some(self.transport.snapshot().await)
+    }
+
     async fn list_managed_routes(
         &self,
         table: &str,
@@ -664,18 +588,23 @@ impl MikrotikApi for MikrotikRsClient {
         Ok(routes)
     }
 
-    async fn find_route(
+    async fn find_routes(
         &self,
         key: &RouteKey,
         comment_prefix: &str,
         plugin_tag: &str,
-    ) -> Result<Option<RouterRoute>> {
-        let inspection = self
+    ) -> Result<Vec<RouterRoute>> {
+        let mut inspection = self
             .inspect_exact_routes(key, comment_prefix, plugin_tag)
             .await?;
-        self.prune_duplicate_owned_routes(inspection.duplicate_owned)
-            .await?;
-        Ok(inspection.owned)
+        let mut routes = Vec::with_capacity(
+            usize::from(inspection.owned.is_some()) + inspection.duplicate_owned.len(),
+        );
+        if let Some(route) = inspection.owned.take() {
+            routes.push(route);
+        }
+        routes.append(&mut inspection.duplicate_owned);
+        Ok(routes)
     }
 
     async fn upsert_host_route(
@@ -745,11 +674,16 @@ impl MikrotikApi for MikrotikRsClient {
             .build();
         let _ = self.send_rows("add host route", add).await?;
 
-        let created = if let Some(route) = self.find_route_by_exact_comment(key, comment).await? {
+        let created = if let Some(route) = self
+            .find_route_by_exact_comment(key, comment, false)
+            .await?
+        {
             route
         } else {
-            self.find_route(key, comment_prefix, plugin_tag)
+            self.find_routes(key, comment_prefix, plugin_tag)
                 .await?
+                .into_iter()
+                .next()
                 .ok_or_else(|| {
                     DnsError::plugin("ros_route upsert route succeeded but route id not found")
                 })?
@@ -789,14 +723,14 @@ impl MikrotikApi for MikrotikRsClient {
 
         let validation_result = async {
             let route = self
-                .find_route_by_exact_comment(key, comment)
+                .find_route_by_exact_comment(key, comment, false)
                 .await?
                 .ok_or_else(|| {
                     DnsError::plugin(
                         "ros_route validate route config succeeded but temporary route id not found",
                     )
                 })?;
-            self.delete_route_by_id(&route.id, route.family).await
+            self.delete_route_if_matches(&route).await.map(|_| ())
         }
         .await;
 
@@ -817,16 +751,9 @@ impl MikrotikApi for MikrotikRsClient {
         Ok(())
     }
 
-    async fn delete_route_by_id(&self, id: &str, family: RouteFamily) -> Result<()> {
-        let remove = CommandBuilder::new()
-            .command(route_command(family, RouteOp::Remove))
-            .attribute(ROUTER_ID_FIELD, Some(id))
-            .build();
-        match self.send_rows("remove route", remove).await {
-            Ok(_) => Ok(()),
-            Err(e) if is_not_found_error(&e) => Ok(()),
-            Err(e) => Err(e),
-        }
+    async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool> {
+        self.delete_route_if_matches_with_backoff(expected, false)
+            .await
     }
 
     async fn connection_destinations(
@@ -847,28 +774,17 @@ impl MikrotikApi for MikrotikRsClient {
             RouteFamily::Ipv6 => "print ipv6 connection destinations",
         };
         let command = connection_destinations_command(family, destinations);
-        let (mut receiver, generation) = self.send_command_receiver(action, command).await?;
-        let result =
-            receive_connection_destinations(action, family, self.timeouts.receive, &mut receiver)
-                .await;
-        self.finish_receive(generation, result).await
+        let mut stream = self.transport.send_command(action, command).await?;
+        let mut found = AHashSet::new();
+        loop {
+            match stream.next().await? {
+                RouterOsEvent::Reply(attributes) => {
+                    insert_connection_destination(action, family, attributes, &mut found)?;
+                }
+                RouterOsEvent::Complete => return Ok(found),
+            }
+        }
     }
-
-    async fn healthcheck(&self) -> Result<()> {
-        // Identity print is cheap and available on all RouterOS v7 targets.
-        let command = CommandBuilder::new()
-            .command(COMMAND_SYSTEM_IDENTITY_PRINT)
-            .build();
-        let _ = self.send_rows("healthcheck", command).await?;
-        Ok(())
-    }
-}
-
-fn is_not_found_error(err: &DnsError) -> bool {
-    let lower = err.to_string().to_ascii_lowercase();
-    lower.contains("no such item")
-        || lower.contains("not found")
-        || lower.contains("does not exist")
 }
 
 #[cfg(test)]
@@ -892,13 +808,10 @@ mod tests {
     fn exact_route_inspection_reports_owned_and_foreign_duplicates() {
         let inspection = classify_exact_routes(
             [
-                route(
-                    "*owned",
-                    Some("fdns;pg=route-test;kind=dynamic;dm=example.com;exp=400;seen=100"),
-                ),
+                route("*owned", Some("fdns;pg=route-test;kind=D;exp=400;seen=100")),
                 route(
                     "*owned-duplicate",
-                    Some("fdns;pg=route-test;kind=dynamic;dm=example.com;exp=400;seen=100"),
+                    Some("fdns;pg=route-test;kind=D;exp=400;seen=100"),
                 ),
                 route("*foreign", Some("operator-managed")),
             ],
@@ -963,7 +876,8 @@ mod tests {
         assert!(wire.contains("?dst-address=203.0.113.11"));
         assert!(wire.contains("?#|"));
 
-        let ipv6 = connection_destinations_command(RouteFamily::Ipv6, &[]);
+        let ipv6_addr: IpAddr = "2001:db8::1".parse().expect("ipv6");
+        let ipv6 = connection_destinations_command(RouteFamily::Ipv6, &[ipv6_addr]);
         assert!(
             String::from_utf8_lossy(ipv6.data()).contains(COMMAND_IPV6_FIREWALL_CONNECTION_PRINT)
         );

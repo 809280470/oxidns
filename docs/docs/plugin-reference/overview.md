@@ -85,8 +85,8 @@ server -> sequence
 | [`script`](executor.mdx#script) | 执行外部命令，并把 `DnsContext` 中的稳定字段注入为参数或环境变量。 |
 | [`ipset`](executor.mdx#ipset) | 把响应中的 IP 写入 Linux `ipset`（内置 netlink 后端，无需 `ipset` 命令）。 |
 | [`nftset`](executor.mdx#nftset) | 把响应 IP 写入 Linux `nftables set`（内置 netlink 后端，无需 `nft` 命令）。 |
-| [`ros_address_list`](executor.mdx#ros_address_list) | 把应答 IP 同步到 RouterOS `address-list`，支持动态项、常驻项和关闭清理。 |
-| [`ros_route`](executor.mdx#ros_route) | 把应答 IP 同步为 RouterOS 策略路由，支持 TTL、固定不过期路由和常驻路由。 |
+| [`ros_address_list`](executor.mdx#ros_address_list) | 推荐的 RouterOS 联动方式；把应答 IP 投影到 `address-list`，适合配合防火墙、mangle 和策略路由规则。 |
+| [`ros_route`](executor.mdx#ros_route) | 高级 RouterOS 联动方式；直接把应答 IP 投影为策略路由，适合明确需要逐 IP 路由的场景。 |
 
 ### 维护与调度
 

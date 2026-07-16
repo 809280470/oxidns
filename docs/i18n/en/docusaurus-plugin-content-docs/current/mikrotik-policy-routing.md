@@ -125,7 +125,7 @@ plugins:
       async: true
       address_list4: "policy_set_v4"
       address_list6: "policy_set_v6"
-      comment_prefix: "oxidns"
+      comment_prefix: "oxi"
       min_ttl: 60
       max_ttl: 1800
 
