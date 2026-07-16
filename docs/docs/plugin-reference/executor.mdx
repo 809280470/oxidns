@@ -2744,7 +2744,7 @@ args:
 - `comment_prefix` 与插件 `tag` 不能包含 `;` 或 `=`。
 - 同步模式不会改变 DNS 应答本身，即使 RouterOS 写入失败也会保留 DNS 结果。
 - `fixed_ttl: 0` 的动态项不会自然过期，也没有记录数量上限；用户需要评估 RouterOS 容量并负责显式清理。
-- 应用级 reload 按 shutdown 处理：先停止并销毁旧 runtime，再创建新 runtime，不移交待处理观测。`cleanup_on_shutdown: true` 时会先清理旧实例拥有的条目，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 条目，请设为 `false`。不同进程不能同时使用相同的插件 tag、注释前缀和目标列表；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
+- 应用级 reload 对该插件采用 shutdown/restart 语义：候选 runtime 可提前完成无副作用的初始化，但旧实例会先完整 shutdown，新实例随后才激活；旧实例待处理观测不移交。`cleanup_on_shutdown: true` 时会清理旧实例拥有的条目，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 条目，请设为 `false`。不同进程不能同时使用相同的插件 tag、注释前缀和目标列表；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
 
 </Admonition>
 
@@ -2796,7 +2796,7 @@ args:
 - RouterOS comment 只保存条目类型、过期时间和最近观察时间，不保存域名引用。重启时恢复未过期租约；当前 TTL 策略可以收紧旧期限，但不会在没有新 DNS 观察时延长它。
 - `tls` 启用 API-SSL（通常 `8729`）：`tls.server_name` 覆盖证书服务器名称，`tls.ca` 指定自签名/私有 CA 文件，`tls.insecure` 默认为 `false`，设为 `true` 时跳过证书验证且不能与 `tls.ca` 同时配置。省略 `tls` 时使用明文 API（通常 `8728`）。
 - `cleanup_on_shutdown: true` 会在 30 秒总预算内删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。生产重启或滚动发布需要策略连续性时建议设为 `false`。
-- 应用级 reload 按 shutdown 处理：先停止并销毁旧 runtime，再创建新 runtime，不移交待处理观测。`cleanup_on_shutdown: true` 时会先清理旧实例拥有的路由，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 路由，请设为 `false`。不同进程不能同时使用相同插件 tag、注释前缀和 routing table；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
+- 应用级 reload 对该插件采用 shutdown/restart 语义：候选 runtime 可提前完成无副作用的初始化，但旧实例会先完整 shutdown，新实例随后才激活；旧实例待处理观测不移交。`cleanup_on_shutdown: true` 时会清理旧实例拥有的路由，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 路由，请设为 `false`。不同进程不能同时使用相同插件 tag、注释前缀和 routing table；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
 - 删除前会重新读取路由并比较完整快照（comment、gateway、distance、disabled 等）。但 RouterOS 最终只提供按内部 ID 删除，不支持原子 compare-and-delete；因此不要在其它进程或 RouterOS 管理界面中并发修改插件拥有的路由。用户直接删除动态路由仍是支持的操作，对账会接受删除事实。
 
 ---

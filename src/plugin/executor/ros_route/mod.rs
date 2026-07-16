@@ -32,14 +32,14 @@
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ahash::AHashSet;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::config::types::PluginConfig;
@@ -122,8 +122,6 @@ struct PersistentArgs {
 
 #[derive(Debug, Clone)]
 struct MikrotikConfig {
-    /// RouterOS API endpoint.
-    address: String,
     /// Connection settings consumed when the API transport is constructed.
     connection: Option<RouterOsConnectionConfig>,
     /// Async mode switch for post stage RouterOS writes.
@@ -223,7 +221,6 @@ impl MikrotikConfigArgs {
         }
 
         Ok(MikrotikConfig {
-            address,
             connection: Some(connection),
             async_mode: self.async_mode.unwrap_or(DEFAULT_ASYNC_MODE),
             routing_table,
@@ -245,6 +242,7 @@ impl MikrotikConfigArgs {
 
 mod api;
 mod manager;
+mod model;
 
 use self::api::{
     DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_RECEIVE_TIMEOUT_SECS, DEFAULT_SEND_TIMEOUT_SECS,
@@ -252,20 +250,15 @@ use self::api::{
 };
 use self::manager::{
     ObserveEnqueueError, RouteManager, RouteManagerConfig, RouteManagerHandle, RouteManagerRuntime,
-    RoutePendingWork,
 };
 use crate::infra::mikrotik::ip_prefix::IpPrefix;
-use crate::infra::mikrotik::lifecycle::{ActiveInstanceRegistry, WriterGate};
 use crate::infra::mikrotik::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
 use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
 
 #[derive(Debug)]
 struct MikrotikExecutor {
     tag: String,
-    instance_id: u64,
-    active_registered: AtomicBool,
-    writer_gate: Arc<WriterGate>,
-    manager_active: Arc<AtomicBool>,
+    committed: AtomicBool,
     metrics: Arc<RosRouteMetrics>,
     config: MikrotikConfig,
     manager: Option<RouteManager>,
@@ -292,226 +285,6 @@ struct RosRouteMetrics {
     last_reconcile_success_timestamp_seconds: AtomicU64,
     degraded: AtomicU64,
     cleanup_error_total: AtomicU64,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveRouteInstance {
-    instance_id: u64,
-    namespace: RouteOwnershipNamespace,
-    metrics: Arc<RosRouteMetrics>,
-    /// Lifecycle channel used to pause, drain, and activate the single writer
-    /// during commit or rollback.
-    manager_handle: Option<RouteManagerHandle>,
-    writer_gate: Arc<WriterGate>,
-    manager_active: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct RouteOwnershipNamespace {
-    address: String,
-    routing_table: String,
-    comment_prefix: String,
-}
-
-impl RouteOwnershipNamespace {
-    fn from_config(config: &MikrotikConfig) -> Self {
-        Self {
-            address: config.address.clone(),
-            routing_table: config.routing_table.clone(),
-            comment_prefix: config.comment_prefix.clone(),
-        }
-    }
-}
-
-static NEXT_ROUTE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
-fn active_route_instances() -> &'static ActiveInstanceRegistry<ActiveRouteInstance> {
-    static INSTANCES: OnceLock<ActiveInstanceRegistry<ActiveRouteInstance>> = OnceLock::new();
-    INSTANCES.get_or_init(ActiveInstanceRegistry::new)
-}
-
-fn route_lifecycle_transition() -> &'static AsyncMutex<()> {
-    static TRANSITION: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    TRANSITION.get_or_init(|| AsyncMutex::new(()))
-}
-
-async fn register_prepared_route_instance(
-    tag: &str,
-    instance_id: u64,
-    namespace: RouteOwnershipNamespace,
-    metrics: Arc<RosRouteMetrics>,
-    manager_handle: Option<RouteManagerHandle>,
-) -> Result<(Arc<WriterGate>, Arc<AtomicBool>)> {
-    let _transition = route_lifecycle_transition().lock().await;
-    register_metric_source(metrics.clone())?;
-    // Candidate servers may accept requests while the runtime is being built.
-    // Admit their observations into the bounded mailbox, but keep the manager
-    // paused until the runtime manager commits the candidate.
-    let writer_gate = WriterGate::new(true);
-    let manager_active = Arc::new(AtomicBool::new(false));
-    active_route_instances().push(
-        tag,
-        ActiveRouteInstance {
-            instance_id,
-            namespace,
-            metrics,
-            manager_handle: manager_handle.clone(),
-            writer_gate: writer_gate.clone(),
-            manager_active: manager_active.clone(),
-        },
-    );
-    Ok((writer_gate, manager_active))
-}
-
-async fn commit_prepared_route_instance(tag: &str, instance_id: u64) {
-    let _transition = route_lifecycle_transition().lock().await;
-    let Some(instance) =
-        active_route_instances().find(tag, |instance| instance.instance_id == instance_id)
-    else {
-        return;
-    };
-    if instance.manager_active.load(Ordering::Acquire) {
-        return;
-    }
-    if active_route_instances()
-        .find(tag, |other| {
-            other.instance_id != instance_id
-                && other.namespace == instance.namespace
-                && other.manager_active.load(Ordering::Acquire)
-        })
-        .is_some()
-    {
-        warn!(plugin = %tag, "ros_route commit deferred because the previous manager is still active");
-        return;
-    }
-    if let Some(handle) = &instance.manager_handle {
-        match handle.activate(RoutePendingWork::default()).await {
-            Ok(()) => instance.manager_active.store(true, Ordering::Release),
-            Err(error) => {
-                warn!(plugin = %tag, err = %error, "ros_route failed to commit prepared manager")
-            }
-        }
-    }
-}
-
-/// Unregister one runtime and return whether its ownership namespace may be
-/// cleaned up.
-///
-/// Candidate runtimes are initialized before the previous runtime is
-/// destroyed. Tracking all active instances prevents the old runtime from
-/// cleaning RouterOS state that a compatible replacement owns. A replacement
-/// using a different RouterOS address, routing table, or comment prefix does
-/// not suppress cleanup of the old namespace. The stack also restores the
-/// previous metric source when candidate initialization later rolls back.
-async fn release_active_route_instance(tag: &str, instance_id: u64) -> bool {
-    release_active_route_instance_until(
-        tag,
-        instance_id,
-        tokio::time::Instant::now() + SHUTDOWN_TIMEOUT,
-    )
-    .await
-}
-
-async fn release_active_route_instance_until(
-    tag: &str,
-    instance_id: u64,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let _transition = route_lifecycle_transition().lock().await;
-    let Some((
-        cleanup_allowed,
-        metric_replacement,
-        remove_metric,
-        removed_handle,
-        removed_writer_gate,
-        removed_manager_active,
-        transfer,
-    )) = active_route_instances().release(
-        tag,
-        |instance| instance.instance_id == instance_id,
-        |removed, instances, was_metric_owner| {
-            removed.writer_gate.deactivate();
-            let is_last = instances.is_empty();
-            let removed_active = removed.manager_active.load(Ordering::Acquire);
-            let cleanup_allowed = removed_active
-                && !instances
-                    .iter()
-                    .any(|instance| instance.namespace == removed.namespace);
-            let metric_replacement = was_metric_owner
-                .then(|| instances.last().map(|instance| instance.metrics.clone()))
-                .flatten();
-            let transfer = instances
-                .iter()
-                .rev()
-                .find(|instance| {
-                    instance.namespace == removed.namespace
-                        && instance.manager_active.load(Ordering::Acquire) != removed_active
-                })
-                .cloned();
-            let remove_metric = was_metric_owner && is_last;
-            (
-                cleanup_allowed,
-                metric_replacement,
-                remove_metric,
-                removed.manager_handle.clone(),
-                removed.writer_gate.clone(),
-                removed.manager_active.clone(),
-                transfer,
-            )
-        },
-    )
-    else {
-        return false;
-    };
-
-    let (pending, handoff_ready) = if transfer.is_some() {
-        let handoff_deadline = deadline
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or(deadline);
-        if tokio::time::timeout_at(handoff_deadline, removed_writer_gate.wait_idle())
-            .await
-            .is_err()
-        {
-            warn!(plugin = %tag, "ros_route writer drain exceeded shutdown deadline");
-            (RoutePendingWork::default(), false)
-        } else if let Some(handle) = removed_handle {
-            match tokio::time::timeout_at(handoff_deadline, handle.quiesce()).await {
-                Ok(pending) => (pending, true),
-                Err(_) => {
-                    warn!(plugin = %tag, "ros_route manager quiesce exceeded shutdown deadline");
-                    (RoutePendingWork::default(), false)
-                }
-            }
-        } else {
-            (RoutePendingWork::default(), true)
-        }
-    } else {
-        (RoutePendingWork::default(), false)
-    };
-    removed_manager_active.store(false, Ordering::Release);
-    if handoff_ready
-        && let Some(transfer) = transfer
-        && let Some(handle) = &transfer.manager_handle
-    {
-        match tokio::time::timeout_at(deadline, handle.activate(pending)).await {
-            Ok(Ok(())) => {
-                transfer.manager_active.store(true, Ordering::Release);
-                handle.request_reconcile();
-            }
-            Ok(Err(error)) => {
-                warn!(plugin = %tag, err = %error, "ros_route failed to transfer manager ownership")
-            }
-            Err(_) => {
-                warn!(plugin = %tag, "ros_route manager activation exceeded shutdown deadline")
-            }
-        }
-    }
-    if let Some(metrics) = metric_replacement {
-        let _ = register_metric_source(metrics);
-    } else if remove_metric {
-        unregister_metric_source(tag);
-    }
-    cleanup_allowed
 }
 
 impl RosRouteMetrics {
@@ -664,58 +437,49 @@ impl Plugin for MikrotikExecutor {
 
         let runtime = RouteManagerRuntime::start_paused(self.tag.clone(), manager);
         let manager_handle = runtime.handle();
-        let (writer_gate, manager_active) = match register_prepared_route_instance(
-            &self.tag,
-            self.instance_id,
-            RouteOwnershipNamespace::from_config(&self.config),
-            self.metrics.clone(),
-            Some(manager_handle.clone()),
-        )
-        .await
-        {
-            Ok(state) => state,
-            Err(error) => {
-                let _ = runtime.shutdown(false).await;
-                return Err(error);
-            }
-        };
         let mut runtime = Some(runtime);
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = runtime.take();
         }
         if let Some(runtime) = runtime {
-            release_active_route_instance(&self.tag, self.instance_id).await;
             let _ = runtime.shutdown(false).await;
             return Err(DnsError::plugin(
                 "ros_route runtime lock is poisoned during initialization",
             ));
         }
         self.manager_handle = Some(manager_handle);
-        self.writer_gate = writer_gate;
-        self.manager_active = manager_active;
-        self.active_registered.store(true, Ordering::Release);
         Ok(())
     }
 
     async fn commit(&self) {
-        if self.active_registered.load(Ordering::Acquire) {
-            commit_prepared_route_instance(&self.tag, self.instance_id).await;
+        if self.committed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(handle) = &self.manager_handle else {
+            return;
+        };
+        match handle.activate().await {
+            Ok(()) => {
+                if let Err(error) = register_metric_source(self.metrics.clone()) {
+                    warn!(plugin = %self.tag, err = %error, "ros_route failed to register metrics");
+                }
+                self.committed.store(true, Ordering::Release);
+            }
+            Err(error) => {
+                warn!(plugin = %self.tag, err = %error, "ros_route failed to activate manager")
+            }
         }
     }
 
     async fn destroy(&self) -> Result<()> {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
-        let is_last_instance = if self.active_registered.swap(false, Ordering::AcqRel) {
-            release_active_route_instance_until(&self.tag, self.instance_id, deadline).await
-        } else {
-            false
-        };
+        let committed = self.committed.swap(false, Ordering::AcqRel);
+        if committed {
+            unregister_metric_source(&self.tag);
+        }
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
             return runtime
-                .shutdown_until(
-                    self.config.cleanup_on_shutdown && is_last_instance,
-                    deadline,
-                )
+                .shutdown_until(self.config.cleanup_on_shutdown && committed, deadline)
                 .await;
         }
         Ok(())
@@ -737,15 +501,7 @@ impl Executor for MikrotikExecutor {
         context: &mut DnsContext,
         next: Option<ExecutorNext>,
     ) -> Result<ExecStep> {
-        let writer_permit = self
-            .active_registered
-            .load(Ordering::Acquire)
-            .then(|| self.writer_gate.enter())
-            .flatten();
         let step = continue_next!(next, context)?;
-        let Some(_writer_permit) = writer_permit else {
-            return Ok(step);
-        };
         let Some(handle) = self.manager_handle.as_ref() else {
             return Ok(step);
         };
@@ -884,10 +640,7 @@ impl PluginFactory for MikrotikFactory {
 
         Ok(UninitializedPlugin::Executor(Box::new(MikrotikExecutor {
             tag: plugin_config.tag.clone(),
-            instance_id: NEXT_ROUTE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
-            active_registered: AtomicBool::new(false),
-            writer_gate: WriterGate::new(false),
-            manager_active: Arc::new(AtomicBool::new(false)),
+            committed: AtomicBool::new(false),
             metrics,
             config,
             manager: Some(manager),
@@ -1479,182 +1232,5 @@ gateway4: "192.0.2.1"
             ));
 
         assert!(extract_observation(&mut context, &config).is_none());
-    }
-
-    #[tokio::test]
-    async fn same_tag_runtime_coordinates_cleanup_by_ownership_namespace() {
-        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(6, Ordering::Relaxed);
-        let namespace = RouteOwnershipNamespace {
-            address: "192.0.2.10:8728".to_string(),
-            routing_table: "policy".to_string(),
-            comment_prefix: "fdns".to_string(),
-        };
-        let success_tag = format!("route-reload-success-{sequence}");
-        let old_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
-        let new_metrics = Arc::new(RosRouteMetrics::new(success_tag.clone()));
-        let (_, old_active) = register_prepared_route_instance(
-            &success_tag,
-            sequence,
-            namespace.clone(),
-            old_metrics,
-            None,
-        )
-        .await
-        .expect("old runtime");
-        old_active.store(true, Ordering::Release);
-        let (_, replacement_active) = register_prepared_route_instance(
-            &success_tag,
-            sequence + 1,
-            namespace.clone(),
-            new_metrics,
-            None,
-        )
-        .await
-        .expect("replacement runtime");
-        assert!(!release_active_route_instance(&success_tag, sequence).await);
-        replacement_active.store(true, Ordering::Release);
-        assert!(release_active_route_instance(&success_tag, sequence + 1).await);
-
-        let rollback_tag = format!("route-reload-rollback-{sequence}");
-        let old_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
-        let candidate_metrics = Arc::new(RosRouteMetrics::new(rollback_tag.clone()));
-        let (_, old_active) = register_prepared_route_instance(
-            &rollback_tag,
-            sequence + 2,
-            namespace.clone(),
-            old_metrics,
-            None,
-        )
-        .await
-        .expect("old runtime");
-        old_active.store(true, Ordering::Release);
-        register_prepared_route_instance(
-            &rollback_tag,
-            sequence + 3,
-            namespace,
-            candidate_metrics,
-            None,
-        )
-        .await
-        .expect("candidate runtime");
-        assert!(!release_active_route_instance(&rollback_tag, sequence + 3).await);
-        assert!(release_active_route_instance(&rollback_tag, sequence + 2).await);
-
-        let migration_tag = format!("route-reload-migration-{sequence}");
-        let old_namespace = RouteOwnershipNamespace {
-            address: "192.0.2.10:8728".to_string(),
-            routing_table: "old-policy".to_string(),
-            comment_prefix: "old-fdns".to_string(),
-        };
-        let new_namespace = RouteOwnershipNamespace {
-            address: "192.0.2.11:8728".to_string(),
-            routing_table: "new-policy".to_string(),
-            comment_prefix: "new-fdns".to_string(),
-        };
-        let (_, old_active) = register_prepared_route_instance(
-            &migration_tag,
-            sequence + 4,
-            old_namespace,
-            Arc::new(RosRouteMetrics::new(migration_tag.clone())),
-            None,
-        )
-        .await
-        .expect("old namespace");
-        old_active.store(true, Ordering::Release);
-        let (_, new_active) = register_prepared_route_instance(
-            &migration_tag,
-            sequence + 5,
-            new_namespace,
-            Arc::new(RosRouteMetrics::new(migration_tag.clone())),
-            None,
-        )
-        .await
-        .expect("new namespace");
-        assert!(release_active_route_instance(&migration_tag, sequence + 4).await);
-        new_active.store(true, Ordering::Release);
-        assert!(release_active_route_instance(&migration_tag, sequence + 5).await);
-    }
-
-    #[tokio::test]
-    async fn failed_compatible_reload_requests_immediate_restore_reconcile() {
-        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
-        let tag = format!("route-reload-restore-{sequence}");
-        let namespace = RouteOwnershipNamespace {
-            address: "192.0.2.10:8728".to_string(),
-            routing_table: "policy".to_string(),
-            comment_prefix: "fdns".to_string(),
-        };
-        let old_handle = RouteManagerHandle::new_for_test();
-
-        let (_, old_active) = register_prepared_route_instance(
-            &tag,
-            sequence,
-            namespace.clone(),
-            Arc::new(RosRouteMetrics::new(tag.clone())),
-            Some(old_handle.clone()),
-        )
-        .await
-        .expect("old runtime");
-        old_active.store(true, Ordering::Release);
-        register_prepared_route_instance(
-            &tag,
-            sequence + 1,
-            namespace,
-            Arc::new(RosRouteMetrics::new(tag.clone())),
-            None,
-        )
-        .await
-        .expect("candidate runtime");
-
-        assert!(!release_active_route_instance(&tag, sequence + 1).await);
-        assert!(old_handle.take_reconcile_for_test());
-        assert!(release_active_route_instance(&tag, sequence).await);
-    }
-
-    #[tokio::test]
-    async fn compatible_release_bounds_writer_drain_by_shutdown_deadline() {
-        let sequence = NEXT_ROUTE_INSTANCE_ID.fetch_add(2, Ordering::Relaxed);
-        let tag = format!("route-release-deadline-{sequence}");
-        let namespace = RouteOwnershipNamespace {
-            address: "192.0.2.10:8728".to_string(),
-            routing_table: "policy".to_string(),
-            comment_prefix: "fdns".to_string(),
-        };
-        let (old_gate, old_active) = register_prepared_route_instance(
-            &tag,
-            sequence,
-            namespace.clone(),
-            Arc::new(RosRouteMetrics::new(tag.clone())),
-            None,
-        )
-        .await
-        .expect("old runtime");
-        old_active.store(true, Ordering::Release);
-        let permit = old_gate.enter().expect("in-flight writer");
-        let (_, replacement_active) = register_prepared_route_instance(
-            &tag,
-            sequence + 1,
-            namespace,
-            Arc::new(RosRouteMetrics::new(tag.clone())),
-            None,
-        )
-        .await
-        .expect("replacement runtime");
-
-        let released = tokio::time::timeout(
-            Duration::from_millis(200),
-            release_active_route_instance_until(
-                &tag,
-                sequence,
-                tokio::time::Instant::now() + Duration::from_millis(20),
-            ),
-        )
-        .await
-        .expect("release must respect deadline");
-        assert!(!released);
-
-        drop(permit);
-        replacement_active.store(true, Ordering::Release);
-        assert!(release_active_route_instance(&tag, sequence + 1).await);
     }
 }

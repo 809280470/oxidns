@@ -14,11 +14,15 @@ use tracing::{debug, warn};
 
 use super::RosRouteMetrics;
 use super::api::{MikrotikApi, RouterRoute};
+use super::model::{
+    RouteCommentCodec, RouteCommentKind, RouteCommentMeta, RouteFamily, RouteKey,
+    is_validation_comment, validation_comment,
+};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::mikrotik::batching::join_all_bounded;
 use crate::infra::mikrotik::completion::BatchCompletion;
-use crate::infra::mikrotik::ip_prefix::{IpPrefix, host_prefix};
+use crate::infra::mikrotik::ip_prefix::IpPrefix;
 use crate::infra::mikrotik::lease::{LeaseBook, LeaseDeadline, LeasePolicy};
 use crate::infra::mikrotik::lifecycle::abort_and_reap;
 use crate::infra::mikrotik::mailbox::{Coalesce, KeyedMailbox, PushOutcome, TryPushError};
@@ -37,14 +41,6 @@ const CONNECTION_GUARD_RETRY_INTERVAL_SECS: u64 = SWEEP_INTERVAL_SECS;
 const CONNECTION_QUERY_BATCH_SIZE: usize = 128;
 const UPSERT_PIPELINE_SIZE: usize = 16;
 
-const COMMENT_FIELD_PLUGIN: &str = "pg";
-const COMMENT_FIELD_KIND: &str = "kind";
-const COMMENT_FIELD_EXP: &str = "exp";
-const COMMENT_FIELD_SEEN: &str = "seen";
-const COMMENT_KIND_DYNAMIC: &str = "D";
-const COMMENT_KIND_PERSISTENT: &str = "P";
-const COMMENT_KIND_GATEWAY_CHECK: &str = "V";
-
 #[derive(Debug, Clone)]
 pub(super) struct RouteManagerConfig {
     pub(super) plugin_tag: String,
@@ -58,184 +54,6 @@ pub(super) struct RouteManagerConfig {
     pub(super) max_ttl: u32,
     pub(super) fixed_ttl: Option<u32>,
     pub(super) conntrack_guard: bool,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub(super) enum RouteFamily {
-    Ipv4,
-    Ipv6,
-}
-
-impl RouteFamily {
-    pub(super) fn from_ip(ip: IpAddr) -> Self {
-        match ip {
-            IpAddr::V4(_) => Self::Ipv4,
-            IpAddr::V6(_) => Self::Ipv6,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub(super) struct RouteKey {
-    pub(super) ip: IpAddr,
-    pub(super) prefix: u8,
-    pub(super) table: String,
-}
-
-impl RouteKey {
-    pub(super) fn new(ip: IpAddr, table: String) -> Self {
-        Self {
-            ip,
-            prefix: host_prefix(ip),
-            table,
-        }
-    }
-
-    pub(super) fn family(&self) -> RouteFamily {
-        RouteFamily::from_ip(self.ip)
-    }
-
-    pub(super) fn dst_address(&self) -> String {
-        format!("{}/{}", self.ip, self.prefix)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum RouteCommentKind {
-    Dynamic,
-    Persistent,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) struct RouteCommentMeta {
-    pub(super) kind: RouteCommentKind,
-    pub(super) expires_at_ms: LeaseDeadline,
-    pub(super) last_seen_ms: u64,
-}
-
-#[derive(Debug)]
-pub(super) struct RouteCommentCodec;
-
-impl RouteCommentCodec {
-    fn prefix(prefix: &str, plugin_tag: &str, kind: &str) -> String {
-        let mut out = String::new();
-        if !prefix.is_empty() {
-            out.push_str(prefix);
-            out.push(';');
-        }
-        out.push_str(COMMENT_FIELD_PLUGIN);
-        out.push('=');
-        out.push_str(plugin_tag);
-        out.push(';');
-        out.push_str(COMMENT_FIELD_KIND);
-        out.push('=');
-        out.push_str(kind);
-        out
-    }
-
-    fn encode_persistent(prefix: &str, plugin_tag: &str) -> String {
-        Self::prefix(prefix, plugin_tag, COMMENT_KIND_PERSISTENT)
-    }
-
-    fn encode_dynamic(
-        prefix: &str,
-        plugin_tag: &str,
-        deadline: LeaseDeadline,
-        last_seen_ms: u64,
-    ) -> String {
-        let mut out = Self::prefix(prefix, plugin_tag, COMMENT_KIND_DYNAMIC);
-        let expires_at = deadline.unix_millis().map_or(0, |value| value / 1_000);
-        out.push(';');
-        out.push_str(COMMENT_FIELD_EXP);
-        out.push('=');
-        out.push_str(&expires_at.to_string());
-        out.push(';');
-        out.push_str(COMMENT_FIELD_SEEN);
-        out.push('=');
-        out.push_str(&(last_seen_ms / 1_000).to_string());
-        out
-    }
-
-    pub(super) fn decode(
-        prefix: &str,
-        plugin_tag: &str,
-        family: RouteFamily,
-        dst_address: &str,
-        comment: &str,
-    ) -> Result<Option<RouteCommentMeta>> {
-        if !prefix.is_empty()
-            && (!comment.starts_with(prefix) || comment.as_bytes().get(prefix.len()) != Some(&b';'))
-        {
-            return Ok(None);
-        }
-        let mut owner = None;
-        let mut kind = None;
-        let mut expiry = None;
-        let mut seen = None;
-        for token in comment.split(';') {
-            let Some((key, value)) = token.trim().split_once('=') else {
-                continue;
-            };
-            match key.trim() {
-                COMMENT_FIELD_PLUGIN => owner = Some(value.trim()),
-                COMMENT_FIELD_KIND => kind = Some(value.trim()),
-                COMMENT_FIELD_EXP => expiry = Some(value.trim()),
-                COMMENT_FIELD_SEEN => seen = Some(value.trim()),
-                _ => {}
-            }
-        }
-        if owner != Some(plugin_tag) {
-            return Ok(None);
-        }
-        let prefix = dst_address
-            .parse::<IpPrefix>()
-            .map_err(|error| DnsError::plugin(format!("ros_route invalid dst-address: {error}")))?;
-        if RouteFamily::from_ip(prefix.address()) != family {
-            return Err(DnsError::plugin(
-                "ros_route comment address family mismatch",
-            ));
-        }
-        match kind {
-            Some(COMMENT_KIND_PERSISTENT) => Ok(Some(RouteCommentMeta {
-                kind: RouteCommentKind::Persistent,
-                expires_at_ms: LeaseDeadline::Timeless,
-                last_seen_ms: 0,
-            })),
-            Some(COMMENT_KIND_DYNAMIC) if prefix.is_host() => {
-                let expiry = expiry
-                    .ok_or_else(|| DnsError::plugin("ros_route dynamic comment missing exp"))?
-                    .parse::<u64>()
-                    .map_err(|error| DnsError::plugin(format!("ros_route invalid exp: {error}")))?;
-                let seen = seen
-                    .ok_or_else(|| DnsError::plugin("ros_route dynamic comment missing seen"))?
-                    .parse::<u64>()
-                    .map_err(|error| {
-                        DnsError::plugin(format!("ros_route invalid seen: {error}"))
-                    })?;
-                Ok(Some(RouteCommentMeta {
-                    kind: RouteCommentKind::Dynamic,
-                    expires_at_ms: if expiry == 0 {
-                        LeaseDeadline::Timeless
-                    } else {
-                        LeaseDeadline::At(expiry.saturating_mul(1_000))
-                    },
-                    last_seen_ms: seen.saturating_mul(1_000),
-                }))
-            }
-            Some(COMMENT_KIND_DYNAMIC) => Err(DnsError::plugin(
-                "ros_route dynamic comment is only valid for host routes",
-            )),
-            _ => Ok(None),
-        }
-    }
-}
-
-fn is_validation_comment(prefix: &str, plugin_tag: &str, comment: &str) -> bool {
-    comment == RouteCommentCodec::prefix(prefix, plugin_tag, COMMENT_KIND_GATEWAY_CHECK)
-        || comment.starts_with(&format!(
-            "{};nonce=",
-            RouteCommentCodec::prefix(prefix, plugin_tag, COMMENT_KIND_GATEWAY_CHECK)
-        ))
 }
 
 fn deadline_is_later(candidate: LeaseDeadline, current: LeaseDeadline) -> bool {
@@ -291,20 +109,9 @@ enum ControlCommand {
     Reconcile,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct RoutePendingWork {
-    items: Vec<(RouteKey, RouteObservation)>,
-}
-
 #[derive(Debug)]
 enum LifecycleCommand {
-    Quiesce {
-        done: oneshot::Sender<RoutePendingWork>,
-    },
-    Activate {
-        pending: RoutePendingWork,
-        done: oneshot::Sender<()>,
-    },
+    Activate { done: oneshot::Sender<()> },
 }
 
 impl Coalesce for ControlCommand {
@@ -347,28 +154,6 @@ impl RouteManagerHandle {
             metrics,
             lifecycle,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn new_for_test() -> Self {
-        AppClock::start();
-        Self::new(
-            &RouteManagerConfig {
-                plugin_tag: "test".to_string(),
-                routing_table: "main".to_string(),
-                gateway4: Some("192.0.2.1".to_string()),
-                gateway6: Some("2001:db8::1".to_string()),
-                persistent_ips: AHashSet::new(),
-                comment_prefix: "fdns".to_string(),
-                distance: 100,
-                min_ttl: 60,
-                max_ttl: 3_600,
-                fixed_ttl: None,
-                conntrack_guard: false,
-            },
-            None,
-            None,
-        )
     }
 
     fn prepare(&self, addrs: Vec<ObservedAddr>) -> Vec<(RouteKey, LeaseDeadline, u64)> {
@@ -513,40 +298,17 @@ impl RouteManagerHandle {
             .is_ok()
     }
 
-    pub(super) async fn quiesce(&self) -> RoutePendingWork {
-        let Some(lifecycle) = &self.lifecycle else {
-            return RoutePendingWork::default();
-        };
-        let (done, wait) = oneshot::channel();
-        if lifecycle
-            .send(LifecycleCommand::Quiesce { done })
-            .await
-            .is_err()
-        {
-            return RoutePendingWork::default();
-        }
-        wait.await.unwrap_or_default()
-    }
-
-    pub(super) async fn activate(&self, pending: RoutePendingWork) -> Result<()> {
+    pub(super) async fn activate(&self) -> Result<()> {
         let Some(lifecycle) = &self.lifecycle else {
             return Ok(());
         };
         let (done, wait) = oneshot::channel();
         lifecycle
-            .send(LifecycleCommand::Activate { pending, done })
+            .send(LifecycleCommand::Activate { done })
             .await
             .map_err(|_| DnsError::plugin("ros_route manager lifecycle channel is closed"))?;
         wait.await
             .map_err(|_| DnsError::plugin("ros_route manager activation was cancelled"))
-    }
-
-    #[cfg(test)]
-    pub(super) fn take_reconcile_for_test(&self) -> bool {
-        matches!(
-            self.controls.try_recv(),
-            Some((ControlKey::Reconcile, ControlCommand::Reconcile))
-        )
     }
 
     fn request_sweep(&self) {
@@ -827,11 +589,7 @@ impl RouteManager {
             let key = validation_route_key(family, &self.cfg.routing_table, nonce);
             let comment = format!(
                 "{};nonce={nonce}",
-                RouteCommentCodec::prefix(
-                    &self.cfg.comment_prefix,
-                    &self.cfg.plugin_tag,
-                    COMMENT_KIND_GATEWAY_CHECK,
-                )
+                validation_comment(&self.cfg.comment_prefix, &self.cfg.plugin_tag)
             );
             self.api
                 .validate_route_config(&key, gateway, self.cfg.distance, &comment)
@@ -1569,7 +1327,10 @@ async fn run_manager_worker(
             }
         };
         enum Event {
-            Observe(Vec<(RouteKey, RouteObservation)>),
+            Observe {
+                batch: Vec<(RouteKey, RouteObservation)>,
+                from_retry: bool,
+            },
             Control(ControlCommand),
             ReconcileCompleted,
             Lifecycle(LifecycleCommand),
@@ -1604,7 +1365,10 @@ async fn run_manager_worker(
                         })
                     })
                     .collect::<Vec<_>>();
-                (!due.is_empty()).then_some(Event::Observe(due))
+                (!due.is_empty()).then_some(Event::Observe {
+                    batch: due,
+                    from_retry: true,
+                })
             }
             _ = reconcile_retry_wakeup, if active => {
                 manager.reconcile_retry.mark_due();
@@ -1616,69 +1380,15 @@ async fn run_manager_worker(
                     let Some(next) = handle.observations.try_recv() else { break };
                     batch.push(next);
                 }
-                Event::Observe(batch)
+                Event::Observe {
+                    batch,
+                    from_retry: false,
+                }
             }),
         };
         let Some(event) = event else { break };
         match event {
-            Event::Lifecycle(LifecycleCommand::Quiesce { done }) => {
-                active = false;
-                manager.reconcile.cancel().await;
-                let mut merged = AHashMap::<RouteKey, RouteObservation>::new();
-                for (key, command) in handle.observations.drain_where(|_| true) {
-                    merged
-                        .entry(key)
-                        .and_modify(|current| current.coalesce(command.clone()))
-                        .or_insert(command);
-                }
-                for (key, (_, command)) in retries.drain() {
-                    merged
-                        .entry(key)
-                        .and_modify(|current| current.coalesce(command.clone()))
-                        .or_insert(command);
-                }
-                let _ = done.send(RoutePendingWork {
-                    items: merged.into_iter().collect(),
-                });
-            }
-            Event::Lifecycle(LifecycleCommand::Activate { pending, done }) => {
-                let now = now_millis();
-                for (key, mut command) in pending.items {
-                    command.deadline = manager
-                        .policy()
-                        .cap_recovered(command.deadline, command.observed_at_ms);
-                    if command.deadline.is_expired(now) {
-                        for completion in command.completions {
-                            completion.finish(&Ok(()));
-                        }
-                        continue;
-                    }
-                    match handle.observations.try_push(key.clone(), command) {
-                        Ok(_) => {}
-                        Err(TryPushError::Full(command)) => {
-                            defer_route_observation(
-                                &mut retries,
-                                tokio::time::Instant::now(),
-                                key,
-                                command,
-                                manager.metrics.as_deref(),
-                            );
-                        }
-                        Err(TryPushError::Closed(command)) => {
-                            let result = Err(DnsError::plugin(
-                                "ros_route handoff observation mailbox is closed",
-                            ));
-                            for completion in command.completions {
-                                completion.finish(&result);
-                            }
-                            if let Some(metrics) = &manager.metrics {
-                                metrics
-                                    .dropped_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
+            Event::Lifecycle(LifecycleCommand::Activate { done }) => {
                 active = true;
                 handle.request_reconcile();
                 let _ = done.send(());
@@ -1696,7 +1406,23 @@ async fn run_manager_worker(
                     warn!(plugin = %tag, err = %error, "ros_route sweep failed");
                 }
             }
-            Event::Observe(mut batch) => {
+            Event::Observe {
+                mut batch,
+                from_retry,
+            } => {
+                if !from_retry && let Some(retry_at) = retries.values().map(|(at, _)| *at).min() {
+                    for (key, command) in batch.drain(..) {
+                        defer_route_observation(
+                            &mut retries,
+                            retry_at,
+                            key,
+                            command,
+                            manager.metrics.as_deref(),
+                        );
+                    }
+                    handle.refresh_pending_metric_with(retries.len());
+                    continue;
+                }
                 let observations = batch
                     .iter()
                     .map(|(key, command)| (key.clone(), command.clone()))
@@ -2196,7 +1922,7 @@ mod tests {
             distance: Some(100),
             comment: Some(format!(
                 "{};nonce=1",
-                RouteCommentCodec::prefix("fdns", "route-test", COMMENT_KIND_GATEWAY_CHECK)
+                validation_comment("fdns", "route-test")
             )),
             disabled: true,
         };
@@ -2284,7 +2010,7 @@ mod tests {
             distance: Some(100),
             comment: Some(format!(
                 "{};nonce=2",
-                RouteCommentCodec::prefix("fdns", "route-test", COMMENT_KIND_GATEWAY_CHECK)
+                validation_comment("fdns", "route-test")
             )),
             disabled: true,
         };
@@ -2399,16 +2125,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_runtime_hands_pending_observations_to_replacement() {
-        let old_api = Arc::new(MockApi::default());
-        let new_api = Arc::new(MockApi::default());
+    async fn paused_runtime_processes_queued_observations_after_activation() {
+        let api = Arc::new(MockApi::default());
         let cfg = config(Some(300), false);
-        let old_runtime = RouteManagerRuntime::start_paused(
-            "route-handoff-old".to_string(),
-            RouteManager::new(old_api.clone(), cfg.clone()),
+        let runtime = RouteManagerRuntime::start_paused(
+            "route-activation".to_string(),
+            RouteManager::new(api.clone(), cfg),
         );
-        let old_handle = old_runtime.handle();
-        old_handle
+        let handle = runtime.handle();
+        handle
             .try_observe(
                 vec![ObservedAddr {
                     addr: "203.0.113.91".parse().expect("ip"),
@@ -2416,29 +2141,17 @@ mod tests {
                 }],
                 None,
             )
-            .expect("queue old observation");
-        let pending = old_handle.quiesce().await;
-
-        let new_runtime = RouteManagerRuntime::start_paused(
-            "route-handoff-new".to_string(),
-            RouteManager::new(new_api.clone(), cfg),
-        );
-        new_runtime
-            .handle()
-            .activate(pending)
-            .await
-            .expect("activate replacement");
+            .expect("queue observation");
+        handle.activate().await.expect("activate runtime");
         for _ in 0..64 {
-            if !new_api.routes().is_empty() {
+            if !api.routes().is_empty() {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert!(old_api.routes().is_empty());
-        assert_eq!(new_api.routes().len(), 1);
+        assert_eq!(api.routes().len(), 1);
 
-        old_runtime.shutdown(false).await.expect("old shutdown");
-        new_runtime.shutdown(false).await.expect("new shutdown");
+        runtime.shutdown(false).await.expect("shutdown");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2449,11 +2162,7 @@ mod tests {
             "route-reconcile-retry".to_string(),
             RouteManager::new(api.clone(), config(None, false)),
         );
-        runtime
-            .handle()
-            .activate(RoutePendingWork::default())
-            .await
-            .expect("activate");
+        runtime.handle().activate().await.expect("activate");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }

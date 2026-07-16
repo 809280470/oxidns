@@ -392,7 +392,7 @@ export const enUSDocs = {
     fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry. Missing IPs in later answers are not withdrawn.",
     conntrack_guard:
       "- Type: `bool`; Default: `false`\n- Checks exact destination IPs before deleting expired dynamic `/32` and `/128` routes. Active connections or query failures defer deletion for 30 seconds. Persistent and shutdown cleanup bypass the guard.",
-    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin on shutdown, with a 30-second total cleanup budget. Set it to `false` when production restarts or rolling deployments require policy continuity.",
+    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin during normal shutdown and application-level reload, with a 30-second total cleanup budget. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance. Set it to `false` when policy continuity is required.",
   },
   ros_address_list: {
     address:
@@ -428,7 +428,7 @@ export const enUSDocs = {
     fixed_ttl:
       "- Type: `u64`; Required: No; Default: None\n- Function: Specify a fixed TTL for all dynamically written items. After configuring this item, the plug-in will no longer use the original TTL in the DNS record, and will no longer be affected by the interval clipping of `min_ttl` and `max_ttl`. If set to `0`, dynamic items will not set RouterOS `timeout`.\n- Applicable scenarios: Suitable for scenarios that require a unified refresh cycle, easy operation and maintenance estimation, and policy convergence.",
     cleanup_on_shutdown:
-      "- Type: `bool`; required: no; default value: `true`\n- Function: Control whether to clean up the entries managed by the plug-in when it exits. When enabled, the plug-in will delete the RouterOS address entries written by itself during the normal shutdown phase and can identify the owned RouterOS address entries.\n- Impact: After turning off this option, written entries will continue to be retained in RouterOS, which is suitable for scenarios that require policy status to be retained across process restarts.",
+      "- Type: `bool`; Required: No; Default: `true`\n- Function: Controls whether entries managed by the plugin are removed during normal shutdown and application-level reload. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance.\n- Impact: When disabled, existing entries remain in RouterOS, which is suitable when policy state must survive process restarts or reloads.",
   },
   upgrade: {
     force:

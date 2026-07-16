@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder, QueryOperator};
 use tracing::warn;
 
-use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
+use super::model::{RouteCommentCodec, RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
+use crate::infra::mikrotik::batching::join_all_bounded;
 use crate::infra::mikrotik::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
     RouterOsTransportSnapshot,
@@ -29,6 +30,7 @@ const ROUTE_COMMENT_FIELD: &str = "comment";
 const ROUTE_DISABLED_FIELD: &str = "disabled";
 const CONNECTION_DST_FIELD: &str = "dst-address";
 const ROUTE_PROPLIST: &str = ".id,dst-address,routing-table,gateway,distance,comment,disabled";
+const MUTATION_PIPELINE_SIZE: usize = 16;
 
 const COMMAND_IP_ROUTE_PRINT: &str = "/ip/route/print";
 const COMMAND_IP_ROUTE_ADD: &str = "/ip/route/add";
@@ -334,10 +336,64 @@ impl MikrotikRsClient {
     }
 
     async fn prune_duplicate_owned_routes(&self, duplicates: Vec<RouterRoute>) -> Result<()> {
-        for duplicate in duplicates {
-            self.delete_route_if_matches(&duplicate).await?;
+        let results = join_all_bounded(
+            duplicates
+                .iter()
+                .map(|route| self.delete_route_if_matches(route)),
+            MUTATION_PIPELINE_SIZE,
+        )
+        .await;
+        for result in results {
+            result?;
         }
         Ok(())
+    }
+
+    async fn set_route_if_matches(
+        &self,
+        expected: &RouterRoute,
+        gateway: &str,
+        distance: u8,
+        comment: &str,
+    ) -> Result<bool> {
+        let print = CommandBuilder::new()
+            .command(route_command(expected.family, RouteOp::Print))
+            .attribute(".proplist", Some(ROUTE_PROPLIST))
+            .query_equal(ROUTER_ID_FIELD, &expected.id)
+            .query_equal(ROUTE_TABLE_FIELD, &expected.routing_table)
+            .query_equal(ROUTE_DST_FIELD, &expected.dst_address)
+            .build();
+        let Some(row) = self
+            .send_rows("verify route before update", print)
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(false);
+        };
+        let mut current = parse_router_route_from_reply(
+            "verify route before update parse",
+            expected.family,
+            &row,
+        )?;
+        if current.routing_table.is_empty() {
+            current.routing_table.clone_from(&expected.routing_table);
+        }
+        if current != *expected {
+            return Ok(false);
+        }
+
+        let distance_str = distance.to_string();
+        let set = CommandBuilder::new()
+            .command(route_command(expected.family, RouteOp::Set))
+            .attribute(ROUTER_ID_FIELD, Some(current.id.as_str()))
+            .attribute(ROUTE_GATEWAY_FIELD, Some(gateway))
+            .attribute(ROUTE_DISTANCE_FIELD, Some(distance_str.as_str()))
+            .attribute(ROUTE_COMMENT_FIELD, Some(comment))
+            .attribute(ROUTE_DISABLED_FIELD, Some("no"))
+            .build();
+        let _ = self.send_rows("set host route", set).await?;
+        Ok(true)
     }
 
     async fn list_routes_for_family(
@@ -638,27 +694,12 @@ impl MikrotikApi for MikrotikRsClient {
             let distance_changed = existing.distance != Some(distance);
             let comment_changed = existing.comment.as_deref() != Some(comment);
             let disabled_changed = existing.disabled;
-            if gateway_changed || distance_changed || comment_changed || disabled_changed {
-                let distance_str = distance.to_string();
-                let mut set_builder = CommandBuilder::new()
-                    .command(route_command(key.family(), RouteOp::Set))
-                    .attribute(ROUTER_ID_FIELD, Some(existing.id.as_str()));
-                if gateway_changed {
-                    set_builder = set_builder.attribute(ROUTE_GATEWAY_FIELD, Some(gateway));
-                }
-                if distance_changed {
-                    set_builder =
-                        set_builder.attribute(ROUTE_DISTANCE_FIELD, Some(distance_str.as_str()));
-                }
-                if comment_changed {
-                    set_builder = set_builder.attribute(ROUTE_COMMENT_FIELD, Some(comment));
-                }
-                if disabled_changed {
-                    set_builder = set_builder.attribute(ROUTE_DISABLED_FIELD, Some("no"));
-                }
-                let _ = self
-                    .send_rows("set host route", set_builder.build())
-                    .await?;
+            if (gateway_changed || distance_changed || comment_changed || disabled_changed)
+                && !self
+                    .set_route_if_matches(&existing, gateway, distance, comment)
+                    .await?
+            {
+                return Err(DnsError::plugin("ros_route route changed before update"));
             }
             return Ok(existing.id);
         }

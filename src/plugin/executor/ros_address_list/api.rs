@@ -11,11 +11,12 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder};
 
-use super::manager::{
+use super::model::{
     AddressListFamily, AddressListKey, OwnedCommentKind, decode_owned_comment,
     parse_router_address, parse_routeros_duration_secs,
 };
 use crate::infra::error::{DnsError, Result};
+use crate::infra::mikrotik::batching::join_all_bounded;
 use crate::infra::mikrotik::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
     RouterOsTransportSnapshot,
@@ -32,6 +33,7 @@ const TIMEOUT_FIELD: &str = "timeout";
 /// RouterOS field containing ownership metadata.
 const COMMENT_FIELD: &str = "comment";
 const ADDRESS_LIST_PROPLIST: &str = ".id,list,address,timeout,comment";
+const MUTATION_PIPELINE_SIZE: usize = 16;
 
 /// RouterOS command for listing IPv4 firewall address-list rows.
 const COMMAND_IP_ADDRESS_LIST_PRINT: &str = "/ip/firewall/address-list/print";
@@ -233,6 +235,46 @@ impl MikrotikRsClient {
             Err(error) if error.is_missing_item() => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn set_entry_if_matches(
+        &self,
+        expected: &RouterListEntry,
+        timeout: Option<&str>,
+        comment: &str,
+    ) -> Result<bool> {
+        let current = self.find_entries_by_key(&expected.key).await?;
+        let Some(current) = current
+            .into_iter()
+            .find(|current| entry_matches_delete_snapshot(expected, current))
+        else {
+            return Ok(false);
+        };
+        let mut set = CommandBuilder::new()
+            .command(address_list_command(current.key.family, ListOp::Set))
+            .attribute(ADDRESS_ID_FIELD, Some(current.id.as_str()))
+            .attribute(COMMENT_FIELD, Some(comment));
+        if let Some(timeout) = timeout {
+            set = set.attribute(TIMEOUT_FIELD, Some(timeout));
+        }
+        let _ = self
+            .send_rows("set address-list entry", set.build())
+            .await?;
+        Ok(true)
+    }
+
+    async fn delete_entries_if_matches(&self, entries: Vec<RouterListEntry>) -> Result<()> {
+        let results = join_all_bounded(
+            entries
+                .iter()
+                .map(|entry| self.delete_entry_if_matches(entry)),
+            MUTATION_PIPELINE_SIZE,
+        )
+        .await;
+        for result in results {
+            result?;
+        }
+        Ok(())
     }
 }
 
@@ -436,9 +478,7 @@ impl MikrotikApi for MikrotikRsClient {
             .position(|entry| entry.timeout.is_some() == timeout.is_some())
             .unwrap_or_default();
         let mut canonical = (!owned.is_empty()).then(|| owned.swap_remove(canonical));
-        for extra in owned {
-            self.delete_entry_if_matches(&extra).await?;
-        }
+        self.delete_entries_if_matches(owned).await?;
 
         if let Some(existing) = canonical.take() {
             // RouterOS timed and timeless rows are different enough that the
@@ -458,17 +498,14 @@ impl MikrotikApi for MikrotikRsClient {
             // the string looks unchanged, which keeps the remote timer alive.
             let timeout_changed = existing.timeout.as_deref() != timeout;
             let comment_changed = existing.comment.as_deref() != Some(comment);
-            if refresh_timeout || timeout_changed || comment_changed {
-                let mut set = CommandBuilder::new()
-                    .command(address_list_command(key.family, ListOp::Set))
-                    .attribute(ADDRESS_ID_FIELD, Some(existing.id.as_str()))
-                    .attribute(COMMENT_FIELD, Some(comment));
-                if let Some(timeout) = timeout {
-                    set = set.attribute(TIMEOUT_FIELD, Some(timeout));
-                }
-                let _ = self
-                    .send_rows("set address-list entry", set.build())
-                    .await?;
+            if (refresh_timeout || timeout_changed || comment_changed)
+                && !self
+                    .set_entry_if_matches(&existing, timeout, comment)
+                    .await?
+            {
+                return Err(DnsError::plugin(
+                    "ros_address_list entry changed before update",
+                ));
             }
             return Ok(Some(()));
         }
@@ -505,11 +542,9 @@ impl MikrotikApi for MikrotikRsClient {
             .map(|(index, _)| index)
             .expect("duplicate owned rows are non-empty");
         owned.swap_remove(canonical);
-        for extra in owned {
-            // A false result can mean either natural expiry or a concurrent
-            // refresh. Re-read below to distinguish convergence from a race.
-            self.delete_entry_if_matches(&extra).await?;
-        }
+        // A false result can mean either natural expiry or a concurrent
+        // refresh. Re-read below to distinguish convergence from a race.
+        self.delete_entries_if_matches(owned).await?;
 
         let mut current = self
             .find_entries_by_key(key)

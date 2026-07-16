@@ -1525,7 +1525,11 @@ export const zhCNPluginDefined = {
           label: "连接跟踪保护",
           description: "删除到期动态主机路由前检查精确目标 IP；有连接时延后删除。",
         },
-        cleanup_on_shutdown: { label: "关闭时清理" },
+        cleanup_on_shutdown: {
+          label: "关闭时清理",
+          description:
+            "应用级 reload 同样执行清理；reload 按 shutdown/restart 处理，不移交旧实例待处理观测。",
+        },
       },
       metrics: {
         labels: {
@@ -1629,7 +1633,8 @@ export const zhCNPluginDefined = {
         },
         cleanup_on_shutdown: {
           label: "关闭时清理",
-          description: "控制插件退出时是否清理由其管理的条目。",
+          description:
+            "控制正常关闭及应用级 reload 时是否清理由其管理的条目；reload 按 shutdown/restart 处理，不移交旧实例待处理观测。",
         },
       },
       metrics: {

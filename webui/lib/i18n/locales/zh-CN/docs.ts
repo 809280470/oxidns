@@ -388,7 +388,7 @@ export const zhCNDocs = {
     fixed_ttl: "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL；设为 `0` 时不按时间过期，后续应答缺少该 IP 不会主动撤销。",
     conntrack_guard:
       "- 类型：`bool`；默认：`false`\n- 仅在删除到期动态 `/32`、`/128` 主机路由前检查精确目标 IP；存在连接或查询失败时延后 30 秒。persistent 删除和关闭清理不受影响。",
-    cleanup_on_shutdown: "- 类型：`bool`；默认：`true`\n- 关闭时清理本插件拥有的动态和固定路由，清理总预算为 30 秒。生产重启或滚动发布需要策略连续性时建议设为 `false`。",
+    cleanup_on_shutdown: "- 类型：`bool`；默认：`true`\n- 正常关闭及应用级 reload 时清理该插件 tag 拥有的动态和固定路由；清理总预算为 30 秒。reload 按 shutdown/restart 处理，不移交旧实例待处理观测；需要策略连续性时建议设为 `false`。",
   },
   ros_address_list: {
     address:
@@ -424,7 +424,7 @@ export const zhCNDocs = {
     fixed_ttl:
       "- 类型：`u64`；必填：否；默认值：无\n- 作用：为所有动态写入项指定固定 TTL。配置本项后，插件不再使用 DNS 记录中的原始 TTL，也不再受 `min_ttl` 与 `max_ttl` 的区间裁剪影响。若设为 `0`，则动态项不会设置 RouterOS `timeout`。\n- 适用场景：适合需要统一刷新周期、便于运维预估和策略收敛的场景。",
     cleanup_on_shutdown:
-      "- 类型：`bool`；必填：否；默认值：`true`\n- 作用：控制插件退出时是否清理由其管理的条目。启用后，插件在正常关闭阶段会删除自身写入并可识别归属的 RouterOS 地址项。\n- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启保留的场景。",
+      "- 类型：`bool`；必填：否；默认值：`true`\n- 作用：控制插件正常关闭及应用级 reload 时是否清理由其管理的条目。reload 按 shutdown/restart 处理，不移交旧实例待处理观测。\n- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启或 reload 保留的场景。",
   },
   upgrade: {
     force:

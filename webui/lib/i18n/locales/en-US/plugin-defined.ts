@@ -1678,7 +1678,11 @@ export const enUSPluginDefined = {
           label: "Connection tracking guard",
           description: "Check exact target IPs before deleting expired dynamic host routes and defer when a connection exists.",
         },
-        cleanup_on_shutdown: { label: "Clean up on shutdown" },
+        cleanup_on_shutdown: {
+          label: "Clean up on shutdown",
+          description:
+            "Also applies during application-level reload, which uses shutdown/restart semantics without transferring pending observations from the old instance.",
+        },
       },
       metrics: {
         labels: {
@@ -1799,7 +1803,7 @@ export const enUSPluginDefined = {
         cleanup_on_shutdown: {
           label: "Clean up on shutdown",
           description:
-            "Controls whether entries managed by the plugin are cleaned up when it exits.",
+            "Controls cleanup during normal shutdown and application-level reload. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance.",
         },
       },
       metrics: {

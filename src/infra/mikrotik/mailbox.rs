@@ -174,35 +174,6 @@ where
         Some(value)
     }
 
-    /// Drain queued entries selected by `matches` while preserving the order
-    /// of all entries left behind. Lifecycle handoff uses this to transfer
-    /// only RouterOS targets shared with a replacement runtime.
-    pub(crate) fn drain_where(&self, mut matches: impl FnMut(&K) -> bool) -> Vec<(K, V)> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut drained = Vec::new();
-        let mut retained = VecDeque::with_capacity(state.order.len());
-        while let Some(key) = state.order.pop_front() {
-            if matches(&key) {
-                if let Some(value) = state.values.remove(&key) {
-                    drained.push((key, value));
-                }
-            } else {
-                retained.push_back(key);
-            }
-        }
-        state.order = retained;
-        drop(state);
-        if !drained.is_empty() {
-            self.inner.space_ready.notify_waiters();
-            self.inner.space_ready.notify_one();
-        }
-        drained
-    }
-
     pub(crate) async fn recv(&self) -> Option<(K, V)> {
         loop {
             let notified = self.inner.items_ready.notified();
