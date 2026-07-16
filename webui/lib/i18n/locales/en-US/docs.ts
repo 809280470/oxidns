@@ -384,7 +384,7 @@ export const enUSDocs = {
     gateway4: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv4 route next hop.",
     gateway6: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
     distance: "- Type: `u8`; Default: `100`\n- RouterOS static-route distance.",
-    comment_prefix: "- Type: `string`; Default: `fdns`\n- Route-comment ownership prefix; it and the plugin tag cannot contain `;` or `=`.",
+    comment_prefix: "- Type: `string`; Default: `oxi`\n- Route-comment ownership prefix; it and the plugin tag cannot contain `;` or `=`.",
     "persistent.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes.",
     "persistent.files": "- Type: `array<string>`\n- Persistent route files read only during plugin initialization; reload the plugin or application to apply changes.",
     min_ttl: "- Type: `u32`; Default: `60`\n- Minimum clamp for dynamic DNS-route TTLs.",
@@ -414,7 +414,7 @@ export const enUSDocs = {
     address_list6:
       "- Type: `string`; Required: No; Default: None\n- Function: Specify the target `address-list` name for IPv6 address writing. The plug-in writes to this list after extracting the AAAA records from the DNS response.\n- Configuration recommendation: If the policy needs to cover IPv6, this item should be configured at the same time, and corresponding matching and routing rules should be established on the RouterOS side.",
     comment_prefix:
-      "- Type: `string`; Required: No; Default: `fdns`\n- Function: Specifies the comment prefix used by the plug-in when writing RouterOS entries. This prefix is ​​used to distinguish dynamic entries and resident entries created by OxiDNS to facilitate subsequent refresh, reload and cleanup.\n- Note: This value and the plugin `tag` should not contain `;` or `=` to avoid affecting the internal tag format.",
+      "- Type: `string`; Required: No; Default: `oxi`\n- Function: Specifies the comment prefix used by the plug-in when writing RouterOS entries. This prefix is ​​used to distinguish dynamic entries and resident entries created by OxiDNS to facilitate subsequent refresh, reload and cleanup.\n- Note: This value and the plugin `tag` should not contain `;` or `=` to avoid affecting the internal tag format.",
     persistent:
       "- Type: `object`; Required: No; Default: None\n- Function: Define a static address set that needs to be retained for a long time. This part does not rely on DNS response triggering, can be directly synchronized to RouterOS after the plug-in is started, and is maintained by background reconcile to maintain consistency.\n- Subfield:\n  - `ips`\n  - `files`",
     "persistent.ips":

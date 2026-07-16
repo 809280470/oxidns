@@ -77,7 +77,7 @@ const DEFAULT_ASYNC_MODE: bool = true;
 /// Default shutdown behavior removes plugin-owned RouterOS entries.
 const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
 /// Default comment prefix used to mark OxiDNS-owned RouterOS rows.
-const DEFAULT_COMMENT_PREFIX: &str = "fdns";
+const DEFAULT_COMMENT_PREFIX: &str = "oxi";
 /// Maximum time sync mode waits for one observe command to finish.
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
 
@@ -107,7 +107,7 @@ struct MikrotikConfigArgs {
     /// IPv6 address-list name for observed IPv6 answers.
     address_list6: Option<String>,
     /// Prefix used in RouterOS comments to mark OxiDNS-managed entries.
-    /// Defaults to `fdns` when omitted.
+    /// Defaults to `oxi` when omitted.
     comment_prefix: Option<String>,
     /// Always-present address-list items that should never expire.
     persistent: Option<PersistentArgs>,
@@ -1794,7 +1794,8 @@ address_list4: "oxidns_ipv4"
         )
         .unwrap();
         let parsed = parse_plugin_config(Some(cfg), false).unwrap();
-        assert_eq!(parsed.comment_prefix, DEFAULT_COMMENT_PREFIX);
+        assert_eq!(DEFAULT_COMMENT_PREFIX, "oxi");
+        assert_eq!(parsed.comment_prefix, "oxi");
         assert_eq!(
             parsed.connection.as_ref().expect("connection").timeouts,
             MikrotikApiTimeouts::default()

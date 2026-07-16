@@ -1819,7 +1819,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "comment_prefix",
         label: "注释前缀",
         type: "text",
-        default: "fdns",
+        default: "oxi",
       },
       {
         key: "persistent",
@@ -1996,7 +1996,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         description: "指定插件写入 RouterOS 条目时使用的注释前缀。",
         label: "注释前缀",
         type: "text",
-        default: "fdns",
+        default: "oxi",
       },
       {
         key: "persistent",

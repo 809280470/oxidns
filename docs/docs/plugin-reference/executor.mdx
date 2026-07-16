@@ -2564,7 +2564,7 @@ old-static.example.com static.example.net
     # AAAA 记录写入的 address-list
     address_list6: "oxidns_ipv6"
     # 用于标记 OxiDNS 管理条目的注释前缀
-    comment_prefix: "oxidns"
+    comment_prefix: "oxi"
     # 动态项 TTL 下限
     min_ttl: 60
     # 动态项 TTL 上限
@@ -2667,7 +2667,7 @@ args:
 
 #### `comment_prefix`
 
-- 类型：`string`；必填：否；默认值：`fdns`
+- 类型：`string`；必填：否；默认值：`oxi`
 - 作用：指定插件写入 RouterOS 条目时使用的注释前缀。该前缀用于区分 OxiDNS 创建的动态项和常驻项，便于后续刷新、重载与清理。
 - 注意事项：该值及插件 `tag` 不应包含 `;` 或 `=`，以避免影响内部标记格式。
 
@@ -2792,6 +2792,7 @@ args:
 - `conntrack_guard` 默认关闭，仅保护到期的动态 `/32`、`/128` 主机路由。目标 IP 仍有跟踪连接时保留路由并在 30 秒后重试；查询失败时 fail-closed。persistent 配置删除、关闭清理和内部维护清理不执行连接检查，也不支持 CIDR 连接保护。
 - 动态租约没有记录数量上限。尤其是 `fixed_ttl: 0` 路由不会自然过期，用户必须评估 RouterOS 路由表和 OxiDNS 内存容量，并通过用户删除、配置变化或关闭清理回收。
 - 动态路由以 RouterOS 实际状态为准：用户删除后由下一次对账接受删除，下一次 DNS 观测再创建；不会在每次 DNS 请求中读取路由表。persistent 路由仍以配置为准。
+- `comment_prefix` 默认是 `oxi`，并与插件 `tag` 一起构成 RouterOS 条目的 ownership namespace；两者都不能包含 `;` 或 `=`。
 - RouterOS comment 只保存条目类型、过期时间和最近观察时间，不保存域名引用。重启时恢复未过期租约；当前 TTL 策略可以收紧旧期限，但不会在没有新 DNS 观察时延长它。
 - `tls` 启用 API-SSL（通常 `8729`）：`tls.server_name` 覆盖证书服务器名称，`tls.ca` 指定自签名/私有 CA 文件，`tls.insecure` 默认为 `false`，设为 `true` 时跳过证书验证且不能与 `tls.ca` 同时配置。省略 `tls` 时使用明文 API（通常 `8728`）。
 - `cleanup_on_shutdown: true` 会在 30 秒总预算内删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。生产重启或滚动发布需要策略连续性时建议设为 `false`。

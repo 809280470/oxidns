@@ -60,7 +60,7 @@ const DEFAULT_ASYNC_MODE: bool = true;
 const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
 const DEFAULT_CONNTRACK_GUARD: bool = false;
 const DEFAULT_ROUTE_DISTANCE: u8 = 100;
-const DEFAULT_COMMENT_PREFIX: &str = "fdns";
+const DEFAULT_COMMENT_PREFIX: &str = "oxi";
 const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -91,7 +91,7 @@ struct MikrotikConfigArgs {
     /// IPv6 gateway value for managed IPv6 routes.
     gateway6: Option<String>,
     /// Prefix used in RouterOS route comments to mark OxiDNS-managed routes.
-    /// Defaults to `fdns` when omitted.
+    /// Defaults to `oxi` when omitted.
     comment_prefix: Option<String>,
     /// Route distance written to RouterOS for managed routes.
     distance: Option<u8>,
@@ -1332,6 +1332,22 @@ routing_table: "policy"
         )
         .expect("yaml");
         assert!(parse_plugin_config(Some(args), false).is_err());
+    }
+
+    #[test]
+    fn config_defaults_comment_prefix_to_oxi() {
+        let args = serde_yaml_ng::from_str::<Value>(
+            r#"
+address: "127.0.0.1:8728"
+username: "api"
+password: "secret"
+routing_table: "policy"
+gateway4: "192.0.2.1"
+"#,
+        )
+        .expect("yaml");
+        let parsed = parse_plugin_config(Some(args), false).expect("route config");
+        assert_eq!(parsed.comment_prefix, "oxi");
     }
 
     #[test]

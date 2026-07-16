@@ -364,7 +364,7 @@ export const pluginFieldDocs = {
     gateway4: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv4 路由下一跳。",
     gateway6: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv6 路由下一跳。",
     distance: "- 类型：`u8`；默认：`100`\n- RouterOS 静态路由 distance。",
-    comment_prefix: "- 类型：`string`；默认：`fdns`\n- 路由注释归属前缀；该值及插件 tag 不能包含 `;` 或 `=`。",
+    comment_prefix: "- 类型：`string`；默认：`oxi`\n- 路由注释归属前缀；该值及插件 tag 不能包含 `;` 或 `=`。",
     "persistent.ips":
       "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由；单 IP 会标准化为主机路由，`/0` 会被忽略。",
     "persistent.files":
@@ -398,7 +398,7 @@ export const pluginFieldDocs = {
     address_list6:
       "- 类型：`string`；必填：否；默认值：无\n- 作用：指定 IPv6 地址写入的目标 `address-list` 名称。插件从 DNS 应答中提取到 AAAA 记录后，将写入该列表。\n- 配置建议：如果策略需要覆盖 IPv6，应同时配置本项，并在 RouterOS 侧建立对应的匹配与路由规则。",
     comment_prefix:
-      "- 类型：`string`；必填：否；默认值：`fdns`\n- 作用：指定插件写入 RouterOS 条目时使用的注释前缀。该前缀用于区分 OxiDNS 创建的动态项和常驻项，便于后续刷新、重载与清理。\n- 注意事项：该值及插件 `tag` 不应包含 `;` 或 `=`，以避免影响内部标记格式。",
+      "- 类型：`string`；必填：否；默认值：`oxi`\n- 作用：指定插件写入 RouterOS 条目时使用的注释前缀。该前缀用于区分 OxiDNS 创建的动态项和常驻项，便于后续刷新、重载与清理。\n- 注意事项：该值及插件 `tag` 不应包含 `;` 或 `=`，以避免影响内部标记格式。",
     persistent:
       "- 类型：`object`；必填：否；默认值：无\n- 作用：定义需要长期保留的静态地址集合。该部分不依赖 DNS 应答触发，可在插件启动后直接同步到 RouterOS，并由后台 reconcile 保持一致性。\n- 子字段：\n  - `ips`\n  - `files`",
     "persistent.ips":
