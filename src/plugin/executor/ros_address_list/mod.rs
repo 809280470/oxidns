@@ -1273,10 +1273,6 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn list_entries_by_key(&self, _key: &AddressListKey) -> Result<Vec<RouterListEntry>> {
-            Ok(Vec::new())
-        }
-
         async fn upsert_owned_entry(
             &self,
             _key: &AddressListKey,
@@ -1294,8 +1290,8 @@ mod tests {
             Ok(Some(()))
         }
 
-        async fn delete_entry_by_id(&self, _id: &str, _family: AddressListFamily) -> Result<()> {
-            Ok(())
+        async fn delete_entry_if_matches(&self, _expected: &RouterListEntry) -> Result<bool> {
+            Ok(false)
         }
     }
 
@@ -1357,19 +1353,6 @@ mod tests {
             }
 
             Ok(entries)
-        }
-
-        async fn list_entries_by_key(&self, key: &AddressListKey) -> Result<Vec<RouterListEntry>> {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| DnsError::plugin("mock api lock poisoned"))?;
-            Ok(state
-                .entries
-                .values()
-                .filter(|entry| entry.key == *key)
-                .cloned()
-                .collect())
         }
 
         async fn upsert_owned_entry(
@@ -1439,7 +1422,7 @@ mod tests {
             Ok(Some(()))
         }
 
-        async fn delete_entry_by_id(&self, id: &str, _family: AddressListFamily) -> Result<()> {
+        async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool> {
             let mut state = self
                 .state
                 .lock()
@@ -1447,12 +1430,13 @@ mod tests {
             let key = state
                 .entries
                 .iter()
-                .find(|(_, entry)| entry.id == id)
+                .find(|(_, entry)| *entry == expected)
                 .map(|(key, _)| key.clone());
             if let Some(key) = key {
                 state.entries.remove(&key);
+                return Ok(true);
             }
-            Ok(())
+            Ok(false)
         }
     }
 
