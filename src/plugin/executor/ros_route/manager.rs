@@ -20,18 +20,22 @@ use super::model::{
 };
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::mikrotik::batching::join_all_bounded;
-use crate::infra::mikrotik::completion::BatchCompletion;
-use crate::infra::mikrotik::ip_prefix::IpPrefix;
-use crate::infra::mikrotik::lease::{
+use crate::infra::task as task_center;
+use crate::plugin::executor::routeros::batching::join_all_bounded;
+use crate::plugin::executor::routeros::completion::BatchCompletion;
+use crate::plugin::executor::routeros::ip_prefix::IpPrefix;
+use crate::plugin::executor::routeros::lease::{
     LeaseBook, LeaseDeadline, LeasePolicy, ROUTE_MAX_REFRESH_INTERVAL_MS,
 };
-use crate::infra::mikrotik::lifecycle::abort_and_reap;
-use crate::infra::mikrotik::mailbox::{Coalesce, KeyedMailbox, PushOutcome, TryPushError};
-use crate::infra::mikrotik::reconcile::{BackgroundReconcile, ReconcileRetry, VersionedSnapshot};
-use crate::infra::mikrotik::throttle::ErrorLogThrottle;
-use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT};
-use crate::infra::task as task_center;
+use crate::plugin::executor::routeros::lifecycle::abort_and_reap;
+use crate::plugin::executor::routeros::mailbox::{
+    Coalesce, KeyedMailbox, PushOutcome, TryPushError,
+};
+use crate::plugin::executor::routeros::reconcile::{
+    BackgroundReconcile, ReconcileRetry, VersionedSnapshot,
+};
+use crate::plugin::executor::routeros::throttle::ErrorLogThrottle;
+use crate::plugin::executor::routeros::{ObservedAddr, SHUTDOWN_TIMEOUT};
 
 const ROUTE_DEFAULT_V4: &str = "0.0.0.0/0";
 const ROUTE_DEFAULT_V6: &str = "::/0";

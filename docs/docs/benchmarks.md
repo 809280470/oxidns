@@ -1,9 +1,15 @@
 ---
-title: 性能与基准
+title: 性能方法与历史基准
 sidebar_position: 8
 ---
 
-本页提供 OxiDNS 的性能关注点和公开基准快照。数据用于理解不同策略复杂度、并发水平和传输路径下的性能轮廓，不用于宣称绝对胜负。
+本页提供 OxiDNS 的性能关注点、复现入口和公开历史基准快照。数据用于理解不同策略复杂度、并发水平和传输路径下的性能轮廓，不用于宣称绝对胜负。
+
+## 数据范围
+
+本页最新公开的 OxiDNS 与 mosdns 对比快照来自 `v0.3.0`。这些结果保留用于说明测试方法和当时版本的性能轮廓，**不代表当前 OxiDNS 版本**，也不能直接用于当前版本的容量规划或性能承诺。
+
+需要评价当前代码时，应在固定硬件、工具版本、配置、查询集和网络条件下重新运行仓库中的 compare pack，并记录被测 commit、二进制 hash 和完整参数。没有重新测量时，应引用具体历史版本，而不是把本页数字描述为“OxiDNS 当前性能”。
 
 ## 性能关注点
 
@@ -23,7 +29,17 @@ OxiDNS 关注的不是“最简单场景下的极限数字”，而是下面这�
 * 这两组快照更适合分别观察 OxiDNS 相对 mosdns 的优势分布
 * 由于 2026-04-13 的 compare pack 已更新场景目录、查询集和部分 workload 口径，`v0.1.0` 与 `v0.3.0` 的绝对数字不建议直接做版本回归比较
 
-源码内的 DNS 响应分类微基准可通过 `cargo bench --bench response_classification` 运行，覆盖 direct A、1/4/16 跳 CNAME、CNAME-only、CNAME+NODATA 和 NXDOMAIN。
+源码内提供以下 Criterion 微基准：
+
+```bash
+cargo bench --bench message_codec
+cargo bench --bench response_classification
+cargo bench --bench domain_rule_matcher
+cargo bench --bench ip_rule_matcher
+cargo bench --bench plugin_local_answers
+```
+
+`response_classification` 覆盖 direct A、1/4/16 跳 CNAME、CNAME-only、CNAME+NODATA 和 NXDOMAIN。微基准用于定位特定实现成本，不替代完整 DNS 请求路径的端到端测试。
 
 说明：
 

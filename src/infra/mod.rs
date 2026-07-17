@@ -3,14 +3,14 @@
 
 //! Infrastructure services used across OxiDNS runtime surfaces.
 
-pub mod build_info;
+#[doc(hidden)]
+pub use crate::build_info;
 pub mod cache;
 pub mod clock;
 pub mod control;
 pub mod env;
 pub mod error;
-#[cfg(any(feature = "plugin-ros-address-list", feature = "plugin-ros-route"))]
-pub(crate) mod mikrotik;
+pub(crate) mod io;
 pub mod network;
 pub mod observability;
 pub mod service;

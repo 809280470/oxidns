@@ -11,9 +11,21 @@ import RoadmapTimeline, { RoadmapItem } from '@site/src/components/RoadmapTimeli
 
 <RoadmapTimeline>
 
-<RoadmapItem type="future" label="敬请期待" title="简单模式 WebUI" desc="基于模板配置，打造类 AdGuard Home 的开箱即用体验" num={3}>
+<RoadmapItem type="future" label="规划中" title="DHCP 服务与 DNS 联动" desc="提供租约管理、地址分配和本地域名解析的一体化网络服务" num={5}>
 
-面向不想编写 YAML 的普通用户，提供一套预置场景模板（去广告、防污染、家庭过滤、分流加速等），通过表单与开关完成主要配置；保留切回完整模式继续手写规则的入口。目标体验对标 AdGuard Home 的简单管理界面，让 OxiDNS 的安装门槛接近"开箱即用"。
+新增可选 DHCP 服务，覆盖地址池、静态租约、租约持久化和常用 DHCP options；将租约中的 hostname/IP 作为本地 DNS 数据安全地提供给解析策略，并通过管理 API 与 WebUI 查看租约、调整配置和执行必要的管理动作。实现上保持 DHCP runtime 与 DNS 插件管线解耦，通过明确的数据接口完成联动，避免把租约状态直接耦合进请求热路径。
+
+</RoadmapItem>
+
+<RoadmapItem type="future" label="规划中" title="Cache 插件重构与性能优化" desc="重整缓存架构，降低命中热路径开销并改善大容量场景稳定性" num={4}>
+
+进一步拆分 Cache 插件的查询、准入、TTL 决策、lazy refresh、淘汰维护、持久化与指标边界，使 DNS 缓存语义和通用存储原语保持清晰分层；重点减少 cache hit 中的消息 clone、临时分配、时间戳写放大和锁竞争，优化相同 key 的并发刷新去重、批量过期清理与 sampled LRU 行为，并补齐 hit / miss / stale / write、并发刷新和大容量缓存的专项 benchmark 与回归测试。
+
+</RoadmapItem>
+
+<RoadmapItem type="active" label="进行中" title="标准模式 WebUI" desc="基于标准场景模板，提供表单化、开箱即用的配置体验">
+
+面向不想直接编写 YAML 的用户，提供一套标准化配置入口。常见场景（去广告、防污染、家庭过滤、分流加速等）通过表单、开关和预置模板完成，同时保留进入高级配置模式继续编辑完整规则的入口。目标是在不削弱 OxiDNS 策略能力的前提下，显著降低首次安装和日常维护门槛。
 
 </RoadmapItem>
 
@@ -23,9 +35,9 @@ import RoadmapTimeline, { RoadmapItem } from '@site/src/components/RoadmapTimeli
 
 </RoadmapItem>
 
-<RoadmapItem type="future" label="敬请期待" title="MikroTik 深度集成" desc="与 RouterOS 双向同步 IP 集，DNS 策略联动路由策略" num={1}>
+<RoadmapItem type="done" label="2026-07-17" title="MikroTik RouterOS 双插件" desc="ros_address_list 与 ros_route 完成地址列表和静态路由同步">
 
-在现有单向推送基础上，新增从 RouterOS 拉取地址列表作为数据源，以及将本地 IP 集主动推送到 RouterOS，实现 DNS 策略与路由策略的双向数据联动。
+完成 `ros_address_list` 与 `ros_route` 两个 RouterOS executor。`ros_address_list` 将 DNS 响应中的 A/AAAA 地址同步到 RouterOS address-list，`ros_route` 将目标地址同步为指定 routing table 中的逐 IP 静态路由。两者共用异步队列、批处理、TTL lease、重连、reconcile、去重、关闭清理和指标体系；路由插件还支持基于 conntrack 的延迟删除，降低活跃连接被提前移除路由的风险。
 
 </RoadmapItem>
 
@@ -37,7 +49,7 @@ import RoadmapTimeline, { RoadmapItem } from '@site/src/components/RoadmapTimeli
 
 <RoadmapItem type="version" title="IP 优选" desc="对多个 A/AAAA 地址并行测速，自动返回延迟最低的 IP" version="v1.2.0"  date="2026-06-03">
 
-对 DNS 响应中的多个 A/AAAA 地址并行测速，自动选出延迟最低的 IP 返回给客户端，提升实际访问速度。开发完成，将随 v1.2.0 发布。
+对 DNS 响应中的多个 A/AAAA 地址并行测速，自动选出延迟最低的 IP 返回给客户端，提升实际访问速度。该能力已随 v1.2.0 发布。
 
 </RoadmapItem>
 

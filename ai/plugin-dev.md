@@ -13,7 +13,7 @@ OxiDNS plugins fall into four categories, each with its own trait and directory:
 | **Executor** | `Executor` | `src/plugin/executor/` | Process or mutate a request/response in a sequence pipeline |
 | **Matcher** | `Matcher` | `src/plugin/matcher/` | Evaluate a boolean predicate on the current `DnsContext` |
 | **Provider** | `Provider` | `src/plugin/provider/` | Expose a reusable dataset (domain set, IP set, etc.) |
-| **Server** | — | `src/plugin/server/` | Accept inbound DNS traffic over a protocol |
+| **Server** | `Server` | `src/plugin/server/` | Accept inbound DNS traffic over a protocol |
 
 ---
 
@@ -42,7 +42,14 @@ Fall back to `register_plugin_factory!("type", expr)` only when:
 - Include a module-level doc comment that covers: purpose, config shape, dependency expectations, lifecycle, and any hot-path or side-effect behavior.
 - Reuse existing abstractions (`DnsContext`, `Executor`, `Matcher`, `Provider`, `RequestHandle`, upstream pools, plugin registry) before introducing parallel frameworks.
 - Keep platform-specific code clearly guarded — especially Linux-only netlink, `ipset`, and `nftset` paths.
-- A plugin that has an API surface must gate its `mod api` block behind `#[cfg(feature = "api")]`.
+- Management HTTP API integration must compile cleanly without the `api` feature. Gate the module with `#[cfg(feature = "api")]` or keep feature-specific implementations behind internal `cfg` branches when a no-op facade is required.
+
+### Package boundaries
+
+- Keep `mod.rs` focused on the package facade, plugin lifecycle, factory wiring, and high-level orchestration. Split stable responsibilities such as config parsing, models, metrics, persistence, protocol adapters, and management API integration into named sibling modules when the package grows.
+- Keep category-specific shared code inside its plugin category. Matcher rule parsing and provider binding belong under `plugin/matcher`; provider formats and selectors belong under `plugin/provider`; server request and connection behavior belong under `plugin/server`.
+- Move code into `infra` only when its API is subsystem-neutral and useful outside one plugin category. `infra` must not depend on plugin traits, registries, or plugin-specific models.
+- Preserve existing public paths through package facades or explicit re-exports when a structural split would otherwise break library consumers.
 
 ### Hot-path rules
 

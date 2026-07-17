@@ -13,8 +13,8 @@ use mikrotik_rs::{Command, CommandBuilder};
 
 use super::model::{AddressListFamily, AddressListKey, decode_owned_comment, parse_router_address};
 use crate::infra::error::{DnsError, Result};
-use crate::infra::mikrotik::batching::join_all_bounded;
-use crate::infra::mikrotik::transport::{
+use crate::plugin::executor::routeros::batching::join_all_bounded;
+use crate::plugin::executor::routeros::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
     RouterOsTransportSnapshot,
 };

@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 
-use crate::infra::mikrotik::ip_prefix::IpPrefix;
+use crate::plugin::executor::routeros::ip_prefix::IpPrefix;
 
 const HOST_PREFIX_V4: u8 = 32;
 const HOST_PREFIX_V6: u8 = 128;

@@ -12,8 +12,8 @@ use http::{Request, StatusCode};
 use serde::Serialize;
 
 use crate::api::{ApiHandler, ApiRegister, json_ok, simple_response};
+use crate::build_info::PRIMARY_BUNDLE;
 use crate::infra::VERSION;
-use crate::infra::build_info::PRIMARY_BUNDLE;
 use crate::infra::clock::AppClock;
 use crate::infra::error::Result;
 
