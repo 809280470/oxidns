@@ -39,9 +39,9 @@ pub mod geoip;
 #[cfg(feature = "provider-protobuf")]
 pub mod geosite;
 pub mod ip_set;
-pub(crate) mod provider_utils;
+pub(crate) mod rule_lines;
 #[cfg(feature = "provider-protobuf")]
-pub(crate) mod v2ray_dat;
+pub(crate) mod v2ray;
 
 #[async_trait]
 #[allow(dead_code)]

@@ -218,7 +218,7 @@ impl PluginFactory for DomainSetFactory {
 }
 
 fn append_rules_from_file(rules: &mut Vec<String>, path: &str) -> DnsResult<()> {
-    crate::plugin::provider::provider_utils::for_each_nonempty_rule_line(
+    crate::plugin::provider::rule_lines::for_each_nonempty_rule_line(
         path,
         "domain rules",
         |raw, _| {
@@ -246,7 +246,7 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::plugin::provider::provider_utils::for_each_nonempty_rule_text;
+    use crate::plugin::provider::rule_lines::for_each_nonempty_rule_text;
     use crate::proto::Name;
 
     fn load_rules_text(

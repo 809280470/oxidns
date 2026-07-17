@@ -17,7 +17,7 @@ use crate::core::rule_matcher::DomainRuleMatcher;
 use crate::infra::error::Result as DnsResult;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::matcher::Matcher;
-use crate::plugin::matcher::matcher_utils::{
+use crate::plugin::matcher::rules::{
     ensure_domain_capable_providers, parse_domain_rules_and_set_tags, parse_quick_setup_rules,
     parse_rules_from_value, provider_dependency_specs, resolve_provider_tags,
     validate_non_empty_domain_rules_or_set_tags,

@@ -3,8 +3,8 @@
 use std::net::IpAddr;
 
 use crate::infra::error::{DnsError, Result};
-use crate::infra::mikrotik::ip_prefix::{IpPrefix, host_prefix};
-use crate::infra::mikrotik::lease::LeaseDeadline;
+use crate::plugin::executor::routeros::ip_prefix::{IpPrefix, host_prefix};
+use crate::plugin::executor::routeros::lease::LeaseDeadline;
 
 const COMMENT_FIELD_PLUGIN: &str = "pg";
 const COMMENT_FIELD_KIND: &str = "kind";

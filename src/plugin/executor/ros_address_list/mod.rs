@@ -53,14 +53,14 @@ use self::model::{AddressListFamily, AddressListKey};
 use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
 use crate::infra::error::{DnsError, Result};
-use crate::infra::mikrotik::throttle::ErrorLogThrottle;
-use crate::infra::mikrotik::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
-use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
 use crate::infra::observability::metrics::{
     MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
     unregister_metric_source,
 };
 use crate::infra::system::deserialize_duration_option;
+use crate::plugin::executor::routeros::throttle::ErrorLogThrottle;
+use crate::plugin::executor::routeros::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
+use crate::plugin::executor::routeros::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
 use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
 use crate::proto::{Rcode, RecordType};

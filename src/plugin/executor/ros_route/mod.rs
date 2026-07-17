@@ -267,11 +267,11 @@ use self::api::{
 use self::manager::{
     ObserveEnqueueError, RouteManager, RouteManagerConfig, RouteManagerHandle, RouteManagerRuntime,
 };
-use crate::infra::mikrotik::ip_prefix::IpPrefix;
-use crate::infra::mikrotik::throttle::ErrorLogThrottle;
-use crate::infra::mikrotik::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
-use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
 use crate::infra::system::deserialize_duration_option;
+use crate::plugin::executor::routeros::ip_prefix::IpPrefix;
+use crate::plugin::executor::routeros::throttle::ErrorLogThrottle;
+use crate::plugin::executor::routeros::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
+use crate::plugin::executor::routeros::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
 
 #[derive(Debug)]
 struct MikrotikExecutor {

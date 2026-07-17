@@ -9,8 +9,6 @@ pub mod clock;
 pub mod control;
 pub mod env;
 pub mod error;
-#[cfg(any(feature = "plugin-ros-address-list", feature = "plugin-ros-route"))]
-pub(crate) mod mikrotik;
 pub mod network;
 pub mod observability;
 pub mod service;

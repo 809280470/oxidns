@@ -16,7 +16,7 @@ use crate::config::types::PluginConfig;
 use crate::infra::error::{DnsError, Result as DnsResult};
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::matcher::Matcher;
-use crate::plugin::matcher::matcher_utils::{
+use crate::plugin::matcher::rules::{
     parse_quick_setup_rules, parse_rules_from_value, provider_dependency_specs,
     resolve_provider_tags, split_rule_sources,
 };

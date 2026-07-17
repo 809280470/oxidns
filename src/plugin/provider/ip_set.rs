@@ -210,17 +210,13 @@ impl PluginFactory for IpSetFactory {
 }
 
 fn append_rules_from_file(rules: &mut Vec<String>, path: &str) -> DnsResult<()> {
-    crate::plugin::provider::provider_utils::for_each_nonempty_rule_line(
-        path,
-        "ip rules",
-        |raw, _| {
-            let rule = normalize_ip_rule_line(raw);
-            if !rule.is_empty() {
-                rules.push(rule.to_string());
-            }
-            Ok(())
-        },
-    )
+    crate::plugin::provider::rule_lines::for_each_nonempty_rule_line(path, "ip rules", |raw, _| {
+        let rule = normalize_ip_rule_line(raw);
+        if !rule.is_empty() {
+            rules.push(rule.to_string());
+        }
+        Ok(())
+    })
 }
 
 fn load_ip_rules(matcher: &mut IpPrefixMatcher, rules: &[String]) -> DnsResult<()> {
@@ -255,7 +251,7 @@ fn normalize_ip_rule_line(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::provider::provider_utils::for_each_nonempty_rule_text;
+    use crate::plugin::provider::rule_lines::for_each_nonempty_rule_text;
 
     fn load_rules_text(
         matcher: &mut IpPrefixMatcher,
