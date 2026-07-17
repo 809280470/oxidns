@@ -475,11 +475,52 @@ apk add --allow-untrusted --no-network ./luci-i18n-oxidns-zh-cn_*.apk
 - `linux/amd64`
 - `linux/arm64`
 
-拉取并运行：
+开始前请先安装 Docker Engine 和 Docker Compose 插件（使用 `docker compose` 命令），并确认下面两个命令都能正常执行。安装方式见 [Docker 官方文档](https://docs.docker.com/engine/install/)：
 
 ```bash
+docker version
+docker compose version
+```
+
+### 准备配置文件
+
+先创建一个空的部署目录，再从镜像中导出与当前镜像版本匹配的默认配置：
+
+```bash
+mkdir -p oxidns
+cd oxidns
+
 docker pull svenshi/oxidns:latest
 
+docker run --rm \
+  --entrypoint /bin/cat \
+  svenshi/oxidns:latest \
+  /etc/oxidns/config.yaml > config.yaml
+
+test -s config.yaml
+```
+
+上述导出命令只用于首次创建配置。升级或重启已有部署时，应保留并复用现有的 `config.yaml`，不要用镜像默认配置覆盖它。
+
+必须在启动容器前创建普通文件 `config.yaml`。如果绑定挂载的源文件不存在，Docker 可能会创建一个同名目录，随后因无法把目录挂载到 `/etc/oxidns/config.yaml` 而启动失败。
+
+<Admonition type="note" title="配置中的 DNS 端口">
+
+镜像内置配置监听容器端口 `53`。仓库根目录的开发用 `config.yaml` 默认监听 `5335`，不要在未修改监听地址时直接配合下面的 `53:53` 端口映射使用。如果需要使用仓库配置，请把 UDP/TCP server 的监听地址改为 `:53`，或者相应调整容器端口映射。
+
+</Admonition>
+
+<Admonition type="warning" title="保护管理接口">
+
+下面的示例会把管理 API 和 WebUI 通过宿主机 `9199` 端口暴露出去，而导出的默认配置没有启用认证。允许其它设备访问前，请在 `config.yaml` 中启用 `api.http.auth`，并结合防火墙限制来源。如果只需要本机访问，可将端口映射改成 `127.0.0.1:9199:9199/tcp`。
+
+</Admonition>
+
+### 使用 docker run 启动
+
+确认当前目录中已经存在上一步生成的 `config.yaml`，然后运行：
+
+```bash
 docker run -d \
   --name oxidns \
   --restart unless-stopped \
@@ -490,13 +531,13 @@ docker run -d \
   svenshi/oxidns:latest
 ```
 
-<Admonition type="note" title="端口绑定">
+<Admonition type="note" title="端口映射">
 
-Linux 上 53 是特权端口；普通用户运行 Docker 时一般通过 Docker 守护进程拿到权限。便携安装非 root 用户应使用 `:5353`。
+如果宿主机的 53 端口已被 systemd-resolved、dnsmasq 或其它 DNS 服务占用，可把映射左侧改为 `5353:53`，例如 `-p 5353:53/udp -p 5353:53/tcp`。容器侧仍保持端口 53。
 
 </Admonition>
 
-如果默认分支镜像已发布，也可以使用 `latest` 标签。
+示例使用滚动更新的 `latest` 标签；生产环境建议改为明确的 release 版本标签，以避免重新拉取镜像时意外升级。
 
 镜像默认启动命令等价于：
 
@@ -510,9 +551,23 @@ oxidns start -c /etc/oxidns/config.yaml -d /etc/oxidns
 - `53/tcp`
 - `9199/tcp`
 
+检查容器、API、WebUI 和 DNS：
+
+```bash
+docker ps --filter name=oxidns
+docker logs --tail 50 oxidns
+curl -fsS http://127.0.0.1:9199/api/health
+
+# 如果系统安装了 dig
+dig @127.0.0.1 example.com
+dig @127.0.0.1 example.com +tcp
+```
+
+WebUI 地址为 `http://服务器IP:9199/`。如果已启用 Basic Auth，请在 WebUI 设置页填写对应用户名和密码。
+
 ### Docker Compose 示例
 
-使用 Compose 管理配置和端口映射时，可参考下面的 `docker-compose.yml`：
+使用 Compose 管理配置和端口映射时，先按“准备配置文件”步骤生成当前目录下的 `config.yaml`，再创建下面的 `docker-compose.yml`：
 
 ```yaml
 services:
@@ -538,6 +593,12 @@ docker compose up -d
 
 ```bash
 docker compose logs -f oxidns
+```
+
+另开一个终端执行健康检查：
+
+```bash
+curl -fsS http://127.0.0.1:9199/api/health
 ```
 
 ## 7. 选择建议
