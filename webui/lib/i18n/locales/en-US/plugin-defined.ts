@@ -1652,7 +1652,7 @@ export const enUSPluginDefined = {
     },
     ros_route: {
       name: "RouterOS Route",
-      description: "Sync response IPs into RouterOS policy routes",
+      description: "Sync response IPs as per-IP static routes in a RouterOS routing table",
       fields: {
         address: { label: "RouterOS API address", placeholder: "172.16.1.1:8728" },
         username: { label: "Username" },
@@ -1676,14 +1676,20 @@ export const enUSPluginDefined = {
         gateway6: { label: "IPv6 gateway", placeholder: "fe80::2%ether1" },
         distance: { label: "Route distance" },
         comment_prefix: { label: "Comment prefix" },
-        persistent: { label: "Persistent routes" },
+        persistent: {
+          label: "Persistent routes",
+          description: "Desired state recovered at startup and reconciled every 180 seconds; dynamic routes are excluded.",
+        },
         "persistent.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
         "persistent.ips[]": { label: "Value", placeholder: "1.1.1.1" },
         "persistent.files": { label: "Files", placeholder: "/etc/oxidns/persistent_routes.txt" },
         "persistent.files[]": { label: "Value", placeholder: "/etc/oxidns/persistent_routes.txt" },
         min_ttl: { label: "Minimum dynamic-route TTL" },
         max_ttl: { label: "Maximum dynamic-route TTL" },
-        fixed_ttl: { label: "Fixed dynamic-route TTL", description: "Set to 0 to disable time-based expiry." },
+        fixed_ttl: {
+          label: "Fixed dynamic-route TTL",
+          description: "Set to 0 to disable time-based expiry; only later DNS observations refresh dynamic routes.",
+        },
         conntrack_guard: {
           label: "Connection tracking guard",
           description: "Check exact target IPs before deleting expired dynamic host routes and defer when a connection exists.",
@@ -1711,7 +1717,7 @@ export const enUSPluginDefined = {
           ros_route_sync_error_total:
             "The total number of synchronous observations that failed in the RouterOS route manager.",
           ros_route_sync_timeout_total:
-            "The total number of synchronous observations that timed out while enqueuing or waiting.",
+            "The total number of synchronous observations that timed out waiting for manager completion.",
           ros_route_delete_deferred_total:
             "The total number of route deletions deferred because RouterOS conntrack still has a target connection.",
           ros_route_connection_check_error_total:
@@ -1721,7 +1727,7 @@ export const enUSPluginDefined = {
     },
     ros_address_list: {
       name: "RouterOS Address List",
-      description: "Synchronize answering IP to RouterOS address-list",
+      description: "Sync response IPs into an address-list consumed by firewall, mangle, or routing rules",
       fields: {
         address: {
           label: "RouterOS API address",
@@ -1785,7 +1791,7 @@ export const enUSPluginDefined = {
         persistent: {
           label: "Resident address",
           description:
-            "Define a set of static addresses that need to be retained for a long time.",
+            "Desired state recovered at startup and reconciled every 180 seconds; dynamic entries are excluded.",
         },
         "persistent.ips": {
           label: "IP / CIDR",
@@ -1818,7 +1824,8 @@ export const enUSPluginDefined = {
         },
         fixed_ttl: {
           label: "Dynamic items fixed TTL",
-          description: "Specify a fixed TTL for all dynamic writes.",
+          description:
+            "Specify a fixed TTL for dynamic entries; only later DNS observations trigger refresh.",
         },
         cleanup_on_shutdown: {
           label: "Clean up on shutdown",
@@ -1841,7 +1848,7 @@ export const enUSPluginDefined = {
           ros_address_list_sync_error_total:
             "The total number of observations that failed on the RouterOS manager side in sync mode.",
           ros_address_list_sync_timeout_total:
-            "The total number of observations that were queued or waited for timeout in sync mode.",
+            "The total number of synchronous observations that timed out waiting for manager completion.",
         },
       },
     },

@@ -2442,7 +2442,7 @@ Format:
 
 ### Purpose
 
-Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, persistent entries, startup-time file loading, and shutdown cleanup. This is the recommended RouterOS integration when firewall, mangle, or routing rules can consume a shared address set.
+Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, persistent entries, startup-time file loading, and shutdown cleanup. RouterOS firewall, mangle, or routing rules can consume the resulting address set.
 
 ### Example Configuration
 
@@ -2481,7 +2481,7 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
     max_ttl: 3600
     # Force dynamic entries to 300 seconds; use 0 to omit RouterOS timeout
     fixed_ttl: 300
-    # Remove owned entries when the plugin shuts down
+    # Remove owned entries during normal shutdown or application reload
     cleanup_on_shutdown: true
     persistent:
       ips:
@@ -2570,17 +2570,17 @@ args:
 
 #### `address_list4`
 
-- Type: `string`; Required: no; Default: `oxi`
+- Type: `string`; Required: no; Default: none
 - Purpose: IPv4 address-list name.
 
 #### `address_list6`
 
-- Type: `string`; Required: no
+- Type: `string`; Required: no; Default: none
 - Purpose: IPv6 address-list name.
 
 #### `comment_prefix`
 
-- Type: `string`; Required: no
+- Type: `string`; Required: no; Default: `oxi`
 - Purpose: Prefix for generated RouterOS comments.
 
 #### `persistent`
@@ -2617,8 +2617,8 @@ args:
 #### `cleanup_on_shutdown`
 
 - Type: `bool`; Required: no; Default: `true`
-- Purpose: Controls whether entries managed by the plugin are removed when the plugin exits. All cleanup shares a 30-second budget; timeout is reported and shutdown continues.
-- Operational note: Set this to `false` when production restarts or rolling deployments require policy continuity.
+- Purpose: Controls whether managed entries are removed during normal shutdown and application-level reload. All cleanup shares a 30-second budget; timeout is reported and shutdown continues.
+- Operational note: Set this to `false` when production restarts, reloads, or rolling deployments require policy continuity.
 
 ### Behavior
 
@@ -2635,8 +2635,9 @@ args:
   - Cleanup on shutdown
 - Startup always performs one persistent recovery scan, even with an empty desired set, so stale persistent rows from an older configuration can be removed. Failures retry until one scan succeeds.
 - The 180-second periodic reconcile runs only when `persistent` is configured and uses the in-memory set loaded during initialization; it never rereads files.
-- Dynamic entries are excluded from startup and periodic full-table reconcile. Operator edits are not proactively corrected; only a normal TTL refresh or later write may overwrite them.
-- Finite dynamic entries become refreshable at 75% of their effective TTL. Timeless entries are not periodically refreshed.
+- Dynamic entries are DNS observations rather than desired state, so they are excluded from startup and periodic full-table reconcile. Operator edits are not proactively corrected; only a later DNS observation that triggers a write may overwrite them.
+- Finite dynamic entries become eligible for refresh by a later DNS observation at 75% of their effective TTL. The plugin does not run a separate dynamic-refresh timer, and timeless entries are not refreshed automatically.
+- Before deleting an address-list row, the plugin rechecks its internal ID, target list/address key, and complete ownership comment. RouterOS `timeout` is lease data rather than a deletion-authorization condition. RouterOS still exposes final removal by internal ID and has no atomic compare-and-delete primitive.
 
 ### Typical Uses
 
@@ -2656,7 +2657,7 @@ args:
 
 ## `ros_route`
 
-Writes A/AAAA addresses from successful DNS answers into a RouterOS policy-routing table. This is the advanced option for deployments that explicitly require per-IP static routes; prefer `ros_address_list` for general policy integration. It is a continuation executor and should appear before the executor that produces the final answer.
+Writes A/AAAA addresses from successful DNS answers as per-IP static routes in a RouterOS policy-routing table, applying the configured gateway and distance to each address. It is a continuation executor and should appear before the executor that produces the final answer.
 
 ```yaml
 - tag: ros_route_policy
@@ -2701,7 +2702,7 @@ args:
 - `conntrack_guard` defaults to disabled and only protects expired dynamic `/32` and `/128` host routes. A tracked connection to the exact target IP defers deletion for 30 seconds; query failures fail closed. Persistent configuration removal, shutdown cleanup, and internal maintenance bypass the guard. CIDR connection protection is not supported.
 - Dynamic leases have no record-count limit. In particular, `fixed_ttl: 0` routes do not expire naturally; operators must plan RouterOS route-table and OxiDNS memory capacity and reclaim them through operator deletion, configuration changes, or shutdown cleanup.
 - Startup performs one full recovery: persistent routes converge to configuration, unexpired dynamic leases are recovered from comments, and expired routes flow through sweep and conntrack guard. Failed startup scans retry with backoff until successful.
-- The 180-second periodic reconcile handles `persistent` routes only and performs no RouterOS query when the persistent set is empty. Dynamic operator edits are not periodically corrected.
+- The 180-second periodic reconcile handles `persistent` routes only and performs no RouterOS query when the persistent set is empty. Dynamic routes are DNS observations rather than desired state, so operator edits are not periodically corrected.
 - `persistent.files` is read only during initialization or reload; periodic reconcile always uses the in-memory set.
 - `comment_prefix` defaults to `oxi` and combines with the plugin `tag` to form the RouterOS ownership namespace; neither value may contain `;` or `=`.
 - RouterOS comments store only item kind, expiry, and last-observed time, not domain references. Restart recovery restores unexpired leases; the current TTL policy may shorten an old deadline but never extends it without a new DNS observation.
@@ -2710,7 +2711,7 @@ args:
 - An application-level reload gives this plugin shutdown/restart semantics: the candidate runtime may finish side-effect-free initialization early, but the old instance fully shuts down before the new instance is activated, and pending observations from the old instance are not transferred. With `cleanup_on_shutdown: true`, owned routes are removed and a policy gap may exist while they are rebuilt; set it to `false` to retain RouterOS routes across reload. Different processes must not write the same plugin tag, comment prefix, and routing table concurrently; rolling deployments need distinct ownership namespaces or an old writer that has already stopped.
 - Before deletion, only the internal ID, route key, and plugin ownership namespace are rechecked; gateway, distance, disabled state, and lease-comment payload are not compared as a full mutable snapshot. RouterOS still exposes final removal by internal ID and has no atomic compare-and-delete primitive.
 - The plugin no longer creates temporary validation routes. Invalid gateway or routing-table settings surface on the first real write and enter background retry.
-- Dynamic lease comments are rewritten at the earlier of 75% of remaining TTL or five minutes after the previous successful write.
+- When a later DNS response observes the same IP, its dynamic lease comment is rewritten only after 75% of the TTL has elapsed or five minutes have passed since the previous successful write, whichever comes first. The plugin does not run a separate dynamic-lease refresh timer.
 
 ---
 

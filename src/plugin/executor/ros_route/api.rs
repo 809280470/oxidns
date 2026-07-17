@@ -107,8 +107,8 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         comment_prefix: &str,
         plugin_tag: &str,
     ) -> Result<String>;
-    /// Re-read the RouterOS row and delete only when it still exactly matches
-    /// the snapshot that authorized the deletion.
+    /// Re-read the RouterOS row and delete only when its id, route key, and
+    /// ownership namespace still authorize the deletion.
     ///
     /// RouterOS exposes the final remove as an id-only command, not an atomic
     /// compare-and-delete operation. The plugin serializes all in-process
@@ -291,9 +291,9 @@ impl MikrotikRsClient {
         }
         // The RouterOS API has no conditional remove primitive. This final
         // id-only command is safe against OxiDNS reload races because the
-        // ownership namespace has one in-process writer. The fresh full-row
-        // comparison above is the best available guard against external
-        // changes; operators must not concurrently edit plugin-owned rows.
+        // ownership namespace has one in-process writer. The fresh identity,
+        // key, and ownership checks above guard against deleting a replaced or
+        // repurposed row; operators must not concurrently edit owned rows.
         self.remove_route_by_id(&expected.id, expected.family, bypass_backoff)
             .await?;
         Ok(true)

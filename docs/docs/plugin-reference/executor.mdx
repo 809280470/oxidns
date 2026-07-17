@@ -2536,7 +2536,7 @@ old-static.example.com static.example.net
 
 ### 作用
 
-把应答 IP 同步到 RouterOS address-list，支持动态项、常驻项、启动时文件加载和关闭时清理。这是推荐的 RouterOS 联动方式，适合让 firewall、mangle 或 routing rule 消费统一地址集合。
+把应答 IP 同步到 RouterOS address-list，支持动态项、常驻项、启动时文件加载和关闭时清理。RouterOS 的 firewall、mangle 或 routing rule 可以消费该地址集合。
 
 ### 配置示例
 
@@ -2575,7 +2575,7 @@ old-static.example.com static.example.net
     max_ttl: 3600
     # 强制把动态项 TTL 固定为 300 秒；填 0 表示不设置 timeout
     fixed_ttl: 300
-    # 插件关闭时清理自己维护的条目
+    # 正常关闭或应用 reload 时清理自己维护的条目
     cleanup_on_shutdown: true
     persistent:
       ips:
@@ -2728,8 +2728,8 @@ args:
 #### `cleanup_on_shutdown`
 
 - 类型：`bool`；必填：否；默认值：`true`
-- 作用：控制插件退出时是否清理由其管理的条目。启用后，插件在正常关闭阶段会删除自身写入并可识别归属的 RouterOS 地址项，全部清理共用 30 秒预算；超时后进程继续关闭并报告错误。
-- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启保留的场景。生产重启或滚动发布需要策略连续性时建议设为 `false`。
+- 作用：控制插件在正常关闭和应用级 reload 时是否清理由其管理的条目。启用后会删除自身写入并可识别归属的 RouterOS 地址项，全部清理共用 30 秒预算；超时后进程继续关闭并报告错误。
+- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启或 reload 保留的场景。生产重启或滚动发布需要策略连续性时建议设为 `false`。
 
 ### 行为说明
 
@@ -2746,8 +2746,9 @@ args:
   - 关闭清理
 - 启动时始终执行一次持久项恢复，即使当前没有 `persistent`，也会清理旧配置遗留的本插件持久项。恢复失败时持续退避重试至成功。
 - 仅在配置了 `persistent` 时每 180 秒对账一次；对账使用初始化时已加载的内存集合，不重新读取文件。
-- 动态项不参与启动或周期全表对账。用户手工删除、修改动态项后插件不主动纠偏；后续只有正常 TTL 刷新或新写入才可能覆盖该变化。
-- 有限 TTL 动态项在有效 TTL 的 75% 处允许再次刷新；`fixed_ttl: 0` 的永久项不做周期刷新。
+- 动态项是 DNS 观察结果，不是期望状态，不参与启动或周期全表对账。用户手工删除、修改动态项后插件不主动纠偏；只有后续 DNS 再次观察到同一 IP 并触发写入时才可能覆盖该变化。
+- 有限 TTL 动态项在有效 TTL 的 75% 处允许由后续 DNS 观察再次刷新；插件不会为动态项启动独立刷新定时器，`fixed_ttl: 0` 的永久项也不会自动刷新。
+- 删除地址项前会重新确认内部 ID、目标 list/address key 和完整 ownership comment；RouterOS `timeout` 只是租约数据，不属于删除授权条件。RouterOS 最终仍只支持按内部 ID 删除，不提供原子 compare-and-delete。
 
 ### 典型用途
 
@@ -2768,7 +2769,7 @@ args:
 
 ## `ros_route`
 
-将成功 DNS 应答中的 A/AAAA 地址写入 RouterOS 指定策略路由表。这是需要逐 IP 静态路由时使用的高级方式；一般策略联动优先使用 `ros_address_list`。插件是 continuation executor，应放在产生最终应答的 executor 之前。
+将成功 DNS 应答中的 A/AAAA 地址写成 RouterOS 指定策略路由表中的逐 IP 静态路由，并为每个地址应用对应网关和 distance。插件是 continuation executor，应放在产生最终应答的 executor 之前。
 
 ```yaml
 - tag: ros_route_policy
@@ -2813,7 +2814,7 @@ args:
 - `conntrack_guard` 默认关闭，仅保护到期的动态 `/32`、`/128` 主机路由。目标 IP 仍有跟踪连接时保留路由并在 30 秒后重试；查询失败时 fail-closed。persistent 配置删除、关闭清理和内部维护清理不执行连接检查，也不支持 CIDR 连接保护。
 - 动态租约没有记录数量上限。尤其是 `fixed_ttl: 0` 路由不会自然过期，用户必须评估 RouterOS 路由表和 OxiDNS 内存容量，并通过用户删除、配置变化或关闭清理回收。
 - 启动时执行一次完整恢复：持久路由会收敛到配置，动态路由从 comment 恢复尚未过期的租约，过期项通过 sweep 和 conntrack guard 删除。启动扫描失败时退避重试至成功。
-- 每 180 秒的定时对账只处理 `persistent`；没有持久项时不发起周期路由表查询。动态路由不会因用户手工修改而触发周期纠偏。
+- 每 180 秒的定时对账只处理 `persistent`；没有持久项时不发起周期路由表查询。动态路由是 DNS 观察结果，不是期望状态，不会因用户手工修改而触发周期纠偏。
 - `persistent.files` 只在初始化或 reload 时读取；定时对账始终使用内存集合。
 - `comment_prefix` 默认是 `oxi`，并与插件 `tag` 一起构成 RouterOS 条目的 ownership namespace；两者都不能包含 `;` 或 `=`。
 - RouterOS comment 只保存条目类型、过期时间和最近观察时间，不保存域名引用。重启时恢复未过期租约；当前 TTL 策略可以收紧旧期限，但不会在没有新 DNS 观察时延长它。
@@ -2822,7 +2823,7 @@ args:
 - 应用级 reload 对该插件采用 shutdown/restart 语义：候选 runtime 可提前完成无副作用的初始化，但旧实例会先完整 shutdown，新实例随后才激活；旧实例待处理观测不移交。`cleanup_on_shutdown: true` 时会清理旧实例拥有的路由，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 路由，请设为 `false`。不同进程不能同时使用相同插件 tag、注释前缀和 routing table；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
 - 删除前只重新确认内部 ID、目标 key 和插件 ownership namespace，不因 gateway、distance、disabled 或租约 comment 的变化比较完整快照。RouterOS 最终仍只支持按内部 ID 删除，不提供原子 compare-and-delete。
 - 插件不再创建临时 validation route；错误的网关或路由表会在第一次真实写入时暴露并进入后台重试。
-- 动态租约在剩余 TTL 的 75% 或上次成功写入后 5 分钟（取较早者）写回 comment，以兼顾管理面写入量和异常重启恢复精度。
+- 后续 DNS 再次观察到同一 IP 时，动态租约在 TTL 已消耗 75% 或距上次成功写入已满 5 分钟（取较早者）才写回 comment；插件不会单独定时刷新动态租约。
 
 ---
 

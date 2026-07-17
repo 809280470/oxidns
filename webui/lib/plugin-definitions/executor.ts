@@ -1725,7 +1725,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     kind: "ros_route",
     type: "executor",
     name: "RouterOS Route",
-    description: "把应答 IP 同步为 RouterOS 策略路由",
+    description: "把应答 IP 同步为 RouterOS routing table 中的逐 IP 静态路由",
     icon: "Route",
     metrics: {
       metricLabels: {
@@ -1755,7 +1755,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
         ros_route_sync_error_total:
           "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
-        ros_route_sync_timeout_total: "同步模式下入队或等待超时的观测总数。",
+        ros_route_sync_timeout_total: "同步模式下等待 manager 完成时超时的观测总数。",
         ros_route_write_success_total: "RouterOS 路由 upsert 成功总数。",
         ros_route_write_error_total: "RouterOS 路由 upsert 失败总数。",
         ros_route_last_write_success_timestamp_seconds:
@@ -1854,6 +1854,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "persistent",
         label: "常驻路由",
         type: "object",
+        description: "期望状态；启动恢复并每 180 秒对账。动态路由不参与定时对账。",
         advanced: true,
         fields: [
           stringArrayField("ips", "IP / CIDR", "1.1.1.1\n100.64.1.0/24", false),
@@ -1883,7 +1884,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "fixed_ttl",
         label: "动态路由固定 TTL",
         type: "number",
-        description: "填 0 表示动态路由不按时间过期。",
+        description: "填 0 表示不按时间过期；动态路由只由后续 DNS 观察刷新。",
         advanced: true,
       },
       {
@@ -1900,6 +1901,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "关闭时清理",
         type: "switch",
         default: true,
+        description: "正常关闭及应用级 reload 时清理；需要策略连续性时设为 false。",
         advanced: true,
       },
     ],
@@ -1908,7 +1910,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     kind: "ros_address_list",
     type: "executor",
     name: "RouterOS Address List",
-    description: "把应答 IP 同步到 RouterOS address-list",
+    description: "把应答 IP 同步到供 firewall、mangle 或路由规则使用的 address-list",
     icon: "Network",
     metrics: {
       metricLabels: {
@@ -1939,7 +1941,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_address_list_sync_error_total:
           "同步模式下在 RouterOS 管理器侧失败的观测总数。",
         ros_address_list_sync_timeout_total:
-          "同步模式下入队或等待超时的观测总数。",
+          "同步模式下等待 manager 完成时超时的观测总数。",
         ros_address_list_write_success_total:
           "RouterOS address-list upsert 成功总数。",
         ros_address_list_write_error_total:
@@ -2070,7 +2072,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       {
         key: "persistent",
-        description: "定义需要长期保留的静态地址集合。",
+        description: "期望状态；启动恢复并每 180 秒对账。动态项不参与定时对账。",
         label: "常驻地址",
         type: "object",
         advanced: true,
@@ -2119,14 +2121,14 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       {
         key: "fixed_ttl",
-        description: "为所有动态写入项指定固定 TTL。",
+        description: "为动态项指定固定 TTL；刷新只由后续 DNS 观察触发。",
         label: "动态项固定 TTL",
         type: "number",
         advanced: true,
       },
       {
         key: "cleanup_on_shutdown",
-        description: "控制插件退出时是否清理由其管理的条目。",
+        description: "控制正常关闭及应用级 reload 时是否清理由其管理的条目。",
         label: "关闭时清理",
         type: "switch",
         default: true,

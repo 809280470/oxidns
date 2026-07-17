@@ -333,7 +333,7 @@ impl MetricSource for RosMetrics {
         ));
         sink.emit(MetricSample::counter(
             "ros_address_list_sync_timeout_total",
-            "Total sync-mode observations that timed out enqueueing or waiting.",
+            "Total sync-mode observations that timed out waiting for manager completion.",
             &labels,
             self.sync_timeout_total.load(Ordering::Relaxed),
         ));
