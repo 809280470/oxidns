@@ -2258,7 +2258,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "升级后清理缓存",
         type: "switch",
         default: true,
-        advanced: true,
       },
       {
         key: "repository",
@@ -2319,7 +2318,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "WebUI 目录",
         type: "text",
         placeholder: "./webui",
-        advanced: true,
       },
       {
         key: "skip_webui",

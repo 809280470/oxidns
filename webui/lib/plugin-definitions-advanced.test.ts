@@ -121,11 +121,9 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
     "cleanup_on_shutdown",
   ],
   "executor/upgrade": [
-    "cleanup",
     "github_token",
     "cache_dir",
     "backup_dir",
-    "webui_dir",
     "timeout",
     "outbound",
     "socks5",
