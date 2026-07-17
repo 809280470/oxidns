@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -123,11 +123,6 @@ enum ControlCommand {
     Reconcile,
 }
 
-#[derive(Debug)]
-enum LifecycleCommand {
-    Activate { done: oneshot::Sender<()> },
-}
-
 impl Coalesce for ControlCommand {
     fn coalesce(&mut self, newer: Self) {
         *self = newer;
@@ -149,15 +144,10 @@ pub(super) struct RouteManagerHandle {
     gateway6_enabled: bool,
     policy: LeasePolicy,
     metrics: Option<Arc<RosRouteMetrics>>,
-    lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
 }
 
 impl RouteManagerHandle {
-    fn new(
-        config: &RouteManagerConfig,
-        metrics: Option<Arc<RosRouteMetrics>>,
-        lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
-    ) -> Self {
+    fn new(config: &RouteManagerConfig, metrics: Option<Arc<RosRouteMetrics>>) -> Self {
         Self {
             observations: KeyedMailbox::new(config.queue_capacity),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
@@ -166,7 +156,6 @@ impl RouteManagerHandle {
             gateway6_enabled: config.gateway6.is_some(),
             policy: LeasePolicy::new(config.min_ttl, config.max_ttl, config.fixed_ttl),
             metrics,
-            lifecycle,
         }
     }
 
@@ -271,19 +260,6 @@ impl RouteManagerHandle {
             .is_ok()
     }
 
-    pub(super) async fn activate(&self) -> Result<()> {
-        let Some(lifecycle) = &self.lifecycle else {
-            return Ok(());
-        };
-        let (done, wait) = oneshot::channel();
-        lifecycle
-            .send(LifecycleCommand::Activate { done })
-            .await
-            .map_err(|_| DnsError::plugin("ros_route manager lifecycle channel is closed"))?;
-        wait.await
-            .map_err(|_| DnsError::plugin("ros_route manager activation was cancelled"))
-    }
-
     fn request_sweep(&self) {
         let _ = self
             .controls
@@ -312,27 +288,17 @@ pub(super) struct RouteManagerRuntime {
 }
 
 impl RouteManagerRuntime {
-    pub(super) fn start_paused(tag: String, manager: RouteManager) -> Self {
-        Self::start_with_state(tag, manager, false)
-    }
-
-    fn start_with_state(tag: String, manager: RouteManager, active: bool) -> Self {
+    pub(super) fn start(tag: String, manager: RouteManager) -> Self {
         let has_persistent = !manager.persistent.is_empty();
-        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
-        let handle =
-            RouteManagerHandle::new(&manager.cfg, manager.metrics.clone(), Some(lifecycle_tx));
+        let handle = RouteManagerHandle::new(&manager.cfg, manager.metrics.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker_handle = Some(tokio::spawn(run_manager_worker(
             tag.clone(),
             manager,
             handle.clone(),
-            lifecycle_rx,
-            active,
             shutdown_rx,
         )));
-        if active {
-            handle.request_reconcile();
-        }
+        handle.request_reconcile();
 
         let sweep_handle = handle.clone();
         let sweep_task_id = Some(task_center::spawn_fixed(
@@ -1429,8 +1395,6 @@ async fn run_manager_worker(
     tag: String,
     mut manager: RouteManager,
     handle: RouteManagerHandle,
-    mut lifecycle_rx: mpsc::Receiver<LifecycleCommand>,
-    mut active: bool,
     mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
 ) {
     let error_logs = ErrorLogThrottle::default();
@@ -1458,7 +1422,6 @@ async fn run_manager_worker(
             },
             Control(ControlCommand),
             ReconcileCompleted,
-            Lifecycle(LifecycleCommand),
         }
         let event = tokio::select! {
             biased;
@@ -1468,10 +1431,9 @@ async fn run_manager_worker(
                 }
                 break;
             }
-            lifecycle = lifecycle_rx.recv() => lifecycle.map(Event::Lifecycle),
-            _ = manager.reconcile.wait(), if active && manager.reconcile.is_running() => Some(Event::ReconcileCompleted),
-            control = handle.controls.recv(), if active => control.map(|(_, command)| Event::Control(command)),
-            _ = retry_wakeup, if active => {
+            _ = manager.reconcile.wait(), if manager.reconcile.is_running() => Some(Event::ReconcileCompleted),
+            control = handle.controls.recv() => control.map(|(_, command)| Event::Control(command)),
+            _ = retry_wakeup => {
                 let now = tokio::time::Instant::now();
                 let keys = retries
                     .iter()
@@ -1495,11 +1457,11 @@ async fn run_manager_worker(
                     from_retry: true,
                 })
             }
-            _ = reconcile_retry_wakeup, if active => {
+            _ = reconcile_retry_wakeup => {
                 manager.reconcile_retry.mark_due();
                 Some(Event::Control(ControlCommand::Reconcile))
             }
-            observation = handle.observations.recv(), if active => observation.map(|first| {
+            observation = handle.observations.recv() => observation.map(|first| {
                 let mut batch = vec![first];
                 while batch.len() < UPSERT_PIPELINE_SIZE {
                     let Some(next) = handle.observations.try_recv() else { break };
@@ -1513,11 +1475,6 @@ async fn run_manager_worker(
         };
         let Some(event) = event else { break };
         match event {
-            Event::Lifecycle(LifecycleCommand::Activate { done }) => {
-                active = true;
-                handle.request_reconcile();
-                let _ = done.send(());
-            }
             Event::ReconcileCompleted => manager.harvest_reconcile().await,
             Event::Control(ControlCommand::Reconcile) => {
                 if let Err(error) = manager.start_reconcile().await {
@@ -2236,36 +2193,6 @@ mod tests {
             );
             assert_eq!(api.routes().len(), 1);
         }
-    }
-
-    #[tokio::test]
-    async fn paused_runtime_processes_queued_observations_after_activation() {
-        let api = Arc::new(MockApi::default());
-        let cfg = config(Some(300), false);
-        let runtime = RouteManagerRuntime::start_paused(
-            "route-activation".to_string(),
-            RouteManager::new(api.clone(), cfg),
-        );
-        let handle = runtime.handle();
-        handle
-            .try_observe(
-                vec![ObservedAddr {
-                    addr: "203.0.113.91".parse().expect("ip"),
-                    ttl_secs: 300,
-                }],
-                None,
-            )
-            .expect("queue observation");
-        handle.activate().await.expect("activate runtime");
-        for _ in 0..64 {
-            if !api.routes().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(api.routes().len(), 1);
-
-        runtime.shutdown(false).await.expect("shutdown");
     }
 
     #[tokio::test]

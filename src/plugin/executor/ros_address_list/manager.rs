@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -182,11 +182,6 @@ enum ControlCommand {
     PruneDynamicCache,
 }
 
-#[derive(Debug)]
-enum LifecycleCommand {
-    Activate { done: oneshot::Sender<()> },
-}
-
 impl Coalesce for ControlCommand {
     fn coalesce(&mut self, newer: Self) {
         *self = newer;
@@ -237,21 +232,15 @@ pub(super) struct AddressListManagerHandle {
     controls: KeyedMailbox<ControlKey, ControlCommand>,
     policy: AddressObservationPolicy,
     metrics: Option<Arc<RosMetrics>>,
-    lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
 }
 
 impl AddressListManagerHandle {
-    fn new(
-        config: &AddressListManagerConfig,
-        metrics: Option<Arc<RosMetrics>>,
-        lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
-    ) -> Self {
+    fn new(config: &AddressListManagerConfig, metrics: Option<Arc<RosMetrics>>) -> Self {
         Self {
             observations: KeyedMailbox::new(config.queue_capacity),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
             policy: AddressObservationPolicy::from_config(config),
             metrics,
-            lifecycle,
         }
     }
 
@@ -270,7 +259,6 @@ impl AddressListManagerHandle {
                 fixed_ttl: None,
                 queue_capacity: 16_384,
             },
-            None,
             None,
         )
     }
@@ -346,21 +334,6 @@ impl AddressListManagerHandle {
             .is_ok()
     }
 
-    pub(super) async fn activate(&self) -> Result<()> {
-        let Some(lifecycle) = &self.lifecycle else {
-            return Ok(());
-        };
-        let (done, wait) = oneshot::channel();
-        lifecycle
-            .send(LifecycleCommand::Activate { done })
-            .await
-            .map_err(|_| {
-                DnsError::plugin("ros_address_list manager lifecycle channel is closed")
-            })?;
-        wait.await
-            .map_err(|_| DnsError::plugin("ros_address_list manager activation was cancelled"))
-    }
-
     fn request_prune(&self) {
         let _ = self.controls.try_push(
             ControlKey::PruneDynamicCache,
@@ -387,7 +360,6 @@ enum WorkerCommand {
     },
     Control(ControlCommand),
     ReconcileCompleted,
-    Lifecycle(LifecycleCommand),
 }
 
 #[derive(Debug)]
@@ -403,46 +375,22 @@ pub(super) struct AddressListManagerRuntime {
 }
 
 impl AddressListManagerRuntime {
-    #[cfg(test)]
     pub(super) fn start(tag: String, manager: AddressListManager) -> Self {
-        Self::start_with_state(tag, manager, true)
-    }
-
-    pub(super) fn start_paused(tag: String, manager: AddressListManager) -> Self {
-        Self::start_with_state(tag, manager, false)
-    }
-
-    fn start_with_state(tag: String, manager: AddressListManager, active: bool) -> Self {
         // All mutable state lives behind one worker to avoid cross-map locking
         // or request-path synchronization in the DNS hot path.
         let has_persistent = !manager.persistent_items.is_empty();
-        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
-        let handle = AddressListManagerHandle::new(
-            &manager.cfg,
-            manager.metrics.clone(),
-            Some(lifecycle_tx),
-        );
+        let handle = AddressListManagerHandle::new(&manager.cfg, manager.metrics.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker_tag = tag.clone();
         let worker_handle_mailbox = handle.clone();
         let worker_handle = Some(tokio::spawn(async move {
-            run_manager_worker(
-                worker_tag,
-                manager,
-                worker_handle_mailbox,
-                lifecycle_rx,
-                active,
-                shutdown_rx,
-            )
-            .await;
+            run_manager_worker(worker_tag, manager, worker_handle_mailbox, shutdown_rx).await;
         }));
 
         // Startup reconciliation is deliberately queued onto the manager worker
         // instead of awaited during plugin init. Slow RouterOS list scans must
         // not prevent the DNS service from coming up.
-        if active {
-            handle.request_reconcile();
-        }
+        handle.request_reconcile();
 
         // Pruning is local-memory only. It never talks to RouterOS and exists
         // solely to keep the write-suppression cache bounded.
@@ -1198,8 +1146,6 @@ async fn run_manager_worker(
     tag: String,
     mut manager: AddressListManager,
     handle: AddressListManagerHandle,
-    mut lifecycle_rx: mpsc::Receiver<LifecycleCommand>,
-    mut active: bool,
     mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
 ) {
     // Every state transition is serialized here. Request-path code only pushes
@@ -1233,12 +1179,11 @@ async fn run_manager_worker(
                 }
                 break;
             }
-            lifecycle = lifecycle_rx.recv() => lifecycle.map(WorkerCommand::Lifecycle),
-            () = manager.wait_for_background_reconcile(), if active => {
+            () = manager.wait_for_background_reconcile() => {
                 Some(WorkerCommand::ReconcileCompleted)
             }
-            control = handle.controls.recv(), if active => control.map(|(_, command)| WorkerCommand::Control(command)),
-            () = retry_wakeup, if active => {
+            control = handle.controls.recv() => control.map(|(_, command)| WorkerCommand::Control(command)),
+            () = retry_wakeup => {
                 let now = tokio::time::Instant::now();
                 let due_keys = retry_observations
                     .iter()
@@ -1264,11 +1209,11 @@ async fn run_manager_worker(
                     from_retry: true,
                 })
             }
-            () = reconcile_retry_wakeup, if active => {
+            () = reconcile_retry_wakeup => {
                 manager.reconcile_retry.mark_due();
                 Some(WorkerCommand::Control(ControlCommand::Reconcile))
             }
-            observation = handle.observations.recv(), if active => {
+            observation = handle.observations.recv() => {
                 observation.map(|first| {
                     let mut batch = vec![first];
                     while batch.len() < UPSERT_PIPELINE_SIZE {
@@ -1288,11 +1233,6 @@ async fn run_manager_worker(
             break;
         };
         match command {
-            WorkerCommand::Lifecycle(LifecycleCommand::Activate { done }) => {
-                active = true;
-                handle.request_reconcile();
-                let _ = done.send(());
-            }
             WorkerCommand::Observe {
                 mut batch,
                 from_retry,
@@ -1585,7 +1525,7 @@ mod observation_tests {
             fixed_ttl: Some(0),
             queue_capacity: 16_384,
         };
-        let handle = AddressListManagerHandle::new(&config, None, None);
+        let handle = AddressListManagerHandle::new(&config, None);
         let addr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         handle
             .try_observe(vec![ObservedAddr { addr, ttl_secs: 60 }], None)

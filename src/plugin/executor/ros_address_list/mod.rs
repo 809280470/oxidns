@@ -30,7 +30,7 @@
 
 use std::fs;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -419,7 +419,6 @@ impl MetricSource for RosMetrics {
 struct MikrotikExecutor {
     /// Plugin tag from the global registry.
     tag: String,
-    committed: AtomicBool,
     /// Shared observability counters.
     metrics: Arc<RosMetrics>,
     /// Fully validated immutable runtime config.
@@ -450,13 +449,15 @@ impl Plugin for MikrotikExecutor {
             return Ok(());
         };
 
-        let runtime = AddressListManagerRuntime::start_paused(self.tag.clone(), manager);
+        register_metric_source(self.metrics.clone())?;
+        let runtime = AddressListManagerRuntime::start(self.tag.clone(), manager);
         let manager_handle = runtime.handle();
         let mut runtime = Some(runtime);
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = runtime.take();
         }
         if let Some(runtime) = runtime {
+            unregister_metric_source(&self.tag);
             let _ = runtime.shutdown(AddressListCleanupScope::none()).await;
             return Err(DnsError::plugin(
                 "ros_address_list runtime lock is poisoned during initialization",
@@ -466,34 +467,11 @@ impl Plugin for MikrotikExecutor {
         Ok(())
     }
 
-    async fn commit(&self) {
-        if self.committed.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(handle) = &self.manager_handle else {
-            return;
-        };
-        match handle.activate().await {
-            Ok(()) => {
-                if let Err(error) = register_metric_source(self.metrics.clone()) {
-                    warn!(plugin = %self.tag, err = %error, "ros_address_list failed to register metrics");
-                }
-                self.committed.store(true, Ordering::Release);
-            }
-            Err(error) => {
-                warn!(plugin = %self.tag, err = %error, "ros_address_list failed to activate manager")
-            }
-        }
-    }
-
     async fn destroy(&self) -> Result<()> {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
-        let committed = self.committed.swap(false, Ordering::AcqRel);
-        if committed {
-            unregister_metric_source(&self.tag);
-        }
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
-            let cleanup_scope = if self.config.cleanup_on_shutdown && committed {
+            unregister_metric_source(&self.tag);
+            let cleanup_scope = if self.config.cleanup_on_shutdown {
                 AddressListCleanupScope::all()
             } else {
                 AddressListCleanupScope::none()
@@ -647,7 +625,6 @@ impl PluginFactory for MikrotikFactory {
 
         Ok(UninitializedPlugin::Executor(Box::new(MikrotikExecutor {
             tag: plugin_config.tag.clone(),
-            committed: AtomicBool::new(false),
             metrics,
             config,
             manager: Some(manager),
@@ -1349,40 +1326,6 @@ mod tests {
         assert_eq!(handle.queued_observations(), 2);
     }
 
-    #[tokio::test]
-    async fn paused_runtime_processes_queued_observations_after_activation() {
-        let api = Arc::new(MockMikrotikApi::default());
-        let cfg = default_cfg("address-activation");
-        let runtime = AddressListManagerRuntime::start_paused(
-            "address-activation".to_string(),
-            AddressListManager::new(api.clone(), cfg),
-        );
-        let handle = runtime.handle();
-        handle
-            .try_observe(
-                vec![ObservedAddr {
-                    addr: "203.0.113.92".parse().expect("ip"),
-                    ttl_secs: 300,
-                }],
-                None,
-            )
-            .expect("queue observation");
-        handle.activate().await.expect("activate runtime");
-        yield_until("runtime applies queued address", || {
-            api.state
-                .lock()
-                .expect("state")
-                .entries
-                .values()
-                .any(|entry| entry.key.address == "203.0.113.92".parse::<IpAddr>().unwrap())
-        })
-        .await;
-        runtime
-            .shutdown(AddressListCleanupScope::none())
-            .await
-            .expect("shutdown");
-    }
-
     fn a_record(ip: Ipv4Addr, ttl: u32) -> Record {
         Record::from_rdata(
             Name::from_ascii("example.com.").unwrap(),
@@ -1435,7 +1378,6 @@ mod tests {
         };
         MikrotikExecutor {
             tag: tag.to_string(),
-            committed: AtomicBool::new(false),
             metrics: Arc::new(RosMetrics::new(tag.to_string())),
             config,
             manager: Some(AddressListManager::new(api, manager_cfg)),
@@ -1443,12 +1385,6 @@ mod tests {
             runtime: Mutex::new(None),
             queue_logs: ErrorLogThrottle::default(),
         }
-    }
-
-    async fn init_and_commit_for_test(executor: &mut MikrotikExecutor) -> Result<()> {
-        executor.init_for_test().await?;
-        executor.commit().await;
-        Ok(())
     }
 
     async fn yield_until(description: &str, mut predicate: impl FnMut() -> bool) {
@@ -2265,7 +2201,7 @@ persistent:
         let api = Arc::new(MockMikrotikApi::default()) as Arc<dyn MikrotikApi>;
         let mut executor =
             build_executor_for_test("mk", true, false, Some("oxidns_ipv4"), None, api);
-        let _ = init_and_commit_for_test(&mut executor).await;
+        let _ = executor.init_for_test().await;
         let mut ctx = make_context();
         let step = executor.execute(&mut ctx).await.unwrap();
         assert!(matches!(step, ExecStep::Next));
@@ -2283,7 +2219,7 @@ persistent:
             Some("oxidns_ipv6"),
             api.clone() as Arc<dyn MikrotikApi>,
         );
-        let _ = init_and_commit_for_test(&mut executor).await;
+        let _ = executor.init_for_test().await;
         let mut ctx = make_context();
         ctx.set_response(response_with_records(vec![
             a_record(Ipv4Addr::new(1, 1, 1, 1), 300),
@@ -2318,7 +2254,7 @@ persistent:
             None,
             api as Arc<dyn MikrotikApi>,
         );
-        let _ = init_and_commit_for_test(&mut executor).await;
+        let _ = executor.init_for_test().await;
 
         let mut ctx = make_context();
         ctx.set_response(response_with_records(vec![a_record(
@@ -2341,7 +2277,7 @@ persistent:
             None,
             api.clone() as Arc<dyn MikrotikApi>,
         );
-        let _ = init_and_commit_for_test(&mut executor).await;
+        let _ = executor.init_for_test().await;
         let mut ctx = make_context();
         ctx.set_response(response_with_records(vec![a_record(
             Ipv4Addr::new(6, 6, 6, 6),
@@ -2371,7 +2307,7 @@ persistent:
             None,
             api.clone() as Arc<dyn MikrotikApi>,
         );
-        init_and_commit_for_test(&mut executor).await.unwrap();
+        executor.init_for_test().await.unwrap();
 
         let mut ctx = make_context();
         ctx.set_response(response_with_records(vec![a_record(
@@ -2403,7 +2339,7 @@ persistent:
             None,
             api.clone() as Arc<dyn MikrotikApi>,
         );
-        init_and_commit_for_test(&mut executor).await.unwrap();
+        executor.init_for_test().await.unwrap();
 
         let mut ctx = make_context();
         ctx.set_response(response_with_records(vec![a_record(
@@ -2461,7 +2397,7 @@ persistent:
             None,
             api.clone() as Arc<dyn MikrotikApi>,
         );
-        let _ = init_and_commit_for_test(&mut executor).await;
+        let _ = executor.init_for_test().await;
         let _ = executor.destroy().await;
 
         let state = api.state.lock().unwrap();

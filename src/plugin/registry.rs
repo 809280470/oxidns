@@ -538,17 +538,6 @@ impl PluginRegistry {
             .count()
     }
 
-    /// Commit plugins after the runtime swap and previous-runtime drain.
-    pub async fn commit(&self) {
-        let order = lock_mutex(&self.init_order).clone();
-        for tag in order {
-            let entry = self.plugins.get(&tag).map(|entry| entry.value().clone());
-            if let Some(entry) = entry {
-                entry.as_plugin().commit().await;
-            }
-        }
-    }
-
     /// Destroy all initialized plugins in reverse init order
     pub async fn destroy(&self) {
         let order = lock_mutex(&self.init_order).clone();

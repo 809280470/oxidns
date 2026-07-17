@@ -31,7 +31,7 @@
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -276,7 +276,6 @@ use crate::infra::system::deserialize_duration_option;
 #[derive(Debug)]
 struct MikrotikExecutor {
     tag: String,
-    committed: AtomicBool,
     metrics: Arc<RosRouteMetrics>,
     config: MikrotikConfig,
     manager: Option<RouteManager>,
@@ -476,13 +475,15 @@ impl Plugin for MikrotikExecutor {
             return Ok(());
         };
 
-        let runtime = RouteManagerRuntime::start_paused(self.tag.clone(), manager);
+        register_metric_source(self.metrics.clone())?;
+        let runtime = RouteManagerRuntime::start(self.tag.clone(), manager);
         let manager_handle = runtime.handle();
         let mut runtime = Some(runtime);
         if let Ok(mut slot) = self.runtime.lock() {
             *slot = runtime.take();
         }
         if let Some(runtime) = runtime {
+            unregister_metric_source(&self.tag);
             let _ = runtime.shutdown(false).await;
             return Err(DnsError::plugin(
                 "ros_route runtime lock is poisoned during initialization",
@@ -492,35 +493,12 @@ impl Plugin for MikrotikExecutor {
         Ok(())
     }
 
-    async fn commit(&self) {
-        if self.committed.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(handle) = &self.manager_handle else {
-            return;
-        };
-        match handle.activate().await {
-            Ok(()) => {
-                if let Err(error) = register_metric_source(self.metrics.clone()) {
-                    warn!(plugin = %self.tag, err = %error, "ros_route failed to register metrics");
-                }
-                self.committed.store(true, Ordering::Release);
-            }
-            Err(error) => {
-                warn!(plugin = %self.tag, err = %error, "ros_route failed to activate manager")
-            }
-        }
-    }
-
     async fn destroy(&self) -> Result<()> {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
-        let committed = self.committed.swap(false, Ordering::AcqRel);
-        if committed {
-            unregister_metric_source(&self.tag);
-        }
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
+            unregister_metric_source(&self.tag);
             return runtime
-                .shutdown_until(self.config.cleanup_on_shutdown && committed, deadline)
+                .shutdown_until(self.config.cleanup_on_shutdown, deadline)
                 .await;
         }
         Ok(())
@@ -672,7 +650,6 @@ impl PluginFactory for MikrotikFactory {
 
         Ok(UninitializedPlugin::Executor(Box::new(MikrotikExecutor {
             tag: plugin_config.tag.clone(),
-            committed: AtomicBool::new(false),
             metrics,
             config,
             manager: Some(manager),
