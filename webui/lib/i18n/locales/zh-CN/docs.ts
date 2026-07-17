@@ -376,6 +376,8 @@ export const zhCNDocs = {
     send_timeout: "- 类型：`u64`；默认：`5`\n- RouterOS API 命令发送超时秒数，必须大于 `0`。",
     receive_timeout: "- 类型：`u64`；默认：`5`\n- RouterOS API 单段响应等待超时秒数，必须大于 `0`。",
     async: "- 类型：`bool`；默认：`true`\n- `true` 只投递后台同步；`false` 等待当前观测的一次同步尝试，但不会改变 DNS 应答。",
+    wait_timeout: "- 类型：`duration`；默认：`8s`\n- 仅在 `async: false` 时限制等待；超时后任务继续在后台执行。",
+    queue_capacity: "- 类型：`usize`；默认：`16384`\n- 分别限制入口队列和重试积压中的不同路由 key。",
     routing_table: "- 类型：`string`；必填：是\n- 目标策略路由表；插件不会创建 routing table 或 routing rule。",
     gateway4: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv4 路由下一跳。",
     gateway6: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv6 路由下一跳。",
@@ -405,6 +407,10 @@ export const zhCNDocs = {
       "- 类型：`u64`；必填：否；默认值：`5`\n- 作用：指定等待下一段 RouterOS API 响应数据的上限，单位为秒。\n- 配置建议：建议为 OxiDNS 使用专用且规模可控的 `address-list`，不建议接入已有的大型共享列表。只有在存量环境无法避免慢列表查询或 RouterOS 管理面响应较慢时，才考虑将该值调大，例如 `30` 或 `60`。",
     async:
       "- 类型：`bool`；必填：否；默认值：`true`\n- 作用：控制地址写入行为是否采用异步方式。启用后，DNS 应答路径只负责投递任务，由后台管理器完成与 RouterOS 的交互。\n- 影响：异步模式有助于降低请求路径阻塞风险；关闭后会改为同步提交，更适合需要立即确认提交结果的场景。",
+    wait_timeout:
+      "- 类型：`duration`；默认值：`8s`\n- 仅在 `async: false` 时限制等待；超时后任务继续在后台执行，不改变 DNS 响应。",
+    queue_capacity:
+      "- 类型：`usize`；默认值：`16384`\n- 分别限制入口队列和重试积压中的不同 IP。",
     address_list4:
       "- 类型：`string`；必填：否；默认值：无\n- 作用：指定 IPv4 地址写入的目标 `address-list` 名称。插件从 DNS 应答中提取到 A 记录后，将写入该列表。\n- 配置建议：如果策略仅处理 IPv4，应至少配置本项。",
     address_list6:

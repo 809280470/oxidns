@@ -210,6 +210,17 @@ async: true
 * 启动阶段的 RouterOS address-list 扫描在后台执行；即使存量列表查询较慢或管理面响应慢，也不应阻塞 DNS 服务启动。
 * 后台化只降低对 DNS 启动和请求路径的影响，不代表推荐接入大型 address-list。
 
+### `wait_timeout` / `queue_capacity`
+
+```yaml
+wait_timeout: 8s
+queue_capacity: 16384
+```
+
+* `wait_timeout` 仅在 `async: false` 时限制 DNS 请求等待时间；超时后已接收的 RouterOS 任务继续在后台执行。它不是 API 接收超时，也不替代 `receive_timeout`。
+* `queue_capacity` 分别限制入口去重队列和重试积压中的不同 IP 数量。同一 IP 会合并，满载时只丢弃新的不同 IP，DNS 响应不受影响。
+* persistent 文件仅在插件初始化或 reload 时读取；启动恢复和每 180 秒一次的持久项对账都使用内存集合。动态项不参与定时全表对账。
+
 ### `min_ttl` / `max_ttl`
 
 ```yaml
@@ -347,7 +358,7 @@ RouterOS 读取目标 IP，检查它是否属于 OxiDNS 维护的 `address-list`
 若场景对“首包必须命中策略路由”具有极高敏感性，可采用以下方式：
 
 * 把极关键目标放入 `persistent`。
-* 或者使用 `async: false`，但要接受 DNS 路径延迟上升的代价。
+* 或者使用 `async: false`，但要接受 DNS 路径最多增加 `wait_timeout` 的等待；超时不取消后台写入。
 
 ## 常见组合方式
 

@@ -50,6 +50,7 @@ impl ReconcileRetry {
 
 #[derive(Debug)]
 pub(crate) struct VersionedSnapshot<T> {
+    #[allow(dead_code)]
     pub(crate) generation: u64,
     pub(crate) value: T,
 }

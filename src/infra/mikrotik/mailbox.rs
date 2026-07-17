@@ -32,9 +32,6 @@ pub(crate) enum TryPushError<V> {
     Closed(V),
 }
 
-#[derive(Debug)]
-pub(crate) struct PushError<V>(pub(crate) V);
-
 struct MailboxState<K, V> {
     values: AHashMap<K, V>,
     order: VecDeque<K>,
@@ -45,7 +42,6 @@ struct MailboxInner<K, V> {
     capacity: usize,
     state: Mutex<MailboxState<K, V>>,
     items_ready: Notify,
-    space_ready: Notify,
 }
 
 pub(crate) struct KeyedMailbox<K, V> {
@@ -94,7 +90,6 @@ where
                     closed: false,
                 }),
                 items_ready: Notify::new(),
-                space_ready: Notify::new(),
             }),
         }
     }
@@ -126,20 +121,6 @@ where
         Ok(PushOutcome::Inserted)
     }
 
-    pub(crate) async fn push(&self, key: K, mut value: V) -> Result<PushOutcome, PushError<V>> {
-        loop {
-            let notified = self.inner.space_ready.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.try_push(key.clone(), value) {
-                Ok(outcome) => return Ok(outcome),
-                Err(TryPushError::Closed(value)) => return Err(PushError(value)),
-                Err(TryPushError::Full(returned)) => value = returned,
-            }
-            notified.await;
-        }
-    }
-
     // Used by ros_address_list batching; it is intentionally unused in a
     // minimal build that enables only ros_route.
     #[allow(dead_code)]
@@ -155,7 +136,6 @@ where
             .remove(&key)
             .expect("mailbox order and values must remain consistent");
         drop(state);
-        self.inner.space_ready.notify_one();
         Some((key, value))
     }
 
@@ -170,7 +150,6 @@ where
         let value = state.values.remove(key)?;
         state.order.retain(|queued| queued != key);
         drop(state);
-        self.inner.space_ready.notify_one();
         Some(value)
     }
 
@@ -191,7 +170,6 @@ where
                         .remove(&key)
                         .expect("mailbox order and values must remain consistent");
                     drop(state);
-                    self.inner.space_ready.notify_one();
                     return Some((key, value));
                 }
                 if state.closed {
@@ -214,8 +192,6 @@ where
         drop(state);
         self.inner.items_ready.notify_waiters();
         self.inner.items_ready.notify_one();
-        self.inner.space_ready.notify_waiters();
-        self.inner.space_ready.notify_one();
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -255,23 +231,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_push_resumes_when_distinct_key_is_consumed() {
-        let mailbox = KeyedMailbox::new(1);
-        mailbox.try_push("a", Latest(1)).expect("first item");
-        let producer = {
-            let mailbox = mailbox.clone();
-            tokio::spawn(async move { mailbox.push("b", Latest(2)).await })
-        };
-
-        assert_eq!(mailbox.recv().await, Some(("a", Latest(1))));
-        assert_eq!(
-            producer.await.expect("producer").expect("push"),
-            PushOutcome::Inserted
-        );
-        assert_eq!(mailbox.recv().await, Some(("b", Latest(2))));
-    }
-
-    #[tokio::test]
     async fn close_wakes_receiver_and_rejects_producer() {
         let mailbox = KeyedMailbox::<&str, Latest>::new(1);
         mailbox.try_push("queued", Latest(0)).expect("queued item");
@@ -283,26 +242,6 @@ mod tests {
             mailbox.try_push("a", Latest(1)),
             Err(TryPushError::Closed(Latest(1)))
         ));
-    }
-
-    #[tokio::test]
-    async fn close_wakes_all_blocked_producers() {
-        let mailbox = KeyedMailbox::new(1);
-        mailbox.try_push("a", Latest(1)).expect("first item");
-        let first = {
-            let mailbox = mailbox.clone();
-            tokio::spawn(async move { mailbox.push("b", Latest(2)).await })
-        };
-        let second = {
-            let mailbox = mailbox.clone();
-            tokio::spawn(async move { mailbox.push("c", Latest(3)).await })
-        };
-        tokio::task::yield_now().await;
-
-        mailbox.close();
-
-        assert!(first.await.expect("first producer").is_err());
-        assert!(second.await.expect("second producer").is_err());
     }
 
     #[test]

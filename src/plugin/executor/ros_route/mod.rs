@@ -61,7 +61,8 @@ const DEFAULT_CLEANUP_ON_SHUTDOWN: bool = true;
 const DEFAULT_CONNTRACK_GUARD: bool = false;
 const DEFAULT_ROUTE_DISTANCE: u8 = 100;
 const DEFAULT_COMMENT_PREFIX: &str = "oxi";
-const SYNC_OBSERVE_TIMEOUT_SECS: u64 = 8;
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+const DEFAULT_QUEUE_CAPACITY: usize = 16_384;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +85,9 @@ struct MikrotikConfigArgs {
     /// (`true`).
     #[serde(rename = "async")]
     async_mode: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_duration_option")]
+    wait_timeout: Option<Duration>,
+    queue_capacity: Option<usize>,
     /// Dedicated RouterOS routing table for managed routes.
     routing_table: Option<String>,
     /// IPv4 gateway value for managed IPv4 routes.
@@ -126,6 +130,8 @@ struct MikrotikConfig {
     connection: Option<RouterOsConnectionConfig>,
     /// Async mode switch for post stage RouterOS writes.
     async_mode: bool,
+    wait_timeout: Duration,
+    queue_capacity: usize,
     /// Dedicated RouterOS routing table for this plugin.
     routing_table: String,
     /// Optional IPv4 gateway.
@@ -203,6 +209,14 @@ impl MikrotikConfigArgs {
         }
         // `0` deliberately means a dynamic route that never expires by time.
         let fixed_ttl = self.fixed_ttl;
+        let wait_timeout = positive_duration(
+            self.wait_timeout.unwrap_or(DEFAULT_WAIT_TIMEOUT),
+            "wait_timeout",
+        )?;
+        let queue_capacity = positive_usize(
+            self.queue_capacity.unwrap_or(DEFAULT_QUEUE_CAPACITY),
+            "queue_capacity",
+        )?;
         let parsed_persistent =
             parse_persistent_ips(self.persistent, gateway4.is_some(), gateway6.is_some())?;
         let ignored_by_gateway = parsed_persistent.ignored_by_gateway;
@@ -223,6 +237,8 @@ impl MikrotikConfigArgs {
         Ok(MikrotikConfig {
             connection: Some(connection),
             async_mode: self.async_mode.unwrap_or(DEFAULT_ASYNC_MODE),
+            wait_timeout,
+            queue_capacity,
             routing_table,
             gateway4,
             gateway6,
@@ -252,8 +268,10 @@ use self::manager::{
     ObserveEnqueueError, RouteManager, RouteManagerConfig, RouteManagerHandle, RouteManagerRuntime,
 };
 use crate::infra::mikrotik::ip_prefix::IpPrefix;
+use crate::infra::mikrotik::throttle::ErrorLogThrottle;
 use crate::infra::mikrotik::transport::{RouterOsConnectionConfig, RouterOsTlsArgs};
 use crate::infra::mikrotik::{ObservedAddr, SHUTDOWN_TIMEOUT, collect_observed_addrs};
+use crate::infra::system::deserialize_duration_option;
 
 #[derive(Debug)]
 struct MikrotikExecutor {
@@ -264,6 +282,7 @@ struct MikrotikExecutor {
     manager: Option<RouteManager>,
     manager_handle: Option<RouteManagerHandle>,
     runtime: Mutex<Option<RouteManagerRuntime>>,
+    queue_logs: ErrorLogThrottle,
 }
 
 #[derive(Debug)]
@@ -273,6 +292,9 @@ struct RosRouteMetrics {
     dropped_total: AtomicU64,
     sync_error_total: AtomicU64,
     sync_timeout_total: AtomicU64,
+    write_success_total: AtomicU64,
+    write_error_total: AtomicU64,
+    last_write_success_timestamp_seconds: AtomicU64,
     delete_deferred_total: AtomicU64,
     connection_check_error_total: AtomicU64,
     pending_observations: AtomicU64,
@@ -295,6 +317,9 @@ impl RosRouteMetrics {
             dropped_total: AtomicU64::new(0),
             sync_error_total: AtomicU64::new(0),
             sync_timeout_total: AtomicU64::new(0),
+            write_success_total: AtomicU64::new(0),
+            write_error_total: AtomicU64::new(0),
+            last_write_success_timestamp_seconds: AtomicU64::new(0),
             delete_deferred_total: AtomicU64::new(0),
             connection_check_error_total: AtomicU64::new(0),
             pending_observations: AtomicU64::new(0),
@@ -370,6 +395,12 @@ impl MetricSource for RosRouteMetrics {
                 self.managed_entries.load(Ordering::Relaxed),
             ),
             (
+                "ros_route_last_write_success_timestamp_seconds",
+                "Unix timestamp of the last successful route upsert.",
+                self.last_write_success_timestamp_seconds
+                    .load(Ordering::Relaxed),
+            ),
+            (
                 "ros_route_last_reconcile_success_timestamp_seconds",
                 "Unix timestamp of the last successful route reconcile.",
                 self.last_reconcile_success_timestamp_seconds
@@ -384,6 +415,16 @@ impl MetricSource for RosRouteMetrics {
             sink.emit(MetricSample::gauge(name, help, &labels, value));
         }
         for (name, help, value) in [
+            (
+                "ros_route_write_success_total",
+                "Total successful RouterOS route upserts.",
+                self.write_success_total.load(Ordering::Relaxed),
+            ),
+            (
+                "ros_route_write_error_total",
+                "Total failed RouterOS route upserts.",
+                self.write_error_total.load(Ordering::Relaxed),
+            ),
             (
                 "ros_route_coalesced_total",
                 "Total route observations merged into an existing mailbox key.",
@@ -517,10 +558,12 @@ impl Executor for MikrotikExecutor {
                 Ok(_) => {}
                 Err(ObserveEnqueueError::Full) => {
                     self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        plugin = %self.tag,
-                        "ros_route observe queue is full, observation dropped"
-                    );
+                    if self.queue_logs.should_log("full") {
+                        warn!(
+                            plugin = %self.tag,
+                            "ros_route observe queue is full, observation dropped"
+                        );
+                    }
                 }
                 Err(ObserveEnqueueError::Closed) => {
                     self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
@@ -534,28 +577,16 @@ impl Executor for MikrotikExecutor {
         }
 
         let (wait_tx, wait_rx) = oneshot::channel::<Result<()>>();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(SYNC_OBSERVE_TIMEOUT_SECS);
-        let send_outcome = tokio::time::timeout_at(deadline, handle.observe(addrs, wait_tx)).await;
-        match send_outcome {
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => {
+        let deadline = tokio::time::Instant::now() + self.config.wait_timeout;
+        match handle.try_observe(addrs, Some(wait_tx)) {
+            Ok(_) => {}
+            Err(_) => {
                 self.metrics
                     .sync_error_total
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     plugin = %self.tag,
                     "ros_route manager channel closed in sync mode, DNS response is kept unchanged"
-                );
-                return Ok(step);
-            }
-            Err(_) => {
-                self.metrics
-                    .sync_timeout_total
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    plugin = %self.tag,
-                    timeout_secs = SYNC_OBSERVE_TIMEOUT_SECS,
-                    "ros_route observe enqueue timed out in sync mode, DNS response is kept unchanged"
                 );
                 return Ok(step);
             }
@@ -591,7 +622,7 @@ impl Executor for MikrotikExecutor {
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     plugin = %self.tag,
-                    timeout_secs = SYNC_OBSERVE_TIMEOUT_SECS,
+                    timeout_ms = self.config.wait_timeout.as_millis(),
                     "ros_route observe timed out in sync mode, DNS response is kept unchanged"
                 );
                 Ok(step)
@@ -634,6 +665,7 @@ impl PluginFactory for MikrotikFactory {
             max_ttl: config.max_ttl,
             fixed_ttl: config.fixed_ttl,
             conntrack_guard: config.conntrack_guard,
+            queue_capacity: config.queue_capacity,
         };
         let metrics = Arc::new(RosRouteMetrics::new(plugin_config.tag.clone()));
         let manager = RouteManager::with_metrics(api, manager_cfg, metrics.clone());
@@ -646,6 +678,7 @@ impl PluginFactory for MikrotikFactory {
             manager: Some(manager),
             manager_handle: None,
             runtime: Mutex::new(None),
+            queue_logs: ErrorLogThrottle::default(),
         })))
     }
 }
@@ -723,6 +756,24 @@ fn timeout_secs(value: Option<u64>, field: &str, default_secs: u64) -> Result<u6
         Some(value) => Ok(value),
         None => Ok(default_secs),
     }
+}
+
+fn positive_duration(value: Duration, field: &str) -> Result<Duration> {
+    if value.is_zero() {
+        return Err(DnsError::plugin(format!(
+            "ros_route '{field}' must be greater than 0"
+        )));
+    }
+    Ok(value)
+}
+
+fn positive_usize(value: usize, field: &str) -> Result<usize> {
+    if value == 0 {
+        return Err(DnsError::plugin(format!(
+            "ros_route '{field}' must be greater than 0"
+        )));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Default)]
@@ -1026,6 +1077,32 @@ fixed_ttl: 0
         .expect("yaml");
         let parsed = parse_plugin_config(Some(args), false).expect("config");
         assert_eq!(parsed.fixed_ttl, Some(0));
+    }
+
+    #[test]
+    fn config_defaults_and_accepts_wait_and_queue_settings() {
+        let defaults = observation_config();
+        assert_eq!(defaults.wait_timeout, DEFAULT_WAIT_TIMEOUT);
+        assert_eq!(defaults.queue_capacity, DEFAULT_QUEUE_CAPACITY);
+
+        let args = serde_yaml_ng::from_str::<Value>(
+            "address: 127.0.0.1:8728\nusername: api\npassword: secret\nrouting_table: policy\ngateway4: 192.0.2.1\nwait_timeout: 1500ms\nqueue_capacity: 32\n",
+        )
+        .expect("yaml");
+        let parsed = parse_plugin_config(Some(args), false).expect("config");
+        assert_eq!(parsed.wait_timeout, Duration::from_millis(1_500));
+        assert_eq!(parsed.queue_capacity, 32);
+    }
+
+    #[test]
+    fn config_rejects_zero_wait_and_queue_settings() {
+        for invalid in ["wait_timeout: 0s", "queue_capacity: 0"] {
+            let yaml = format!(
+                "address: 127.0.0.1:8728\nusername: api\npassword: secret\nrouting_table: policy\ngateway4: 192.0.2.1\n{invalid}\n"
+            );
+            let value = serde_yaml_ng::from_str::<Value>(&yaml).expect("yaml");
+            assert!(parse_plugin_config(Some(value), false).is_err());
+        }
     }
 
     #[test]

@@ -380,6 +380,8 @@ export const enUSDocs = {
     send_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API command-send timeout in seconds; must be greater than `0`.",
     receive_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API per-response-chunk timeout in seconds; must be greater than `0`.",
     async: "- Type: `bool`; Default: `true`\n- `true` queues background synchronization; `false` waits for one attempt for the current observation without changing the DNS response.",
+    wait_timeout: "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout.",
+    queue_capacity: "- Type: `usize`; Default: `16384`\n- Independently limits distinct route keys in ingress and retry stages.",
     routing_table: "- Type: `string`; Required: yes\n- Target policy-routing table; the plugin does not create tables or routing rules.",
     gateway4: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv4 route next hop.",
     gateway6: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
@@ -409,6 +411,10 @@ export const enUSDocs = {
       "- Type: `u64`; Required: No; Default: `5`\n- Function: Specify the maximum wait time, in seconds, for the next chunk of RouterOS API response data.\n- Configuration recommendation: Prefer a dedicated, size-controlled `address-list` for OxiDNS. Avoid connecting the plugin to an existing large shared list. Increase this value, for example to `30` or `60`, only when slow legacy list queries or a slow RouterOS management plane cannot be avoided.",
     async:
       "- Type: `bool`; required: no; default value: `true`\n- Function: Control whether the address writing behavior is asynchronous. When enabled, the DNS response path is only responsible for delivery tasks, and the background manager completes the interaction with RouterOS.\n- Impact: Asynchronous mode helps reduce the risk of request path blocking; after closing, it will be changed to synchronous submission, which is more suitable for scenarios that require immediate confirmation of submission results.",
+    wait_timeout:
+      "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout without changing DNS output.",
+    queue_capacity:
+      "- Type: `usize`; Default: `16384`\n- Independently limits distinct IPs in ingress and retry stages.",
     address_list4:
       "- Type: `string`; Required: No; Default: None\n- Function: Specify the target `address-list` name for writing IPv4 addresses. After the plugin extracts the A records from the DNS answer, it writes to this list.\n- Configuration recommendation: If the policy only handles IPv4, at least this item should be configured.",
     address_list6:

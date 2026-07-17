@@ -210,6 +210,17 @@ Why:
 * Startup-time RouterOS address-list scans run in the background, so slow legacy list queries or a slow management plane should not block DNS service startup.
 * Backgrounding reduces the impact on DNS startup and the request path, but it does not make large address lists a recommended target.
 
+### `wait_timeout` / `queue_capacity`
+
+```yaml
+wait_timeout: 8s
+queue_capacity: 16384
+```
+
+* `wait_timeout` applies only with `async: false`; once it expires, accepted RouterOS work continues in the background. It is not an API receive timeout and does not replace `receive_timeout`.
+* `queue_capacity` independently limits distinct IPs in the coalescing ingress queue and retry backlog. Existing IPs still merge; only a new distinct IP is dropped at capacity, without changing the DNS response.
+* Persistent files are read only during initialization or reload. Startup recovery and the 180-second persistent reconcile use the in-memory set; dynamic entries are excluded from periodic full-table reconcile.
+
 ### `min_ttl` / `max_ttl`
 
 ```yaml
@@ -347,7 +358,7 @@ The impact can be reduced from three angles:
 For environments where "the very first packet must already hit policy routing" is a strict requirement:
 
 * Put the most critical targets into `persistent`, or
-* Use `async: false` and accept the added latency on the DNS path.
+* Use `async: false` and accept up to `wait_timeout` of added DNS-path waiting; a timeout does not cancel the background write.
 
 ## Common Composition Patterns
 

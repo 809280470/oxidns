@@ -1508,6 +1508,14 @@ export const zhCNPluginDefined = {
         send_timeout: { label: "发送超时" },
         receive_timeout: { label: "接收超时" },
         async: { label: "异步提交" },
+        wait_timeout: {
+          label: "同步等待时间",
+          description: "仅 async=false 时生效；超时后已接收任务继续在后台执行。",
+        },
+        queue_capacity: {
+          label: "队列容量",
+          description: "分别限制入口队列和重试积压中的不同路由 key。",
+        },
         routing_table: { label: "路由表", placeholder: "via_proxy" },
         gateway4: { label: "IPv4 网关", placeholder: "192.168.88.2@main" },
         gateway6: { label: "IPv6 网关", placeholder: "fe80::2%ether1" },
@@ -1584,6 +1592,14 @@ export const zhCNPluginDefined = {
         async: {
           label: "异步提交",
           description: "控制地址写入行为是否采用异步方式。",
+        },
+        wait_timeout: {
+          label: "同步等待时间",
+          description: "仅 async=false 时生效；超时后已接收任务继续在后台执行。",
+        },
+        queue_capacity: {
+          label: "队列容量",
+          description: "分别限制入口队列和重试积压中的不同 IP。",
         },
         address_list4: {
           label: "IPv4 Address List",

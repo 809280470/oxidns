@@ -155,40 +155,6 @@ pub(super) fn decode_owned_comment(
         .flatten()
 }
 
-pub(super) fn parse_routeros_duration_secs(raw: &str) -> Option<u32> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let bytes = raw.as_bytes();
-    let mut index = 0;
-    let mut total = 0u64;
-    while index < bytes.len() {
-        let number_start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if number_start == index {
-            return None;
-        }
-        let value = raw[number_start..index].parse::<u64>().ok()?;
-        let unit_start = index;
-        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
-            index += 1;
-        }
-        let multiplier = match &raw[unit_start..index] {
-            "w" => 7 * 24 * 60 * 60,
-            "d" => 24 * 60 * 60,
-            "h" => 60 * 60,
-            "m" => 60,
-            "s" => 1,
-            _ => return None,
-        };
-        total = total.saturating_add(value.saturating_mul(multiplier));
-    }
-    Some(total.min(u64::from(u32::MAX)) as u32)
-}
-
 pub(super) fn parse_router_address(family: AddressListFamily, raw: &str) -> Option<(IpAddr, u8)> {
     let value = raw.trim();
     if let Some((ip_raw, prefix_raw)) = value.split_once('/') {

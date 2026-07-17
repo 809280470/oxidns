@@ -362,6 +362,12 @@ export function PluginConfigFieldsEditor({
   readOnly = false,
 }: PluginConfigFieldsEditorProps) {
   const { t } = useI18n();
+  const regularFields = fields.filter((field) => !field.advanced);
+  const advancedFields = fields.filter((field) => field.advanced);
+  const hasConfiguredAdvancedValue = advancedFields.some((field) =>
+    hasMeaningfulAdvancedValue(values[field.key], field.default),
+  );
+  const [advancedOpen, setAdvancedOpen] = useState(hasConfiguredAdvancedValue);
   const updateConfig = (key: string, value: unknown) => {
     onChange({ ...values, [key]: value });
   };
@@ -374,34 +380,67 @@ export function PluginConfigFieldsEditor({
     );
   }
 
+  const renderFields = (items: ConfigField[]) => (
+    <div className="oxidns-config-fields-grid w-full">
+      {items.map((field) => (
+        <Field
+          key={field.key}
+          className={cn(
+            isFullWidthConfigField(field) && "@md/field-group:col-span-2",
+          )}
+        >
+          <ConfigFieldLabel field={field} />
+          <ConfigFieldControl
+            field={field}
+            plugins={plugins}
+            value={values[field.key]}
+            onChange={(value) => updateConfig(field.key, value)}
+            defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
+            readOnly={readOnly}
+          />
+        </Field>
+      ))}
+    </div>
+  );
+
   return (
     <FieldGroup>
       {/* Grid layout lives on a child element rather than on FieldGroup
           itself, because FieldGroup establishes `@container/field-group`
           and CSS container queries cannot match the container element they
           establish — only its descendants. */}
-      <div className="oxidns-config-fields-grid w-full">
-        {fields.map((field) => (
-          <Field
-            key={field.key}
-            className={cn(
-              isFullWidthConfigField(field) && "@md/field-group:col-span-2",
-            )}
+      {renderFields(regularFields)}
+      {advancedFields.length > 0 && (
+        <div className="w-full rounded-lg border border-border/70">
+          <button
+            type="button"
+            className="flex w-full items-center justify-between px-3 py-2 text-sm font-medium"
+            onClick={() => setAdvancedOpen((open) => !open)}
+            aria-expanded={advancedOpen}
           >
-            <ConfigFieldLabel field={field} />
-            <ConfigFieldControl
-              field={field}
-              plugins={plugins}
-              value={values[field.key]}
-              onChange={(value) => updateConfig(field.key, value)}
-              defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
-              readOnly={readOnly}
+            {t(WEBUI.plugins.advancedSettings)}
+            <ChevronDown
+              className={cn(
+                "size-4 transition-transform",
+                advancedOpen && "rotate-180",
+              )}
             />
-          </Field>
-        ))}
-      </div>
+          </button>
+          {advancedOpen && <div className="border-t p-3">{renderFields(advancedFields)}</div>}
+        </div>
+      )}
     </FieldGroup>
   );
+}
+
+function hasMeaningfulAdvancedValue(value: unknown, defaultValue: unknown) {
+  if (value === undefined || value === null || value === "") return false;
+  if (defaultValue !== undefined) {
+    return JSON.stringify(value) !== JSON.stringify(defaultValue);
+  }
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
 }
 
 function isFullWidthConfigField(field: ConfigField): boolean {

@@ -11,10 +11,7 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder};
 
-use super::model::{
-    AddressListFamily, AddressListKey, OwnedCommentKind, decode_owned_comment,
-    parse_router_address, parse_routeros_duration_secs,
-};
+use super::model::{AddressListFamily, AddressListKey, decode_owned_comment, parse_router_address};
 use crate::infra::error::{DnsError, Result};
 use crate::infra::mikrotik::batching::join_all_bounded;
 use crate::infra::mikrotik::transport::{
@@ -102,15 +99,6 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         plugin_tag: &str,
         refresh_timeout: bool,
     ) -> Result<Option<()>>;
-    /// Collapse duplicate rows of one owned kind without creating or
-    /// refreshing an entry. The returned row is re-read after cleanup.
-    async fn dedupe_owned_entries(
-        &self,
-        key: &AddressListKey,
-        comment_prefix: &str,
-        plugin_tag: &str,
-        kind: OwnedCommentKind,
-    ) -> Result<Option<RouterListEntry>>;
     /// Re-read one row and delete it only while the ownership-relevant
     /// snapshot still matches.
     async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool>;
@@ -340,42 +328,8 @@ fn parse_router_list_entry(
     }))
 }
 
-fn timeout_snapshot_matches(expected: Option<&str>, current: Option<&str>) -> bool {
-    match (expected, current) {
-        (None, None) => true,
-        (Some(expected), Some(current)) => {
-            match (
-                parse_routeros_duration_secs(expected),
-                parse_routeros_duration_secs(current),
-            ) {
-                // RouterOS counts timed entries down between the two reads.
-                // A larger current value means the row was refreshed after
-                // the snapshot and must not be removed by the older action.
-                (Some(expected), Some(current)) => current <= expected,
-                _ => current == expected,
-            }
-        }
-        _ => false,
-    }
-}
-
 fn entry_matches_delete_snapshot(expected: &RouterListEntry, current: &RouterListEntry) -> bool {
-    current.id == expected.id
-        && current.key == expected.key
-        && current.comment == expected.comment
-        && timeout_snapshot_matches(expected.timeout.as_deref(), current.timeout.as_deref())
-}
-
-fn timeout_rank(entry: &RouterListEntry) -> (bool, u32) {
-    match entry
-        .timeout
-        .as_deref()
-        .and_then(parse_routeros_duration_secs)
-        .filter(|seconds| *seconds > 0)
-    {
-        Some(seconds) => (false, seconds),
-        None => (true, 0),
-    }
+    current.id == expected.id && current.key == expected.key && current.comment == expected.comment
 }
 
 #[async_trait]
@@ -514,56 +468,6 @@ impl MikrotikApi for MikrotikRsClient {
         Ok(Some(()))
     }
 
-    async fn dedupe_owned_entries(
-        &self,
-        key: &AddressListKey,
-        comment_prefix: &str,
-        plugin_tag: &str,
-        kind: OwnedCommentKind,
-    ) -> Result<Option<RouterListEntry>> {
-        let mut owned = self
-            .find_entries_by_key(key)
-            .await?
-            .into_iter()
-            .filter(|entry| {
-                decode_owned_comment(comment_prefix, plugin_tag, entry.comment.as_deref())
-                    .is_some_and(|meta| meta.kind == kind)
-            })
-            .collect::<Vec<_>>();
-
-        if owned.len() <= 1 {
-            return Ok(owned.pop());
-        }
-
-        let canonical = owned
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, entry)| timeout_rank(entry))
-            .map(|(index, _)| index)
-            .expect("duplicate owned rows are non-empty");
-        owned.swap_remove(canonical);
-        // A false result can mean either natural expiry or a concurrent
-        // refresh. Re-read below to distinguish convergence from a race.
-        self.delete_entries_if_matches(owned).await?;
-
-        let mut current = self
-            .find_entries_by_key(key)
-            .await?
-            .into_iter()
-            .filter(|entry| {
-                decode_owned_comment(comment_prefix, plugin_tag, entry.comment.as_deref())
-                    .is_some_and(|meta| meta.kind == kind)
-            })
-            .collect::<Vec<_>>();
-        match current.len() {
-            0 => Ok(None),
-            1 => Ok(current.pop()),
-            _ => Err(DnsError::plugin(
-                "ros_address_list entries changed during duplicate cleanup",
-            )),
-        }
-    }
-
     async fn delete_entry_if_matches(&self, expected: &RouterListEntry) -> Result<bool> {
         let current = self.find_entries_by_key(&expected.key).await?;
         let Some(current) = current
@@ -623,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_snapshot_allows_countdown_but_rejects_refresh_or_ownership_change() {
+    fn delete_snapshot_ignores_timeout_changes_but_rejects_ownership_change() {
         let key = AddressListKey::new("192.0.2.10".parse().expect("ip"), "policy".to_string());
         let expected = RouterListEntry {
             id: "*1".to_string(),
@@ -636,7 +540,7 @@ mod tests {
         assert!(entry_matches_delete_snapshot(&expected, &current));
 
         current.timeout = Some("301s".to_string());
-        assert!(!entry_matches_delete_snapshot(&expected, &current));
+        assert!(entry_matches_delete_snapshot(&expected, &current));
 
         current.timeout = Some("299s".to_string());
         current.comment = Some("operator-owned".to_string());

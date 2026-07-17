@@ -1661,6 +1661,16 @@ export const enUSPluginDefined = {
         send_timeout: { label: "Send timeout" },
         receive_timeout: { label: "Receive timeout" },
         async: { label: "Async submission" },
+        wait_timeout: {
+          label: "Synchronous wait timeout",
+          description:
+            "Applies only when async is false; accepted work continues in the background after the timeout.",
+        },
+        queue_capacity: {
+          label: "Queue capacity",
+          description:
+            "Limits distinct route keys independently in the ingress queue and retry backlog.",
+        },
         routing_table: { label: "Routing table", placeholder: "via_proxy" },
         gateway4: { label: "IPv4 gateway", placeholder: "192.168.88.2@main" },
         gateway6: { label: "IPv6 gateway", placeholder: "fe80::2%ether1" },
@@ -1746,6 +1756,16 @@ export const enUSPluginDefined = {
           label: "Asynchronous submission",
           description:
             "Controls whether address writing behavior is asynchronous.",
+        },
+        wait_timeout: {
+          label: "Synchronous wait timeout",
+          description:
+            "Applies only when async is false; accepted work continues in the background after the timeout.",
+        },
+        queue_capacity: {
+          label: "Queue capacity",
+          description:
+            "Limits distinct IPs independently in the ingress queue and retry backlog.",
         },
         address_list4: {
           label: "IPv4 Address List",

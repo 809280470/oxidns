@@ -107,15 +107,6 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         comment_prefix: &str,
         plugin_tag: &str,
     ) -> Result<String>;
-    /// Validate that configured table/gateway/distance can be accepted by
-    /// RouterOS.
-    async fn validate_route_config(
-        &self,
-        key: &RouteKey,
-        gateway: &str,
-        distance: u8,
-        comment: &str,
-    ) -> Result<()>;
     /// Re-read the RouterOS row and delete only when it still exactly matches
     /// the snapshot that authorized the deletion.
     ///
@@ -257,14 +248,6 @@ impl MikrotikRsClient {
         Ok(None)
     }
 
-    async fn cleanup_validation_route(&self, key: &RouteKey, comment: &str) -> Result<()> {
-        if let Some(route) = self.find_route_by_exact_comment(key, comment, true).await? {
-            self.delete_route_if_matches_with_backoff(&route, true)
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn delete_route_if_matches_with_backoff(
         &self,
         expected: &RouterRoute,
@@ -298,7 +281,12 @@ impl MikrotikRsClient {
         if current.routing_table.is_empty() {
             current.routing_table.clone_from(&expected.routing_table);
         }
-        if current != *expected {
+        if current.id != expected.id
+            || current.family != expected.family
+            || current.dst_address != expected.dst_address
+            || current.routing_table != expected.routing_table
+            || !same_ownership_namespace(current.comment.as_deref(), expected.comment.as_deref())
+        {
             return Ok(false);
         }
         // The RouterOS API has no conditional remove primitive. This final
@@ -349,44 +337,17 @@ impl MikrotikRsClient {
         Ok(())
     }
 
-    async fn set_route_if_matches(
+    async fn set_route(
         &self,
         expected: &RouterRoute,
         gateway: &str,
         distance: u8,
         comment: &str,
     ) -> Result<bool> {
-        let print = CommandBuilder::new()
-            .command(route_command(expected.family, RouteOp::Print))
-            .attribute(".proplist", Some(ROUTE_PROPLIST))
-            .query_equal(ROUTER_ID_FIELD, &expected.id)
-            .query_equal(ROUTE_TABLE_FIELD, &expected.routing_table)
-            .query_equal(ROUTE_DST_FIELD, &expected.dst_address)
-            .build();
-        let Some(row) = self
-            .send_rows("verify route before update", print)
-            .await?
-            .into_iter()
-            .next()
-        else {
-            return Ok(false);
-        };
-        let mut current = parse_router_route_from_reply(
-            "verify route before update parse",
-            expected.family,
-            &row,
-        )?;
-        if current.routing_table.is_empty() {
-            current.routing_table.clone_from(&expected.routing_table);
-        }
-        if current != *expected {
-            return Ok(false);
-        }
-
         let distance_str = distance.to_string();
         let set = CommandBuilder::new()
             .command(route_command(expected.family, RouteOp::Set))
-            .attribute(ROUTER_ID_FIELD, Some(current.id.as_str()))
+            .attribute(ROUTER_ID_FIELD, Some(expected.id.as_str()))
             .attribute(ROUTE_GATEWAY_FIELD, Some(gateway))
             .attribute(ROUTE_DISTANCE_FIELD, Some(distance_str.as_str()))
             .attribute(ROUTE_COMMENT_FIELD, Some(comment))
@@ -548,6 +509,20 @@ fn parse_router_route_from_reply(
     })
 }
 
+fn same_ownership_namespace(current: Option<&str>, expected: Option<&str>) -> bool {
+    fn namespace(comment: &str) -> Option<(&str, &str)> {
+        let mut parts = comment.split(';');
+        let prefix = parts.next()?.trim();
+        let plugin = parts.find_map(|part| part.trim().strip_prefix("pg="))?;
+        (!prefix.is_empty() && !plugin.is_empty()).then_some((prefix, plugin))
+    }
+
+    match (current.and_then(namespace), expected.and_then(namespace)) {
+        (Some(current), Some(expected)) => current == expected,
+        _ => false,
+    }
+}
+
 fn parse_routeros_bool(raw: &str, field: &str, action: &str) -> Result<bool> {
     if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("yes") || raw == "1" {
         return Ok(true);
@@ -696,7 +671,7 @@ impl MikrotikApi for MikrotikRsClient {
             let disabled_changed = existing.disabled;
             if (gateway_changed || distance_changed || comment_changed || disabled_changed)
                 && !self
-                    .set_route_if_matches(&existing, gateway, distance, comment)
+                    .set_route(&existing, gateway, distance, comment)
                     .await?
             {
                 return Err(DnsError::plugin("ros_route route changed before update"));
@@ -730,66 +705,6 @@ impl MikrotikApi for MikrotikRsClient {
                 })?
         };
         Ok(created.id)
-    }
-
-    async fn validate_route_config(
-        &self,
-        key: &RouteKey,
-        gateway: &str,
-        distance: u8,
-        comment: &str,
-    ) -> Result<()> {
-        let distance_str = distance.to_string();
-        let add = CommandBuilder::new()
-            .command(route_command(key.family(), RouteOp::Add))
-            .attribute(ROUTE_DST_FIELD, Some(&key.dst_address()))
-            .attribute(ROUTE_TABLE_FIELD, Some(&key.table))
-            .attribute(ROUTE_GATEWAY_FIELD, Some(gateway))
-            .attribute(ROUTE_DISTANCE_FIELD, Some(distance_str.as_str()))
-            .attribute(ROUTE_COMMENT_FIELD, Some(comment))
-            .attribute("disabled", Some("yes"))
-            .build();
-        if let Err(validation_error) = self.send_rows("validate route config", add).await {
-            // An add response can be lost after RouterOS has already created
-            // the disabled probe route. Attempt the same ownership-scoped
-            // cleanup used for later validation failures before retrying
-            // initialization, otherwise each retry may leave a new nonce row.
-            return match self.cleanup_validation_route(key, comment).await {
-                Ok(()) => Err(validation_error),
-                Err(cleanup_error) => Err(DnsError::plugin(format!(
-                    "{validation_error}; temporary validation-route cleanup also failed: {cleanup_error}"
-                ))),
-            };
-        }
-
-        let validation_result = async {
-            let route = self
-                .find_route_by_exact_comment(key, comment, false)
-                .await?
-                .ok_or_else(|| {
-                    DnsError::plugin(
-                        "ros_route validate route config succeeded but temporary route id not found",
-                    )
-                })?;
-            self.delete_route_if_matches(&route).await.map(|_| ())
-        }
-        .await;
-
-        if let Err(validation_error) = validation_result {
-            // The add may have reached RouterOS even when the follow-up query or
-            // delete failed. Retry cleanup on a fresh connection before returning
-            // the validation error; reconciliation also recognizes this comment
-            // kind and removes any residue left by a prolonged outage.
-            let cleanup_result = self.cleanup_validation_route(key, comment).await;
-            return match cleanup_result {
-                Ok(()) => Err(validation_error),
-                Err(cleanup_error) => Err(DnsError::plugin(format!(
-                    "{validation_error}; temporary validation-route cleanup also failed: {cleanup_error}"
-                ))),
-            };
-        }
-
-        Ok(())
     }
 
     async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool> {
@@ -880,6 +795,24 @@ mod tests {
         let reused_tag = route("*reused-tag", Some("fdns;pg=route-test;dm=operator-route"));
 
         assert!(!route_owned_by_plugin(&reused_tag, "fdns", "route-test"));
+    }
+
+    #[test]
+    fn deletion_guard_accepts_payload_changes_only_within_the_same_owner_namespace() {
+        let expected = "fdns;pg=route-test;kind=D;exp=400;seen=100";
+
+        assert!(same_ownership_namespace(
+            Some("fdns;pg=route-test;kind=D;exp=900;seen=500"),
+            Some(expected),
+        ));
+        assert!(!same_ownership_namespace(
+            Some("fdns;pg=another-plugin;kind=D;exp=900;seen=500"),
+            Some(expected),
+        ));
+        assert!(!same_ownership_namespace(
+            Some("operator-managed"),
+            Some(expected),
+        ));
     }
 
     #[test]

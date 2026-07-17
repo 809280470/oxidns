@@ -2559,6 +2559,10 @@ old-static.example.com static.example.net
     receive_timeout: 30
     # 异步提交，避免阻塞 DNS 主路径
     async: true
+    # async=false 时最多等待这么久；超时后任务继续在后台执行
+    wait_timeout: 8s
+    # 入口队列和重试积压各自允许的不同 IP 数量
+    queue_capacity: 16384
     # A 记录写入的 address-list
     address_list4: "oxidns_ipv4"
     # AAAA 记录写入的 address-list
@@ -2653,6 +2657,18 @@ args:
 - 作用：控制地址写入行为是否采用异步方式。启用后，DNS 应答路径只负责投递任务，由后台管理器完成与 RouterOS 的交互。
 - 影响：异步模式有助于降低请求路径阻塞风险；关闭后会改为同步提交，更适合需要立即确认提交结果的场景。
 
+#### `wait_timeout`
+
+- 类型：`duration`；必填：否；默认值：`8s`
+- 作用：仅在 `async: false` 时限制 DNS 请求等待 manager 完成一次写入尝试的时间。
+- 超时行为：DNS 响应保持不变，已入队任务及其后台重试不会被取消。该配置与 RouterOS API 的 `receive_timeout` 无关。
+
+#### `queue_capacity`
+
+- 类型：`usize`；必填：否；默认值：`16384`
+- 作用：限制入口去重队列和重试积压中不同 IP 的数量；两个阶段分别使用该上限。
+- 满载行为：同一 IP 仍会合并；新的不同 IP 会被丢弃并记录指标，不影响 DNS 响应。必须大于 `0`。
+
 #### `address_list4`
 
 - 类型：`string`；必填：否；默认值：无
@@ -2718,18 +2734,20 @@ args:
 ### 行为说明
 
 - 插件本身不改 DNS 响应。
-- 启动阶段不会等待 RouterOS address-list 扫描完成；初始连通性验证和常驻项同步会交给后台 manager 执行，失败只记录日志，不阻塞 DNS 服务启动或动态观察写入。
+- 启动阶段不会等待 RouterOS address-list 扫描完成；持久项恢复会交给后台 manager 执行，失败后退避重试，不阻塞 DNS 服务启动或动态观察写入。
 - 正向阶段只透传。
 - 回程阶段：
   - 仅在 A/AAAA 查询的 `NOERROR` 响应中，提取 Answer 区全部已启用地址族的 A/AAAA；不重建 CNAME 链。
   - 去重并保留最大 TTL。
   - 根据异步或同步模式投递给后台 manager。
 - manager 负责：
-  - 后台初始连通性验证
   - 动态项刷新
   - 持久项一致性维护
   - 关闭清理
-- 动态项以 RouterOS 实际状态为准：用户删除后，周期对账清除本地写入抑制状态，下一次 DNS 观测才重新写入；插件不会为每次 DNS 请求读取 RouterOS。persistent 项则以配置为准，被删除后会由对账恢复。
+- 启动时始终执行一次持久项恢复，即使当前没有 `persistent`，也会清理旧配置遗留的本插件持久项。恢复失败时持续退避重试至成功。
+- 仅在配置了 `persistent` 时每 180 秒对账一次；对账使用初始化时已加载的内存集合，不重新读取文件。
+- 动态项不参与启动或周期全表对账。用户手工删除、修改动态项后插件不主动纠偏；后续只有正常 TTL 刷新或新写入才可能覆盖该变化。
+- 有限 TTL 动态项在有效 TTL 的 75% 处允许再次刷新；`fixed_ttl: 0` 的永久项不做周期刷新。
 
 ### 典型用途
 
@@ -2763,6 +2781,9 @@ args:
     routing_table: "via_proxy"
     gateway4: "192.168.88.2@main"
     gateway6: "fe80::2%ether1"
+    async: true
+    wait_timeout: 8s
+    queue_capacity: 16384
     fixed_ttl: 0
     conntrack_guard: true
     cleanup_on_shutdown: true
@@ -2788,16 +2809,20 @@ args:
 - `min_ttl`/`max_ttl` 默认分别为 `60`/`3600` 秒。`fixed_ttl` 覆盖 DNS TTL；其中 `fixed_ttl: 0` 表示动态路由不按时间过期，只能由用户删除、关闭清理或后续配置操作移除。
 - `ros_route` 与 `ros_address_list` 仅处理 A/AAAA 查询的成功响应，并收集 Answer 区中所有已启用地址族的 A/AAAA 记录；不重建 CNAME 链，也不用 CNAME TTL 截断地址 TTL。每个 IP 独立形成租约；后续应答缺少旧 IP、NODATA 或 NXDOMAIN 都不会立即撤销已有项。
 - `persistent` 是独立于 DNS 的常驻 IP/CIDR 集合；文件仅在插件初始化时读取，内容变化需重载插件或应用。
-- RouterOS 不可达时 DNS 服务仍会启动，路由操作在后台重试。`async: false` 只等待一次同步尝试，失败不会改变 DNS 应答。
+- RouterOS 不可达时 DNS 服务仍会启动，路由操作在后台重试。`async` 默认为 `true`；`async: false` 最多等待 `wait_timeout`（默认 `8s`），超时后后台任务继续且 DNS 应答不变。`queue_capacity` 默认 `16384`，分别限制入口队列和重试积压。
 - `conntrack_guard` 默认关闭，仅保护到期的动态 `/32`、`/128` 主机路由。目标 IP 仍有跟踪连接时保留路由并在 30 秒后重试；查询失败时 fail-closed。persistent 配置删除、关闭清理和内部维护清理不执行连接检查，也不支持 CIDR 连接保护。
 - 动态租约没有记录数量上限。尤其是 `fixed_ttl: 0` 路由不会自然过期，用户必须评估 RouterOS 路由表和 OxiDNS 内存容量，并通过用户删除、配置变化或关闭清理回收。
-- 动态路由以 RouterOS 实际状态为准：用户删除后由下一次对账接受删除，下一次 DNS 观测再创建；不会在每次 DNS 请求中读取路由表。persistent 路由仍以配置为准。
+- 启动时执行一次完整恢复：持久路由会收敛到配置，动态路由从 comment 恢复尚未过期的租约，过期项通过 sweep 和 conntrack guard 删除。启动扫描失败时退避重试至成功。
+- 每 180 秒的定时对账只处理 `persistent`；没有持久项时不发起周期路由表查询。动态路由不会因用户手工修改而触发周期纠偏。
+- `persistent.files` 只在初始化或 reload 时读取；定时对账始终使用内存集合。
 - `comment_prefix` 默认是 `oxi`，并与插件 `tag` 一起构成 RouterOS 条目的 ownership namespace；两者都不能包含 `;` 或 `=`。
 - RouterOS comment 只保存条目类型、过期时间和最近观察时间，不保存域名引用。重启时恢复未过期租约；当前 TTL 策略可以收紧旧期限，但不会在没有新 DNS 观察时延长它。
 - `tls` 启用 API-SSL（通常 `8729`）：`tls.server_name` 覆盖证书服务器名称，`tls.ca` 指定自签名/私有 CA 文件，`tls.insecure` 默认为 `false`，设为 `true` 时跳过证书验证且不能与 `tls.ca` 同时配置。省略 `tls` 时使用明文 API（通常 `8728`）。
 - `cleanup_on_shutdown: true` 会在 30 秒总预算内删除该插件 tag 所拥有的动态和常驻路由；设为 `false` 时保留并在下次启动恢复。生产重启或滚动发布需要策略连续性时建议设为 `false`。
 - 应用级 reload 对该插件采用 shutdown/restart 语义：候选 runtime 可提前完成无副作用的初始化，但旧实例会先完整 shutdown，新实例随后才激活；旧实例待处理观测不移交。`cleanup_on_shutdown: true` 时会清理旧实例拥有的路由，重建期间可能出现策略空窗；如需在 reload 期间保留 RouterOS 路由，请设为 `false`。不同进程不能同时使用相同插件 tag、注释前缀和 routing table；滚动发布时应使用不同 ownership namespace，或确保旧实例停止写入。
-- 删除前会重新读取路由并比较完整快照（comment、gateway、distance、disabled 等）。但 RouterOS 最终只提供按内部 ID 删除，不支持原子 compare-and-delete；因此不要在其它进程或 RouterOS 管理界面中并发修改插件拥有的路由。用户直接删除动态路由仍是支持的操作，对账会接受删除事实。
+- 删除前只重新确认内部 ID、目标 key 和插件 ownership namespace，不因 gateway、distance、disabled 或租约 comment 的变化比较完整快照。RouterOS 最终仍只支持按内部 ID 删除，不提供原子 compare-and-delete。
+- 插件不再创建临时 validation route；错误的网关或路由表会在第一次真实写入时暴露并进入后台重试。
+- 动态租约在剩余 TTL 的 75% 或上次成功写入后 5 分钟（取较早者）写回 comment，以兼顾管理面写入量和异常重启恢复精度。
 
 ---
 
