@@ -173,6 +173,13 @@ export function createDefaultPluginConfigValues(fields: ConfigField[]) {
   return defaults;
 }
 
+export function resolveConfigFieldDisplayValue(
+  value: unknown,
+  defaultValue: unknown,
+) {
+  return value === undefined ? defaultValue : value;
+}
+
 export function createPluginConfigFormValues(
   fields: ConfigField[],
   config: Record<string, unknown>,
@@ -850,8 +857,14 @@ function ConfigFieldControl({
         />
       );
     case "select":
+      const selectDisplayValue = resolveConfigFieldDisplayValue(
+        value,
+        field.default,
+      );
       const selectValue =
-        value == null || value === "" ? OPTIONAL_SELECT_VALUE : String(value);
+        selectDisplayValue == null || selectDisplayValue === ""
+          ? OPTIONAL_SELECT_VALUE
+          : String(selectDisplayValue);
       const options = withCurrentSelectOption(
         resolveSelectOptions(field, configModel),
         selectValue,
@@ -889,7 +902,9 @@ function ConfigFieldControl({
     case "switch":
       return (
         <Switch
-          checked={!!value}
+          checked={Boolean(
+            resolveConfigFieldDisplayValue(value, field.default),
+          )}
           onCheckedChange={onChange}
           disabled={readOnly}
         />

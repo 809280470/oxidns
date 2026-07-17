@@ -9,6 +9,7 @@ import {
   createPluginConfigFormValues,
   hasConfiguredAdvancedFields,
   isPluginConfigFormValid,
+  resolveConfigFieldDisplayValue,
   serializePluginConfigValues,
 } from "./plugin-config-fields-editor";
 
@@ -277,6 +278,17 @@ describe("advanced config field visibility", () => {
         serializePluginConfigValues(definition.configSchema, values),
       ).not.toHaveProperty(key);
     }
+  });
+
+  it("displays advanced defaults without marking fields as configured", () => {
+    expect(resolveConfigFieldDisplayValue(undefined, true)).toBe(true);
+    expect(resolveConfigFieldDisplayValue(false, true)).toBe(false);
+    expect(resolveConfigFieldDisplayValue(undefined, "balanced")).toBe(
+      "balanced",
+    );
+    expect(resolveConfigFieldDisplayValue("fastest", "balanced")).toBe(
+      "fastest",
+    );
   });
 
   it("reveals explicit defaults, false, zero, and empty objects", () => {

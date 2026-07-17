@@ -1195,7 +1195,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           { label: "Fail", value: "fail" },
         ],
         default: "continue",
-        advanced: true,
       },
       {
         key: "timeout",
@@ -1453,7 +1452,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           { label: "Fail", value: "fail" },
         ],
         default: "continue",
-        advanced: true,
       },
       {
         key: "headers",
@@ -1618,7 +1616,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           { label: "Fail", value: "fail" },
         ],
         default: "continue",
-        advanced: true,
       },
       {
         key: "max_output_bytes",
@@ -2269,7 +2266,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "GitHub 仓库",
         type: "text",
         default: "svenshi/oxidns",
-        advanced: true,
       },
       {
         key: "asset",
@@ -2278,7 +2274,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "Release Asset",
         type: "text",
         default: "auto",
-        advanced: true,
       },
       {
         key: "bundle",

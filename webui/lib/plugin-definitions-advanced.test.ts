@@ -57,7 +57,7 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
   "executor/prefer_ipv4": ["cache_ttl"],
   "executor/prefer_ipv6": ["cache_ttl"],
   "executor/reverse_lookup": ["size", "ttl"],
-  "executor/learn_domain": ["async", "error_mode", "timeout"],
+  "executor/learn_domain": ["async", "timeout"],
   "executor/query_recorder": [
     "queue_size",
     "batch_size",
@@ -69,13 +69,12 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
   "executor/http_request": [
     "async",
     "timeout",
-    "error_mode",
     "outbound",
     "socks5",
     "max_redirects",
     "queue_size",
   ],
-  "executor/script": ["timeout", "error_mode", "max_output_bytes"],
+  "executor/script": ["timeout", "max_output_bytes"],
   "executor/ipset": ["mask4", "mask6"],
   "executor/nftset": [
     "ipv4.mask",
@@ -123,8 +122,6 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
   ],
   "executor/upgrade": [
     "cleanup",
-    "repository",
-    "asset",
     "github_token",
     "cache_dir",
     "backup_dir",
