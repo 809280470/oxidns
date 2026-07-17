@@ -57,6 +57,17 @@ if (!ipSelectorDefinition) {
   throw new Error("ip_selector executor definition must exist");
 }
 
+const forwardDefinition = executorPluginDefinitions.find(
+  (definition) => definition.kind === "forward",
+);
+const fallbackDefinition = executorPluginDefinitions.find(
+  (definition) => definition.kind === "fallback",
+);
+
+if (!forwardDefinition || !fallbackDefinition) {
+  throw new Error("forward and fallback executor definitions must exist");
+}
+
 describe("time matcher config form", () => {
   it("normalizes legacy weekday aliases to ISO numbers while preserving monthdays", () => {
     const config = {
@@ -251,6 +262,21 @@ describe("advanced config field visibility", () => {
     expect(
       serializePluginConfigValues(ipSelectorDefinition.configSchema, values),
     ).not.toHaveProperty("cache");
+  });
+
+  it("does not materialize defaults for unopened advanced scalar fields", () => {
+    const cases = [
+      [forwardDefinition, "response_selection"],
+      [fallbackDefinition, "always_standby"],
+    ] as const;
+
+    for (const [definition, key] of cases) {
+      const values = createDefaultPluginConfigValues(definition.configSchema);
+      expect(values).not.toHaveProperty(key);
+      expect(
+        serializePluginConfigValues(definition.configSchema, values),
+      ).not.toHaveProperty(key);
+    }
   });
 
   it("reveals explicit defaults, false, zero, and empty objects", () => {

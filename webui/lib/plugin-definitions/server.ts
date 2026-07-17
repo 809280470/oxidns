@@ -174,7 +174,6 @@ export const serverPluginDefinitions: PluginKindDefinition[] = [
         label: "来源 IP Header",
         type: "text",
         placeholder: "X-Forwarded-For",
-        advanced: true,
       },
       {
         key: "cert",

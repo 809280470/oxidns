@@ -131,10 +131,9 @@ function InvertCheckbox({
   );
 }
 
-// Free-text / numeric inputs: their default is shown via the input's
-// placeholder instead of being pre-filled, so an unset field stays absent and
-// is never materialized into the config. switch/select keep their default
-// pre-filled (no placeholder affordance).
+// Free-text / numeric inputs show defaults via placeholders. Advanced fields
+// also stay unset until the operator interacts with them, so collapsed tuning
+// defaults are never materialized into the config.
 const PLACEHOLDER_INPUT_TYPES = new Set([
   "text",
   "time",
@@ -147,11 +146,14 @@ const PLACEHOLDER_INPUT_TYPES = new Set([
 export function createDefaultPluginConfigValues(fields: ConfigField[]) {
   const defaults: Record<string, unknown> = {};
   fields.forEach((field) => {
+    if (field.advanced) {
+      return;
+    }
     if (field.type === "array") {
       defaults[field.key] = [];
     } else if (field.type === "time" && field.timeRange) {
       defaults[field.key] = field.timeRange.defaultValue;
-    } else if (field.type === "object" && field.fields && !field.advanced) {
+    } else if (field.type === "object" && field.fields) {
       const objectDefaults = createDefaultPluginConfigValues(field.fields);
       if (field.preserveEmptyObject) {
         objectDefaults[OBJECT_PRESENCE_KEY] = false;

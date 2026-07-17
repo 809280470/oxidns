@@ -10,7 +10,6 @@ const EXPECTED_ADVANCED_FIELDS: Record<string, string[]> = {
   "server/tcp_server": ["idle_timeout"],
   "server/http_server": [
     "entries[].json_api",
-    "src_ip_header",
     "idle_timeout",
     "enable_http3",
   ],
