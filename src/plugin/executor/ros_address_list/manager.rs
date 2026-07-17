@@ -190,34 +190,8 @@ impl Coalesce for ControlCommand {
 
 #[derive(Debug)]
 struct ShutdownRequest {
-    cleanup: AddressListCleanupScope,
+    cleanup: bool,
     done: oneshot::Sender<Result<()>>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub(super) struct AddressListCleanupScope {
-    pub(super) ipv4: bool,
-    pub(super) ipv6: bool,
-}
-
-impl AddressListCleanupScope {
-    pub(super) const fn none() -> Self {
-        Self {
-            ipv4: false,
-            ipv6: false,
-        }
-    }
-
-    pub(super) const fn all() -> Self {
-        Self {
-            ipv4: true,
-            ipv6: true,
-        }
-    }
-
-    fn is_empty(self) -> bool {
-        !self.ipv4 && !self.ipv6
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -437,14 +411,14 @@ impl AddressListManagerRuntime {
         self.handle.clone()
     }
 
-    pub(super) async fn shutdown(self, cleanup: AddressListCleanupScope) -> Result<()> {
+    pub(super) async fn shutdown(self, cleanup: bool) -> Result<()> {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         self.shutdown_until(cleanup, deadline).await
     }
 
     pub(super) async fn shutdown_until(
         mut self,
-        cleanup: AddressListCleanupScope,
+        cleanup: bool,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
         let tasks = [self.prune_task_id.take(), self.reconcile_task_id.take()]
@@ -1034,10 +1008,10 @@ impl AddressListManager {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&mut self, cleanup: AddressListCleanupScope) -> Result<()> {
+    pub(super) async fn shutdown(&mut self, cleanup: bool) -> Result<()> {
         self.reconcile.cancel().await;
 
-        if cleanup.is_empty() {
+        if !cleanup {
             self.leases.clear();
             return Ok(());
         }
@@ -1049,14 +1023,8 @@ impl AddressListManager {
         let entries = self
             .api
             .list_entries(
-                cleanup
-                    .ipv4
-                    .then_some(self.cfg.address_list4.as_deref())
-                    .flatten(),
-                cleanup
-                    .ipv6
-                    .then_some(self.cfg.address_list6.as_deref())
-                    .flatten(),
+                self.cfg.address_list4.as_deref(),
+                self.cfg.address_list6.as_deref(),
             )
             .await?;
         let owned = entries

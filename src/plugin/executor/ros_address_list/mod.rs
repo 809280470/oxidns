@@ -46,8 +46,8 @@ use self::api::{
     MikrotikApi, MikrotikApiTimeouts, MikrotikRsClient,
 };
 use self::manager::{
-    AddressListCleanupScope, AddressListManager, AddressListManagerConfig,
-    AddressListManagerHandle, AddressListManagerRuntime, ObserveEnqueueError,
+    AddressListManager, AddressListManagerConfig, AddressListManagerHandle,
+    AddressListManagerRuntime, ObserveEnqueueError,
 };
 use self::model::{AddressListFamily, AddressListKey};
 use crate::config::types::PluginConfig;
@@ -458,7 +458,7 @@ impl Plugin for MikrotikExecutor {
         }
         if let Some(runtime) = runtime {
             unregister_metric_source(&self.tag);
-            let _ = runtime.shutdown(AddressListCleanupScope::none()).await;
+            let _ = runtime.shutdown(false).await;
             return Err(DnsError::plugin(
                 "ros_address_list runtime lock is poisoned during initialization",
             ));
@@ -471,12 +471,9 @@ impl Plugin for MikrotikExecutor {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         if let Some(runtime) = self.runtime.lock().ok().and_then(|mut slot| slot.take()) {
             unregister_metric_source(&self.tag);
-            let cleanup_scope = if self.config.cleanup_on_shutdown {
-                AddressListCleanupScope::all()
-            } else {
-                AddressListCleanupScope::none()
-            };
-            return runtime.shutdown_until(cleanup_scope, deadline).await;
+            return runtime
+                .shutdown_until(self.config.cleanup_on_shutdown, deadline)
+                .await;
         }
         Ok(())
     }
@@ -1905,10 +1902,7 @@ persistent:
         .await
         .expect("startup reconcile result should be applied without waiting for a timer tick");
 
-        runtime
-            .shutdown(AddressListCleanupScope::none())
-            .await
-            .expect("shutdown");
+        runtime.shutdown(false).await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -2436,10 +2430,7 @@ persistent:
             cfg
         });
 
-        manager
-            .shutdown(AddressListCleanupScope::all())
-            .await
-            .unwrap();
+        manager.shutdown(true).await.unwrap();
 
         assert!(
             api.state
@@ -2447,52 +2438,6 @@ persistent:
                 .unwrap()
                 .entries
                 .contains_key(&MockMikrotikApi::storage_key(&key))
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_cleanup_can_target_only_an_unclaimed_address_family() {
-        let api = Arc::new(MockMikrotikApi::default());
-        let ipv4_key = AddressListKey::new(
-            IpAddr::V4(Ipv4Addr::new(11, 11, 11, 14)),
-            "oxidns_ipv4".to_string(),
-        );
-        let ipv6_key = AddressListKey::new(
-            IpAddr::V6("2001:db8::14".parse().expect("ipv6")),
-            "oxidns_ipv6".to_string(),
-        );
-        for (id, key) in [("*owned-v4", &ipv4_key), ("*owned-v6", &ipv6_key)] {
-            api.seed_entry(RouterListEntry {
-                id: id.to_string(),
-                key: key.clone(),
-                timeout: Some("300s".to_string()),
-                comment: Some(encode_comment(
-                    "oxidns",
-                    "partial-cleanup",
-                    OwnedCommentKind::Dynamic,
-                )),
-            });
-        }
-        let mut manager = AddressListManager::new(api.clone(), default_cfg("partial-cleanup"));
-
-        manager
-            .shutdown(AddressListCleanupScope {
-                ipv4: false,
-                ipv6: true,
-            })
-            .await
-            .expect("partial cleanup");
-
-        let state = api.state.lock().expect("mock lock");
-        assert!(
-            state
-                .entries
-                .contains_key(&MockMikrotikApi::storage_key(&ipv4_key))
-        );
-        assert!(
-            !state
-                .entries
-                .contains_key(&MockMikrotikApi::storage_key(&ipv6_key))
         );
     }
 }
