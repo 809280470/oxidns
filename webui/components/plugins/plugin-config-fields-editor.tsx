@@ -1,6 +1,7 @@
 "use client";
 
 import { PluginReferencePicker } from "@/components/plugins/plugin-reference-picker";
+import { AdvancedSettingsSection } from "@/components/plugins/advanced-settings-section";
 import { ConfigProvider, TimePicker } from "antd";
 import enUS from "antd/locale/en_US";
 import zhCN from "antd/locale/zh_CN";
@@ -71,6 +72,7 @@ interface PluginConfigFieldsEditorProps {
   fields: ConfigField[];
   plugins: PluginInstance[];
   values: Record<string, unknown>;
+  configuredValues?: Record<string, unknown>;
   onChange: (values: Record<string, unknown>) => void;
   defaultArrayObjectCollapsed?: boolean;
   readOnly?: boolean;
@@ -129,10 +131,9 @@ function InvertCheckbox({
   );
 }
 
-// Free-text / numeric inputs: their default is shown via the input's
-// placeholder instead of being pre-filled, so an unset field stays absent and
-// is never materialized into the config. switch/select keep their default
-// pre-filled (no placeholder affordance).
+// Free-text / numeric inputs show defaults via placeholders. Advanced fields
+// also stay unset until the operator interacts with them, so collapsed tuning
+// defaults are never materialized into the config.
 const PLACEHOLDER_INPUT_TYPES = new Set([
   "text",
   "time",
@@ -145,6 +146,9 @@ const PLACEHOLDER_INPUT_TYPES = new Set([
 export function createDefaultPluginConfigValues(fields: ConfigField[]) {
   const defaults: Record<string, unknown> = {};
   fields.forEach((field) => {
+    if (field.advanced) {
+      return;
+    }
     if (field.type === "array") {
       defaults[field.key] = [];
     } else if (field.type === "time" && field.timeRange) {
@@ -167,6 +171,13 @@ export function createDefaultPluginConfigValues(fields: ConfigField[]) {
     }
   });
   return defaults;
+}
+
+export function resolveConfigFieldDisplayValue(
+  value: unknown,
+  defaultValue: unknown,
+) {
+  return value === undefined ? defaultValue : value;
 }
 
 export function createPluginConfigFormValues(
@@ -357,6 +368,7 @@ export function PluginConfigFieldsEditor({
   fields,
   plugins,
   values,
+  configuredValues = values,
   onChange,
   defaultArrayObjectCollapsed = false,
   readOnly = false,
@@ -364,10 +376,10 @@ export function PluginConfigFieldsEditor({
   const { t } = useI18n();
   const regularFields = fields.filter((field) => !field.advanced);
   const advancedFields = fields.filter((field) => field.advanced);
-  const hasConfiguredAdvancedValue = advancedFields.some((field) =>
-    hasMeaningfulAdvancedValue(values[field.key], field.default),
+  const hasConfiguredAdvancedValue = hasConfiguredAdvancedFields(
+    advancedFields,
+    configuredValues,
   );
-  const [advancedOpen, setAdvancedOpen] = useState(hasConfiguredAdvancedValue);
   const updateConfig = (key: string, value: unknown) => {
     onChange({ ...values, [key]: value });
   };
@@ -394,6 +406,7 @@ export function PluginConfigFieldsEditor({
             field={field}
             plugins={plugins}
             value={values[field.key]}
+            configuredValue={configuredValues[field.key]}
             onChange={(value) => updateConfig(field.key, value)}
             defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
             readOnly={readOnly}
@@ -411,36 +424,23 @@ export function PluginConfigFieldsEditor({
           establish — only its descendants. */}
       {renderFields(regularFields)}
       {advancedFields.length > 0 && (
-        <div className="w-full rounded-lg border border-border/70">
-          <button
-            type="button"
-            className="flex w-full items-center justify-between px-3 py-2 text-sm font-medium"
-            onClick={() => setAdvancedOpen((open) => !open)}
-            aria-expanded={advancedOpen}
-          >
-            {t(WEBUI.plugins.advancedSettings)}
-            <ChevronDown
-              className={cn(
-                "size-4 transition-transform",
-                advancedOpen && "rotate-180",
-              )}
-            />
-          </button>
-          {advancedOpen && <div className="border-t p-3">{renderFields(advancedFields)}</div>}
-        </div>
+        <AdvancedSettingsSection defaultOpen={hasConfiguredAdvancedValue}>
+          {renderFields(advancedFields)}
+        </AdvancedSettingsSection>
       )}
     </FieldGroup>
   );
 }
 
-function hasMeaningfulAdvancedValue(value: unknown, defaultValue: unknown) {
-  if (value === undefined || value === null || value === "") return false;
-  if (defaultValue !== undefined) {
-    return JSON.stringify(value) !== JSON.stringify(defaultValue);
-  }
-  if (Array.isArray(value)) return value.length > 0;
-  if (typeof value === "object") return Object.keys(value).length > 0;
-  return true;
+export function hasConfiguredAdvancedFields(
+  fields: ConfigField[],
+  configuredValues: Record<string, unknown>,
+) {
+  return fields.some(
+    (field) =>
+      field.advanced &&
+      Object.prototype.hasOwnProperty.call(configuredValues, field.key),
+  );
 }
 
 function isFullWidthConfigField(field: ConfigField): boolean {
@@ -661,6 +661,7 @@ function ConfigFieldControl({
   field,
   plugins,
   value,
+  configuredValue,
   onChange,
   defaultArrayObjectCollapsed,
   readOnly,
@@ -668,6 +669,7 @@ function ConfigFieldControl({
   field: ConfigField;
   plugins: PluginInstance[];
   value: unknown;
+  configuredValue?: unknown;
   onChange: (value: unknown) => void;
   defaultArrayObjectCollapsed: boolean;
   readOnly: boolean;
@@ -757,6 +759,7 @@ function ConfigFieldControl({
             field={field}
             plugins={plugins}
             value={Array.isArray(value) ? value : []}
+            configuredValue={configuredValue}
             onChange={onChange}
             defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
             readOnly={readOnly}
@@ -824,6 +827,7 @@ function ConfigFieldControl({
                 fields={field.fields}
                 plugins={plugins}
                 value={objectValue}
+                configuredValue={configuredValue}
                 onChange={onChange}
                 defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
                 readOnly={readOnly}
@@ -837,6 +841,7 @@ function ConfigFieldControl({
           fields={field.fields}
           plugins={plugins}
           value={objectValue}
+          configuredValue={configuredValue}
           onChange={onChange}
           defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
           readOnly={readOnly}
@@ -852,8 +857,14 @@ function ConfigFieldControl({
         />
       );
     case "select":
+      const selectDisplayValue = resolveConfigFieldDisplayValue(
+        value,
+        field.default,
+      );
       const selectValue =
-        value == null || value === "" ? OPTIONAL_SELECT_VALUE : String(value);
+        selectDisplayValue == null || selectDisplayValue === ""
+          ? OPTIONAL_SELECT_VALUE
+          : String(selectDisplayValue);
       const options = withCurrentSelectOption(
         resolveSelectOptions(field, configModel),
         selectValue,
@@ -891,7 +902,9 @@ function ConfigFieldControl({
     case "switch":
       return (
         <Switch
-          checked={!!value}
+          checked={Boolean(
+            resolveConfigFieldDisplayValue(value, field.default),
+          )}
           onCheckedChange={onChange}
           disabled={readOnly}
         />
@@ -1047,6 +1060,7 @@ function ObjectFieldEditor({
   fields,
   plugins,
   value,
+  configuredValue,
   onChange,
   defaultArrayObjectCollapsed,
   readOnly,
@@ -1054,46 +1068,70 @@ function ObjectFieldEditor({
   fields: ConfigField[];
   plugins: PluginInstance[];
   value: Record<string, unknown>;
+  configuredValue?: unknown;
   onChange: (value: Record<string, unknown>) => void;
   defaultArrayObjectCollapsed: boolean;
   readOnly: boolean;
 }) {
-  return (
-    <div className="space-y-4">
-      {fields.map((field) => {
-        if (field.timeRange?.role === "end") return null;
-        if (field.timeRange?.role === "start") {
-          const endField = findTimeRangePair(fields, field);
-          if (endField) {
-            return (
-              <TimeRangeFieldEditor
-                key={field.timeRange.id}
-                startField={field}
-                endField={endField}
-                value={value}
-                onChange={onChange}
-                readOnly={readOnly}
-              />
-            );
-          }
-        }
+  const configuredValues =
+    configuredValue &&
+    typeof configuredValue === "object" &&
+    !Array.isArray(configuredValue)
+      ? (configuredValue as Record<string, unknown>)
+      : {};
+  const regularFields = fields.filter((field) => !field.advanced);
+  const advancedFields = fields.filter((field) => field.advanced);
 
-        return (
-          <Field key={field.key}>
-            <ConfigFieldLabel field={field} />
-            <ConfigFieldControl
-              field={field}
-              plugins={plugins}
-              value={value[field.key]}
-              onChange={(nextFieldValue) =>
-                onChange({ ...value, [field.key]: nextFieldValue })
-              }
-              defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
+  const renderFields = (items: ConfigField[]) =>
+    items.map((field) => {
+      if (field.timeRange?.role === "end") return null;
+      if (field.timeRange?.role === "start") {
+        const endField = findTimeRangePair(fields, field);
+        if (endField) {
+          return (
+            <TimeRangeFieldEditor
+              key={field.timeRange.id}
+              startField={field}
+              endField={endField}
+              value={value}
+              onChange={onChange}
               readOnly={readOnly}
             />
-          </Field>
-        );
-      })}
+          );
+        }
+      }
+
+      return (
+        <Field key={field.key}>
+          <ConfigFieldLabel field={field} />
+          <ConfigFieldControl
+            field={field}
+            plugins={plugins}
+            value={value[field.key]}
+            configuredValue={configuredValues[field.key]}
+            onChange={(nextFieldValue) =>
+              onChange({ ...value, [field.key]: nextFieldValue })
+            }
+            defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
+            readOnly={readOnly}
+          />
+        </Field>
+      );
+    });
+
+  return (
+    <div className="space-y-4">
+      {renderFields(regularFields)}
+      {advancedFields.length > 0 && (
+        <AdvancedSettingsSection
+          defaultOpen={hasConfiguredAdvancedFields(
+            advancedFields,
+            configuredValues,
+          )}
+        >
+          <div className="space-y-4">{renderFields(advancedFields)}</div>
+        </AdvancedSettingsSection>
+      )}
     </div>
   );
 }
@@ -1627,6 +1665,7 @@ function SchemaArrayFieldEditor({
   field,
   plugins,
   value,
+  configuredValue,
   onChange,
   defaultArrayObjectCollapsed,
   readOnly,
@@ -1634,6 +1673,7 @@ function SchemaArrayFieldEditor({
   field: ConfigField;
   plugins: PluginInstance[];
   value: unknown[];
+  configuredValue?: unknown;
   onChange: (items: unknown[]) => void;
   defaultArrayObjectCollapsed: boolean;
   readOnly: boolean;
@@ -1646,6 +1686,9 @@ function SchemaArrayFieldEditor({
   const [collapsedItems, setCollapsedItems] = useState<Record<string, boolean>>(
     {},
   );
+  const configuredEntries = Array.isArray(configuredValue)
+    ? configuredValue
+    : [];
 
   const addItem = () => {
     const selectedOption =
@@ -1753,6 +1796,7 @@ function SchemaArrayFieldEditor({
                   item={child}
                   plugins={plugins}
                   value={entryValue}
+                  configuredValue={configuredEntries[index]}
                   placeholder={field.placeholder}
                   onChange={(nextValue) =>
                     updateItem(
@@ -1809,6 +1853,7 @@ function SchemaArrayItemControl({
   item,
   plugins,
   value,
+  configuredValue,
   placeholder,
   onChange,
   defaultArrayObjectCollapsed,
@@ -1817,6 +1862,7 @@ function SchemaArrayItemControl({
   item: ConfigFieldChild;
   plugins: PluginInstance[];
   value: unknown;
+  configuredValue?: unknown;
   placeholder?: string;
   onChange: (value: unknown) => void;
   defaultArrayObjectCollapsed: boolean;
@@ -1834,6 +1880,7 @@ function SchemaArrayItemControl({
         fields={item.fields}
         plugins={plugins}
         value={objectValue}
+        configuredValue={configuredValue}
         onChange={onChange}
         defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
         readOnly={readOnly}
@@ -1851,6 +1898,7 @@ function SchemaArrayItemControl({
         )}
         plugins={plugins}
         value={Array.isArray(value) ? value : []}
+        configuredValue={configuredValue}
         onChange={onChange}
         defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
         readOnly={readOnly}
@@ -1867,6 +1915,7 @@ function SchemaArrayItemControl({
       )}
       plugins={plugins}
       value={value}
+      configuredValue={configuredValue}
       onChange={onChange}
       defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
       readOnly={readOnly}

@@ -7,7 +7,9 @@ import { getLocalizedPluginKindDefinition } from "@/lib/plugin-definitions";
 import {
   createDefaultPluginConfigValues,
   createPluginConfigFormValues,
+  hasConfiguredAdvancedFields,
   isPluginConfigFormValid,
+  resolveConfigFieldDisplayValue,
   serializePluginConfigValues,
 } from "./plugin-config-fields-editor";
 
@@ -45,9 +47,27 @@ if (!qnameDefinition) {
 
 const routerOsDefinitions = executorPluginDefinitions.filter(
   (definition) =>
-    definition.kind === "ros_route" ||
-    definition.kind === "ros_address_list",
+    definition.kind === "ros_route" || definition.kind === "ros_address_list",
 );
+
+const ipSelectorDefinition = executorPluginDefinitions.find(
+  (definition) => definition.kind === "ip_selector",
+);
+
+if (!ipSelectorDefinition) {
+  throw new Error("ip_selector executor definition must exist");
+}
+
+const forwardDefinition = executorPluginDefinitions.find(
+  (definition) => definition.kind === "forward",
+);
+const fallbackDefinition = executorPluginDefinitions.find(
+  (definition) => definition.kind === "fallback",
+);
+
+if (!forwardDefinition || !fallbackDefinition) {
+  throw new Error("forward and fallback executor definitions must exist");
+}
 
 describe("time matcher config form", () => {
   it("normalizes legacy weekday aliases to ISO numbers while preserving monthdays", () => {
@@ -185,8 +205,9 @@ describe("optional object config fields", () => {
     expect(routerOsDefinitions).toHaveLength(2);
     for (const definition of routerOsDefinitions) {
       const values = createDefaultPluginConfigValues(definition.configSchema);
-      expect(serializePluginConfigValues(definition.configSchema, values)).not
-        .toHaveProperty("tls");
+      expect(
+        serializePluginConfigValues(definition.configSchema, values),
+      ).not.toHaveProperty("tls");
     }
   });
 
@@ -201,6 +222,83 @@ describe("optional object config fields", () => {
         serializePluginConfigValues(definition.configSchema, values),
       ).toHaveProperty("tls", {});
     }
+  });
+});
+
+describe("advanced config field visibility", () => {
+  const advancedFields = [
+    {
+      key: "flag",
+      label: "Flag",
+      type: "switch" as const,
+      default: false,
+      advanced: true,
+    },
+    {
+      key: "limit",
+      label: "Limit",
+      type: "number" as const,
+      default: 0,
+      advanced: true,
+    },
+    {
+      key: "tls",
+      label: "TLS",
+      type: "object" as const,
+      advanced: true,
+      fields: [],
+    },
+  ];
+
+  it("stays collapsed when a new form has no explicitly configured values", () => {
+    expect(hasConfiguredAdvancedFields(advancedFields, {})).toBe(false);
+  });
+
+  it("does not materialize defaults for unopened advanced objects", () => {
+    const values = createDefaultPluginConfigValues(
+      ipSelectorDefinition.configSchema,
+    );
+
+    expect(values).not.toHaveProperty("cache");
+    expect(
+      serializePluginConfigValues(ipSelectorDefinition.configSchema, values),
+    ).not.toHaveProperty("cache");
+  });
+
+  it("does not materialize defaults for unopened advanced scalar fields", () => {
+    const cases = [
+      [forwardDefinition, "response_selection"],
+      [fallbackDefinition, "always_standby"],
+    ] as const;
+
+    for (const [definition, key] of cases) {
+      const values = createDefaultPluginConfigValues(definition.configSchema);
+      expect(values).not.toHaveProperty(key);
+      expect(
+        serializePluginConfigValues(definition.configSchema, values),
+      ).not.toHaveProperty(key);
+    }
+  });
+
+  it("displays advanced defaults without marking fields as configured", () => {
+    expect(resolveConfigFieldDisplayValue(undefined, true)).toBe(true);
+    expect(resolveConfigFieldDisplayValue(false, true)).toBe(false);
+    expect(resolveConfigFieldDisplayValue(undefined, "balanced")).toBe(
+      "balanced",
+    );
+    expect(resolveConfigFieldDisplayValue("fastest", "balanced")).toBe(
+      "fastest",
+    );
+  });
+
+  it("reveals explicit defaults, false, zero, and empty objects", () => {
+    expect(hasConfiguredAdvancedFields(advancedFields, { flag: false })).toBe(
+      true,
+    );
+    expect(hasConfiguredAdvancedFields(advancedFields, { limit: 0 })).toBe(
+      true,
+    );
+    expect(hasConfiguredAdvancedFields(advancedFields, { tls: {} })).toBe(true);
   });
 });
 

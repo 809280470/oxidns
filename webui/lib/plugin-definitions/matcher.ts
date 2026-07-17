@@ -305,6 +305,7 @@ export const matcherPluginDefinitions: PluginKindDefinition[] = [
         label: "时区",
         type: "text",
         placeholder: "Asia/Shanghai",
+        advanced: true,
         description:
           "留空时使用系统时区；填写有效 IANA 时区可固定策略判断时区。",
       },
@@ -436,6 +437,7 @@ export const matcherPluginDefinitions: PluginKindDefinition[] = [
         label: "IPv4 聚合前缀",
         type: "number",
         default: 32,
+        advanced: true,
       },
       {
         key: "mask6",
@@ -443,6 +445,7 @@ export const matcherPluginDefinitions: PluginKindDefinition[] = [
         label: "IPv6 聚合前缀",
         type: "number",
         default: 48,
+        advanced: true,
       },
     ],
     quickSetup: {
