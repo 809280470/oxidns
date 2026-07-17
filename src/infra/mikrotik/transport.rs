@@ -361,6 +361,7 @@ impl RouterOsTransport {
     /// This is reserved for bounded cleanup operations whose objects may have
     /// reached RouterOS before the response failed. A failed bypass attempt
     /// still records the connection failure and schedules the next backoff.
+    #[cfg(any(feature = "plugin-ros-route", test))]
     pub(crate) async fn send_command_bypassing_backoff(
         &self,
         action: &str,

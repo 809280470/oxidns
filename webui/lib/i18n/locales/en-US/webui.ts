@@ -123,6 +123,7 @@ export const enUSWebui = {
     applying: "Applying",
     restarting: "Restarting",
     noConfigFields: "This plugin has no standalone configuration fields.",
+    advancedSettings: "Advanced settings",
     yamlMustBeObject: "Plugin config must be a YAML object",
     invertMatch: "Invert match",
     referencePlaceholder: "Select plugin reference",

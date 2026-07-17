@@ -117,6 +117,7 @@ export const zhCNWebui = {
     applying: "应用中",
     restarting: "重启中",
     noConfigFields: "此插件没有独立配置项。",
+    advancedSettings: "高级设置",
     yamlMustBeObject: "插件配置必须是 YAML 对象",
     invertMatch: "取反匹配",
     referencePlaceholder: "选择插件引用",

@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder, QueryOperator};
 use tracing::warn;
 
-use super::manager::{RouteCommentCodec, RouteFamily, RouteKey};
+use super::model::{RouteCommentCodec, RouteFamily, RouteKey};
 use crate::infra::error::{DnsError, Result};
+use crate::infra::mikrotik::batching::join_all_bounded;
 use crate::infra::mikrotik::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
     RouterOsTransportSnapshot,
@@ -29,6 +30,7 @@ const ROUTE_COMMENT_FIELD: &str = "comment";
 const ROUTE_DISABLED_FIELD: &str = "disabled";
 const CONNECTION_DST_FIELD: &str = "dst-address";
 const ROUTE_PROPLIST: &str = ".id,dst-address,routing-table,gateway,distance,comment,disabled";
+const MUTATION_PIPELINE_SIZE: usize = 16;
 
 const COMMAND_IP_ROUTE_PRINT: &str = "/ip/route/print";
 const COMMAND_IP_ROUTE_ADD: &str = "/ip/route/add";
@@ -105,17 +107,8 @@ pub(super) trait MikrotikApi: Debug + Send + Sync {
         comment_prefix: &str,
         plugin_tag: &str,
     ) -> Result<String>;
-    /// Validate that configured table/gateway/distance can be accepted by
-    /// RouterOS.
-    async fn validate_route_config(
-        &self,
-        key: &RouteKey,
-        gateway: &str,
-        distance: u8,
-        comment: &str,
-    ) -> Result<()>;
-    /// Re-read the RouterOS row and delete only when it still exactly matches
-    /// the snapshot that authorized the deletion.
+    /// Re-read the RouterOS row and delete only when its id, route key, and
+    /// ownership namespace still authorize the deletion.
     ///
     /// RouterOS exposes the final remove as an id-only command, not an atomic
     /// compare-and-delete operation. The plugin serializes all in-process
@@ -255,14 +248,6 @@ impl MikrotikRsClient {
         Ok(None)
     }
 
-    async fn cleanup_validation_route(&self, key: &RouteKey, comment: &str) -> Result<()> {
-        if let Some(route) = self.find_route_by_exact_comment(key, comment, true).await? {
-            self.delete_route_if_matches_with_backoff(&route, true)
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn delete_route_if_matches_with_backoff(
         &self,
         expected: &RouterRoute,
@@ -296,14 +281,19 @@ impl MikrotikRsClient {
         if current.routing_table.is_empty() {
             current.routing_table.clone_from(&expected.routing_table);
         }
-        if current != *expected {
+        if current.id != expected.id
+            || current.family != expected.family
+            || current.dst_address != expected.dst_address
+            || current.routing_table != expected.routing_table
+            || !same_ownership_namespace(current.comment.as_deref(), expected.comment.as_deref())
+        {
             return Ok(false);
         }
         // The RouterOS API has no conditional remove primitive. This final
         // id-only command is safe against OxiDNS reload races because the
-        // ownership namespace has one in-process writer. The fresh full-row
-        // comparison above is the best available guard against external
-        // changes; operators must not concurrently edit plugin-owned rows.
+        // ownership namespace has one in-process writer. The fresh identity,
+        // key, and ownership checks above guard against deleting a replaced or
+        // repurposed row; operators must not concurrently edit owned rows.
         self.remove_route_by_id(&expected.id, expected.family, bypass_backoff)
             .await?;
         Ok(true)
@@ -334,10 +324,37 @@ impl MikrotikRsClient {
     }
 
     async fn prune_duplicate_owned_routes(&self, duplicates: Vec<RouterRoute>) -> Result<()> {
-        for duplicate in duplicates {
-            self.delete_route_if_matches(&duplicate).await?;
+        let results = join_all_bounded(
+            duplicates
+                .iter()
+                .map(|route| self.delete_route_if_matches(route)),
+            MUTATION_PIPELINE_SIZE,
+        )
+        .await;
+        for result in results {
+            result?;
         }
         Ok(())
+    }
+
+    async fn set_route(
+        &self,
+        expected: &RouterRoute,
+        gateway: &str,
+        distance: u8,
+        comment: &str,
+    ) -> Result<bool> {
+        let distance_str = distance.to_string();
+        let set = CommandBuilder::new()
+            .command(route_command(expected.family, RouteOp::Set))
+            .attribute(ROUTER_ID_FIELD, Some(expected.id.as_str()))
+            .attribute(ROUTE_GATEWAY_FIELD, Some(gateway))
+            .attribute(ROUTE_DISTANCE_FIELD, Some(distance_str.as_str()))
+            .attribute(ROUTE_COMMENT_FIELD, Some(comment))
+            .attribute(ROUTE_DISABLED_FIELD, Some("no"))
+            .build();
+        let _ = self.send_rows("set host route", set).await?;
+        Ok(true)
     }
 
     async fn list_routes_for_family(
@@ -492,6 +509,20 @@ fn parse_router_route_from_reply(
     })
 }
 
+fn same_ownership_namespace(current: Option<&str>, expected: Option<&str>) -> bool {
+    fn namespace(comment: &str) -> Option<(&str, &str)> {
+        let mut parts = comment.split(';');
+        let prefix = parts.next()?.trim();
+        let plugin = parts.find_map(|part| part.trim().strip_prefix("pg="))?;
+        (!prefix.is_empty() && !plugin.is_empty()).then_some((prefix, plugin))
+    }
+
+    match (current.and_then(namespace), expected.and_then(namespace)) {
+        (Some(current), Some(expected)) => current == expected,
+        _ => false,
+    }
+}
+
 fn parse_routeros_bool(raw: &str, field: &str, action: &str) -> Result<bool> {
     if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("yes") || raw == "1" {
         return Ok(true);
@@ -638,27 +669,12 @@ impl MikrotikApi for MikrotikRsClient {
             let distance_changed = existing.distance != Some(distance);
             let comment_changed = existing.comment.as_deref() != Some(comment);
             let disabled_changed = existing.disabled;
-            if gateway_changed || distance_changed || comment_changed || disabled_changed {
-                let distance_str = distance.to_string();
-                let mut set_builder = CommandBuilder::new()
-                    .command(route_command(key.family(), RouteOp::Set))
-                    .attribute(ROUTER_ID_FIELD, Some(existing.id.as_str()));
-                if gateway_changed {
-                    set_builder = set_builder.attribute(ROUTE_GATEWAY_FIELD, Some(gateway));
-                }
-                if distance_changed {
-                    set_builder =
-                        set_builder.attribute(ROUTE_DISTANCE_FIELD, Some(distance_str.as_str()));
-                }
-                if comment_changed {
-                    set_builder = set_builder.attribute(ROUTE_COMMENT_FIELD, Some(comment));
-                }
-                if disabled_changed {
-                    set_builder = set_builder.attribute(ROUTE_DISABLED_FIELD, Some("no"));
-                }
-                let _ = self
-                    .send_rows("set host route", set_builder.build())
-                    .await?;
+            if (gateway_changed || distance_changed || comment_changed || disabled_changed)
+                && !self
+                    .set_route(&existing, gateway, distance, comment)
+                    .await?
+            {
+                return Err(DnsError::plugin("ros_route route changed before update"));
             }
             return Ok(existing.id);
         }
@@ -689,66 +705,6 @@ impl MikrotikApi for MikrotikRsClient {
                 })?
         };
         Ok(created.id)
-    }
-
-    async fn validate_route_config(
-        &self,
-        key: &RouteKey,
-        gateway: &str,
-        distance: u8,
-        comment: &str,
-    ) -> Result<()> {
-        let distance_str = distance.to_string();
-        let add = CommandBuilder::new()
-            .command(route_command(key.family(), RouteOp::Add))
-            .attribute(ROUTE_DST_FIELD, Some(&key.dst_address()))
-            .attribute(ROUTE_TABLE_FIELD, Some(&key.table))
-            .attribute(ROUTE_GATEWAY_FIELD, Some(gateway))
-            .attribute(ROUTE_DISTANCE_FIELD, Some(distance_str.as_str()))
-            .attribute(ROUTE_COMMENT_FIELD, Some(comment))
-            .attribute("disabled", Some("yes"))
-            .build();
-        if let Err(validation_error) = self.send_rows("validate route config", add).await {
-            // An add response can be lost after RouterOS has already created
-            // the disabled probe route. Attempt the same ownership-scoped
-            // cleanup used for later validation failures before retrying
-            // initialization, otherwise each retry may leave a new nonce row.
-            return match self.cleanup_validation_route(key, comment).await {
-                Ok(()) => Err(validation_error),
-                Err(cleanup_error) => Err(DnsError::plugin(format!(
-                    "{validation_error}; temporary validation-route cleanup also failed: {cleanup_error}"
-                ))),
-            };
-        }
-
-        let validation_result = async {
-            let route = self
-                .find_route_by_exact_comment(key, comment, false)
-                .await?
-                .ok_or_else(|| {
-                    DnsError::plugin(
-                        "ros_route validate route config succeeded but temporary route id not found",
-                    )
-                })?;
-            self.delete_route_if_matches(&route).await.map(|_| ())
-        }
-        .await;
-
-        if let Err(validation_error) = validation_result {
-            // The add may have reached RouterOS even when the follow-up query or
-            // delete failed. Retry cleanup on a fresh connection before returning
-            // the validation error; reconciliation also recognizes this comment
-            // kind and removes any residue left by a prolonged outage.
-            let cleanup_result = self.cleanup_validation_route(key, comment).await;
-            return match cleanup_result {
-                Ok(()) => Err(validation_error),
-                Err(cleanup_error) => Err(DnsError::plugin(format!(
-                    "{validation_error}; temporary validation-route cleanup also failed: {cleanup_error}"
-                ))),
-            };
-        }
-
-        Ok(())
     }
 
     async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool> {
@@ -839,6 +795,24 @@ mod tests {
         let reused_tag = route("*reused-tag", Some("fdns;pg=route-test;dm=operator-route"));
 
         assert!(!route_owned_by_plugin(&reused_tag, "fdns", "route-test"));
+    }
+
+    #[test]
+    fn deletion_guard_accepts_payload_changes_only_within_the_same_owner_namespace() {
+        let expected = "fdns;pg=route-test;kind=D;exp=400;seen=100";
+
+        assert!(same_ownership_namespace(
+            Some("fdns;pg=route-test;kind=D;exp=900;seen=500"),
+            Some(expected),
+        ));
+        assert!(!same_ownership_namespace(
+            Some("fdns;pg=another-plugin;kind=D;exp=900;seen=500"),
+            Some(expected),
+        ));
+        assert!(!same_ownership_namespace(
+            Some("operator-managed"),
+            Some(expected),
+        ));
     }
 
     #[test]

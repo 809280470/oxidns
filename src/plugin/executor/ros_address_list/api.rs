@@ -11,11 +11,9 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use mikrotik_rs::{Command, CommandBuilder};
 
-use super::manager::{
-    AddressListFamily, AddressListKey, decode_owned_comment, parse_router_address,
-    parse_routeros_duration_secs,
-};
+use super::model::{AddressListFamily, AddressListKey, decode_owned_comment, parse_router_address};
 use crate::infra::error::{DnsError, Result};
+use crate::infra::mikrotik::batching::join_all_bounded;
 use crate::infra::mikrotik::transport::{
     RouterOsConnectionConfig, RouterOsEvent, RouterOsResult, RouterOsTimeouts, RouterOsTransport,
     RouterOsTransportSnapshot,
@@ -32,6 +30,7 @@ const TIMEOUT_FIELD: &str = "timeout";
 /// RouterOS field containing ownership metadata.
 const COMMENT_FIELD: &str = "comment";
 const ADDRESS_LIST_PROPLIST: &str = ".id,list,address,timeout,comment";
+const MUTATION_PIPELINE_SIZE: usize = 16;
 
 /// RouterOS command for listing IPv4 firewall address-list rows.
 const COMMAND_IP_ADDRESS_LIST_PRINT: &str = "/ip/firewall/address-list/print";
@@ -225,6 +224,46 @@ impl MikrotikRsClient {
             Err(error) => Err(error.into()),
         }
     }
+
+    async fn set_entry_if_matches(
+        &self,
+        expected: &RouterListEntry,
+        timeout: Option<&str>,
+        comment: &str,
+    ) -> Result<bool> {
+        let current = self.find_entries_by_key(&expected.key).await?;
+        let Some(current) = current
+            .into_iter()
+            .find(|current| entry_matches_delete_snapshot(expected, current))
+        else {
+            return Ok(false);
+        };
+        let mut set = CommandBuilder::new()
+            .command(address_list_command(current.key.family, ListOp::Set))
+            .attribute(ADDRESS_ID_FIELD, Some(current.id.as_str()))
+            .attribute(COMMENT_FIELD, Some(comment));
+        if let Some(timeout) = timeout {
+            set = set.attribute(TIMEOUT_FIELD, Some(timeout));
+        }
+        let _ = self
+            .send_rows("set address-list entry", set.build())
+            .await?;
+        Ok(true)
+    }
+
+    async fn delete_entries_if_matches(&self, entries: Vec<RouterListEntry>) -> Result<()> {
+        let results = join_all_bounded(
+            entries
+                .iter()
+                .map(|entry| self.delete_entry_if_matches(entry)),
+            MUTATION_PIPELINE_SIZE,
+        )
+        .await;
+        for result in results {
+            result?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,30 +328,8 @@ fn parse_router_list_entry(
     }))
 }
 
-fn timeout_snapshot_matches(expected: Option<&str>, current: Option<&str>) -> bool {
-    match (expected, current) {
-        (None, None) => true,
-        (Some(expected), Some(current)) => {
-            match (
-                parse_routeros_duration_secs(expected),
-                parse_routeros_duration_secs(current),
-            ) {
-                // RouterOS counts timed entries down between the two reads.
-                // A larger current value means the row was refreshed after
-                // the snapshot and must not be removed by the older action.
-                (Some(expected), Some(current)) => current <= expected,
-                _ => current == expected,
-            }
-        }
-        _ => false,
-    }
-}
-
 fn entry_matches_delete_snapshot(expected: &RouterListEntry, current: &RouterListEntry) -> bool {
-    current.id == expected.id
-        && current.key == expected.key
-        && current.comment == expected.comment
-        && timeout_snapshot_matches(expected.timeout.as_deref(), current.timeout.as_deref())
+    current.id == expected.id && current.key == expected.key && current.comment == expected.comment
 }
 
 #[async_trait]
@@ -415,9 +432,7 @@ impl MikrotikApi for MikrotikRsClient {
             .position(|entry| entry.timeout.is_some() == timeout.is_some())
             .unwrap_or_default();
         let mut canonical = (!owned.is_empty()).then(|| owned.swap_remove(canonical));
-        for extra in owned {
-            self.delete_entry_if_matches(&extra).await?;
-        }
+        self.delete_entries_if_matches(owned).await?;
 
         if let Some(existing) = canonical.take() {
             // RouterOS timed and timeless rows are different enough that the
@@ -437,17 +452,14 @@ impl MikrotikApi for MikrotikRsClient {
             // the string looks unchanged, which keeps the remote timer alive.
             let timeout_changed = existing.timeout.as_deref() != timeout;
             let comment_changed = existing.comment.as_deref() != Some(comment);
-            if refresh_timeout || timeout_changed || comment_changed {
-                let mut set = CommandBuilder::new()
-                    .command(address_list_command(key.family, ListOp::Set))
-                    .attribute(ADDRESS_ID_FIELD, Some(existing.id.as_str()))
-                    .attribute(COMMENT_FIELD, Some(comment));
-                if let Some(timeout) = timeout {
-                    set = set.attribute(TIMEOUT_FIELD, Some(timeout));
-                }
-                let _ = self
-                    .send_rows("set address-list entry", set.build())
-                    .await?;
+            if (refresh_timeout || timeout_changed || comment_changed)
+                && !self
+                    .set_entry_if_matches(&existing, timeout, comment)
+                    .await?
+            {
+                return Err(DnsError::plugin(
+                    "ros_address_list entry changed before update",
+                ));
             }
             return Ok(Some(()));
         }
@@ -515,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_snapshot_allows_countdown_but_rejects_refresh_or_ownership_change() {
+    fn delete_snapshot_ignores_timeout_changes_but_rejects_ownership_change() {
         let key = AddressListKey::new("192.0.2.10".parse().expect("ip"), "policy".to_string());
         let expected = RouterListEntry {
             id: "*1".to_string(),
@@ -528,7 +540,7 @@ mod tests {
         assert!(entry_matches_delete_snapshot(&expected, &current));
 
         current.timeout = Some("301s".to_string());
-        assert!(!entry_matches_delete_snapshot(&expected, &current));
+        assert!(entry_matches_delete_snapshot(&expected, &current));
 
         current.timeout = Some("299s".to_string());
         current.comment = Some("operator-owned".to_string());

@@ -93,6 +93,8 @@ export interface ConfigField {
   docs?: string;
   required?: boolean;
   default?: unknown;
+  /** Render this field inside the collapsed advanced-settings section. */
+  advanced?: boolean;
   options?: {
     label: string;
     value: string | number;

@@ -1499,7 +1499,7 @@ export const zhCNPluginDefined = {
     },
     ros_route: {
       name: "RouterOS Route",
-      description: "把应答 IP 同步为 RouterOS 策略路由",
+      description: "把应答 IP 同步为 RouterOS routing table 中的逐 IP 静态路由",
       fields: {
         address: { label: "RouterOS API 地址", placeholder: "172.16.1.1:8728" },
         username: { label: "用户名" },
@@ -1508,24 +1508,42 @@ export const zhCNPluginDefined = {
         send_timeout: { label: "发送超时" },
         receive_timeout: { label: "接收超时" },
         async: { label: "异步提交" },
+        wait_timeout: {
+          label: "同步等待时间",
+          description: "仅 async=false 时生效；超时后已接收任务继续在后台执行。",
+        },
+        queue_capacity: {
+          label: "队列容量",
+          description: "分别限制入口队列和重试积压中的不同路由 key。",
+        },
         routing_table: { label: "路由表", placeholder: "via_proxy" },
         gateway4: { label: "IPv4 网关", placeholder: "192.168.88.2@main" },
         gateway6: { label: "IPv6 网关", placeholder: "fe80::2%ether1" },
         distance: { label: "路由距离" },
         comment_prefix: { label: "注释前缀" },
-        persistent: { label: "常驻路由" },
+        persistent: {
+          label: "常驻路由",
+          description: "期望状态；启动恢复并每 180 秒对账。动态路由不参与定时对账。",
+        },
         "persistent.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
         "persistent.ips[]": { label: "输入值", placeholder: "1.1.1.1" },
         "persistent.files": { label: "文件", placeholder: "/etc/oxidns/persistent_routes.txt" },
         "persistent.files[]": { label: "输入值", placeholder: "/etc/oxidns/persistent_routes.txt" },
         min_ttl: { label: "动态路由最小 TTL" },
         max_ttl: { label: "动态路由最大 TTL" },
-        fixed_ttl: { label: "动态路由固定 TTL", description: "填 0 表示动态路由不按时间过期。" },
+        fixed_ttl: {
+          label: "动态路由固定 TTL",
+          description: "填 0 表示不按时间过期；动态路由只由后续 DNS 观察刷新。",
+        },
         conntrack_guard: {
           label: "连接跟踪保护",
           description: "删除到期动态主机路由前检查精确目标 IP；有连接时延后删除。",
         },
-        cleanup_on_shutdown: { label: "关闭时清理" },
+        cleanup_on_shutdown: {
+          label: "关闭时清理",
+          description:
+            "应用级 reload 同样执行清理；reload 按 shutdown/restart 处理，不移交旧实例待处理观测。",
+        },
       },
       metrics: {
         labels: {
@@ -1540,7 +1558,7 @@ export const zhCNPluginDefined = {
           ros_route_observe_total: "提交给 RouterOS 路由管理器的地址观测总数。",
           ros_route_dropped_total: "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
           ros_route_sync_error_total: "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
-          ros_route_sync_timeout_total: "同步模式下入队或等待超时的观测总数。",
+          ros_route_sync_timeout_total: "同步模式下等待 manager 完成时超时的观测总数。",
           ros_route_delete_deferred_total:
             "因 RouterOS conntrack 中仍存在目标连接而延迟删除路由的总次数。",
           ros_route_connection_check_error_total:
@@ -1550,7 +1568,7 @@ export const zhCNPluginDefined = {
     },
     ros_address_list: {
       name: "RouterOS Address List",
-      description: "把应答 IP 同步到 RouterOS address-list",
+      description: "把应答 IP 同步到供 firewall、mangle 或路由规则使用的 address-list",
       fields: {
         address: {
           label: "RouterOS API 地址",
@@ -1581,6 +1599,14 @@ export const zhCNPluginDefined = {
           label: "异步提交",
           description: "控制地址写入行为是否采用异步方式。",
         },
+        wait_timeout: {
+          label: "同步等待时间",
+          description: "仅 async=false 时生效；超时后已接收任务继续在后台执行。",
+        },
+        queue_capacity: {
+          label: "队列容量",
+          description: "分别限制入口队列和重试积压中的不同 IP。",
+        },
         address_list4: {
           label: "IPv4 Address List",
           description: "指定 IPv4 地址写入的目标 address-list 名称。",
@@ -1595,7 +1621,7 @@ export const zhCNPluginDefined = {
         },
         persistent: {
           label: "常驻地址",
-          description: "定义需要长期保留的静态地址集合。",
+          description: "期望状态；启动恢复并每 180 秒对账。动态项不参与定时对账。",
         },
         "persistent.ips": {
           label: "IP / CIDR",
@@ -1625,11 +1651,12 @@ export const zhCNPluginDefined = {
         },
         fixed_ttl: {
           label: "动态项固定 TTL",
-          description: "为所有动态写入项指定固定 TTL。",
+          description: "为动态项指定固定 TTL；刷新只由后续 DNS 观察触发。",
         },
         cleanup_on_shutdown: {
           label: "关闭时清理",
-          description: "控制插件退出时是否清理由其管理的条目。",
+          description:
+            "控制正常关闭及应用级 reload 时是否清理由其管理的条目；reload 按 shutdown/restart 处理，不移交旧实例待处理观测。",
         },
       },
       metrics: {
@@ -1647,7 +1674,7 @@ export const zhCNPluginDefined = {
           ros_address_list_sync_error_total:
             "同步模式下在 RouterOS 管理器侧失败的观测总数。",
           ros_address_list_sync_timeout_total:
-            "同步模式下入队或等待超时的观测总数。",
+            "同步模式下等待 manager 完成时超时的观测总数。",
         },
       },
     },

@@ -3,23 +3,29 @@
 //! Dynamic state is keyed only by the destination host route. DNS answers add
 //! or extend leases; absence from a later answer never withdraws a route.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use ahash::{AHashMap, AHashSet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::RosRouteMetrics;
 use super::api::{MikrotikApi, RouterRoute};
+use super::model::{
+    RouteCommentCodec, RouteCommentKind, RouteCommentMeta, RouteFamily, RouteKey,
+    is_validation_comment,
+};
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result};
 use crate::infra::mikrotik::batching::join_all_bounded;
 use crate::infra::mikrotik::completion::BatchCompletion;
-use crate::infra::mikrotik::ip_prefix::{IpPrefix, host_prefix};
-use crate::infra::mikrotik::lease::{LeaseBook, LeaseDeadline, LeasePolicy};
+use crate::infra::mikrotik::ip_prefix::IpPrefix;
+use crate::infra::mikrotik::lease::{
+    LeaseBook, LeaseDeadline, LeasePolicy, ROUTE_MAX_REFRESH_INTERVAL_MS,
+};
 use crate::infra::mikrotik::lifecycle::abort_and_reap;
 use crate::infra::mikrotik::mailbox::{Coalesce, KeyedMailbox, PushOutcome, TryPushError};
 use crate::infra::mikrotik::reconcile::{BackgroundReconcile, ReconcileRetry, VersionedSnapshot};
@@ -29,21 +35,12 @@ use crate::infra::task as task_center;
 
 const ROUTE_DEFAULT_V4: &str = "0.0.0.0/0";
 const ROUTE_DEFAULT_V6: &str = "::/0";
-const MANAGER_QUEUE_SIZE: usize = 1024;
 const CONTROL_QUEUE_SIZE: usize = 2;
 const SWEEP_INTERVAL_SECS: u64 = 30;
 const RECONCILE_INTERVAL_SECS: u64 = 180;
 const CONNECTION_GUARD_RETRY_INTERVAL_SECS: u64 = SWEEP_INTERVAL_SECS;
 const CONNECTION_QUERY_BATCH_SIZE: usize = 128;
 const UPSERT_PIPELINE_SIZE: usize = 16;
-
-const COMMENT_FIELD_PLUGIN: &str = "pg";
-const COMMENT_FIELD_KIND: &str = "kind";
-const COMMENT_FIELD_EXP: &str = "exp";
-const COMMENT_FIELD_SEEN: &str = "seen";
-const COMMENT_KIND_DYNAMIC: &str = "D";
-const COMMENT_KIND_PERSISTENT: &str = "P";
-const COMMENT_KIND_GATEWAY_CHECK: &str = "V";
 
 #[derive(Debug, Clone)]
 pub(super) struct RouteManagerConfig {
@@ -58,184 +55,7 @@ pub(super) struct RouteManagerConfig {
     pub(super) max_ttl: u32,
     pub(super) fixed_ttl: Option<u32>,
     pub(super) conntrack_guard: bool,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub(super) enum RouteFamily {
-    Ipv4,
-    Ipv6,
-}
-
-impl RouteFamily {
-    pub(super) fn from_ip(ip: IpAddr) -> Self {
-        match ip {
-            IpAddr::V4(_) => Self::Ipv4,
-            IpAddr::V6(_) => Self::Ipv6,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub(super) struct RouteKey {
-    pub(super) ip: IpAddr,
-    pub(super) prefix: u8,
-    pub(super) table: String,
-}
-
-impl RouteKey {
-    pub(super) fn new(ip: IpAddr, table: String) -> Self {
-        Self {
-            ip,
-            prefix: host_prefix(ip),
-            table,
-        }
-    }
-
-    pub(super) fn family(&self) -> RouteFamily {
-        RouteFamily::from_ip(self.ip)
-    }
-
-    pub(super) fn dst_address(&self) -> String {
-        format!("{}/{}", self.ip, self.prefix)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum RouteCommentKind {
-    Dynamic,
-    Persistent,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) struct RouteCommentMeta {
-    pub(super) kind: RouteCommentKind,
-    pub(super) expires_at_ms: LeaseDeadline,
-    pub(super) last_seen_ms: u64,
-}
-
-#[derive(Debug)]
-pub(super) struct RouteCommentCodec;
-
-impl RouteCommentCodec {
-    fn prefix(prefix: &str, plugin_tag: &str, kind: &str) -> String {
-        let mut out = String::new();
-        if !prefix.is_empty() {
-            out.push_str(prefix);
-            out.push(';');
-        }
-        out.push_str(COMMENT_FIELD_PLUGIN);
-        out.push('=');
-        out.push_str(plugin_tag);
-        out.push(';');
-        out.push_str(COMMENT_FIELD_KIND);
-        out.push('=');
-        out.push_str(kind);
-        out
-    }
-
-    fn encode_persistent(prefix: &str, plugin_tag: &str) -> String {
-        Self::prefix(prefix, plugin_tag, COMMENT_KIND_PERSISTENT)
-    }
-
-    fn encode_dynamic(
-        prefix: &str,
-        plugin_tag: &str,
-        deadline: LeaseDeadline,
-        last_seen_ms: u64,
-    ) -> String {
-        let mut out = Self::prefix(prefix, plugin_tag, COMMENT_KIND_DYNAMIC);
-        let expires_at = deadline.unix_millis().map_or(0, |value| value / 1_000);
-        out.push(';');
-        out.push_str(COMMENT_FIELD_EXP);
-        out.push('=');
-        out.push_str(&expires_at.to_string());
-        out.push(';');
-        out.push_str(COMMENT_FIELD_SEEN);
-        out.push('=');
-        out.push_str(&(last_seen_ms / 1_000).to_string());
-        out
-    }
-
-    pub(super) fn decode(
-        prefix: &str,
-        plugin_tag: &str,
-        family: RouteFamily,
-        dst_address: &str,
-        comment: &str,
-    ) -> Result<Option<RouteCommentMeta>> {
-        if !prefix.is_empty()
-            && (!comment.starts_with(prefix) || comment.as_bytes().get(prefix.len()) != Some(&b';'))
-        {
-            return Ok(None);
-        }
-        let mut owner = None;
-        let mut kind = None;
-        let mut expiry = None;
-        let mut seen = None;
-        for token in comment.split(';') {
-            let Some((key, value)) = token.trim().split_once('=') else {
-                continue;
-            };
-            match key.trim() {
-                COMMENT_FIELD_PLUGIN => owner = Some(value.trim()),
-                COMMENT_FIELD_KIND => kind = Some(value.trim()),
-                COMMENT_FIELD_EXP => expiry = Some(value.trim()),
-                COMMENT_FIELD_SEEN => seen = Some(value.trim()),
-                _ => {}
-            }
-        }
-        if owner != Some(plugin_tag) {
-            return Ok(None);
-        }
-        let prefix = dst_address
-            .parse::<IpPrefix>()
-            .map_err(|error| DnsError::plugin(format!("ros_route invalid dst-address: {error}")))?;
-        if RouteFamily::from_ip(prefix.address()) != family {
-            return Err(DnsError::plugin(
-                "ros_route comment address family mismatch",
-            ));
-        }
-        match kind {
-            Some(COMMENT_KIND_PERSISTENT) => Ok(Some(RouteCommentMeta {
-                kind: RouteCommentKind::Persistent,
-                expires_at_ms: LeaseDeadline::Timeless,
-                last_seen_ms: 0,
-            })),
-            Some(COMMENT_KIND_DYNAMIC) if prefix.is_host() => {
-                let expiry = expiry
-                    .ok_or_else(|| DnsError::plugin("ros_route dynamic comment missing exp"))?
-                    .parse::<u64>()
-                    .map_err(|error| DnsError::plugin(format!("ros_route invalid exp: {error}")))?;
-                let seen = seen
-                    .ok_or_else(|| DnsError::plugin("ros_route dynamic comment missing seen"))?
-                    .parse::<u64>()
-                    .map_err(|error| {
-                        DnsError::plugin(format!("ros_route invalid seen: {error}"))
-                    })?;
-                Ok(Some(RouteCommentMeta {
-                    kind: RouteCommentKind::Dynamic,
-                    expires_at_ms: if expiry == 0 {
-                        LeaseDeadline::Timeless
-                    } else {
-                        LeaseDeadline::At(expiry.saturating_mul(1_000))
-                    },
-                    last_seen_ms: seen.saturating_mul(1_000),
-                }))
-            }
-            Some(COMMENT_KIND_DYNAMIC) => Err(DnsError::plugin(
-                "ros_route dynamic comment is only valid for host routes",
-            )),
-            _ => Ok(None),
-        }
-    }
-}
-
-fn is_validation_comment(prefix: &str, plugin_tag: &str, comment: &str) -> bool {
-    comment == RouteCommentCodec::prefix(prefix, plugin_tag, COMMENT_KIND_GATEWAY_CHECK)
-        || comment.starts_with(&format!(
-            "{};nonce=",
-            RouteCommentCodec::prefix(prefix, plugin_tag, COMMENT_KIND_GATEWAY_CHECK)
-        ))
+    pub(super) queue_capacity: usize,
 }
 
 fn deadline_is_later(candidate: LeaseDeadline, current: LeaseDeadline) -> bool {
@@ -261,6 +81,18 @@ struct RouteState {
     distance: u8,
     router_id: Option<String>,
     sync_state: SyncState,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReconcileMode {
+    StartupRecovery,
+    Persistent,
+}
+
+#[derive(Debug)]
+struct RouteSnapshot {
+    mode: ReconcileMode,
+    routes: Vec<RouterRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -291,22 +123,6 @@ enum ControlCommand {
     Reconcile,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct RoutePendingWork {
-    items: Vec<(RouteKey, RouteObservation)>,
-}
-
-#[derive(Debug)]
-enum LifecycleCommand {
-    Quiesce {
-        done: oneshot::Sender<RoutePendingWork>,
-    },
-    Activate {
-        pending: RoutePendingWork,
-        done: oneshot::Sender<()>,
-    },
-}
-
 impl Coalesce for ControlCommand {
     fn coalesce(&mut self, newer: Self) {
         *self = newer;
@@ -328,47 +144,19 @@ pub(super) struct RouteManagerHandle {
     gateway6_enabled: bool,
     policy: LeasePolicy,
     metrics: Option<Arc<RosRouteMetrics>>,
-    lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
 }
 
 impl RouteManagerHandle {
-    fn new(
-        config: &RouteManagerConfig,
-        metrics: Option<Arc<RosRouteMetrics>>,
-        lifecycle: Option<mpsc::Sender<LifecycleCommand>>,
-    ) -> Self {
+    fn new(config: &RouteManagerConfig, metrics: Option<Arc<RosRouteMetrics>>) -> Self {
         Self {
-            observations: KeyedMailbox::new(MANAGER_QUEUE_SIZE),
+            observations: KeyedMailbox::new(config.queue_capacity),
             controls: KeyedMailbox::new(CONTROL_QUEUE_SIZE),
             routing_table: config.routing_table.clone(),
             gateway4_enabled: config.gateway4.is_some(),
             gateway6_enabled: config.gateway6.is_some(),
             policy: LeasePolicy::new(config.min_ttl, config.max_ttl, config.fixed_ttl),
             metrics,
-            lifecycle,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn new_for_test() -> Self {
-        AppClock::start();
-        Self::new(
-            &RouteManagerConfig {
-                plugin_tag: "test".to_string(),
-                routing_table: "main".to_string(),
-                gateway4: Some("192.0.2.1".to_string()),
-                gateway6: Some("2001:db8::1".to_string()),
-                persistent_ips: AHashSet::new(),
-                comment_prefix: "fdns".to_string(),
-                distance: 100,
-                min_ttl: 60,
-                max_ttl: 3_600,
-                fixed_ttl: None,
-                conntrack_guard: false,
-            },
-            None,
-            None,
-        )
     }
 
     fn prepare(&self, addrs: Vec<ObservedAddr>) -> Vec<(RouteKey, LeaseDeadline, u64)> {
@@ -466,87 +254,10 @@ impl RouteManagerHandle {
         error.map_or(Ok(total), Err)
     }
 
-    pub(super) async fn observe(
-        &self,
-        addrs: Vec<ObservedAddr>,
-        wait: oneshot::Sender<Result<()>>,
-    ) -> std::result::Result<PushOutcome, ObserveEnqueueError> {
-        let prepared = self.prepare(addrs);
-        if prepared.is_empty() {
-            let _ = wait.send(Ok(()));
-            return Ok(PushOutcome::Inserted);
-        }
-        let completion = BatchCompletion::new(prepared.len(), wait);
-        let total_items = prepared.len();
-        let mut total = PushOutcome::Coalesced;
-        for (index, (key, deadline, observed_at_ms)) in prepared.into_iter().enumerate() {
-            let command = RouteObservation {
-                deadline,
-                observed_at_ms,
-                completions: vec![completion.clone()],
-            };
-            match self.observations.push(key, command).await {
-                Ok(outcome) => {
-                    self.finish_enqueue_metric(outcome);
-                    if matches!(outcome, PushOutcome::Inserted) {
-                        total = outcome;
-                    }
-                }
-                Err(error) => {
-                    let result = Err(DnsError::plugin("ros_route observation mailbox is closed"));
-                    for completion in error.0.completions {
-                        completion.finish(&result);
-                    }
-                    for _ in index + 1..total_items {
-                        completion.finish(&result);
-                    }
-                    return Err(ObserveEnqueueError::Closed);
-                }
-            }
-        }
-        Ok(total)
-    }
-
     pub(super) fn request_reconcile(&self) -> bool {
         self.controls
             .try_push(ControlKey::Reconcile, ControlCommand::Reconcile)
             .is_ok()
-    }
-
-    pub(super) async fn quiesce(&self) -> RoutePendingWork {
-        let Some(lifecycle) = &self.lifecycle else {
-            return RoutePendingWork::default();
-        };
-        let (done, wait) = oneshot::channel();
-        if lifecycle
-            .send(LifecycleCommand::Quiesce { done })
-            .await
-            .is_err()
-        {
-            return RoutePendingWork::default();
-        }
-        wait.await.unwrap_or_default()
-    }
-
-    pub(super) async fn activate(&self, pending: RoutePendingWork) -> Result<()> {
-        let Some(lifecycle) = &self.lifecycle else {
-            return Ok(());
-        };
-        let (done, wait) = oneshot::channel();
-        lifecycle
-            .send(LifecycleCommand::Activate { pending, done })
-            .await
-            .map_err(|_| DnsError::plugin("ros_route manager lifecycle channel is closed"))?;
-        wait.await
-            .map_err(|_| DnsError::plugin("ros_route manager activation was cancelled"))
-    }
-
-    #[cfg(test)]
-    pub(super) fn take_reconcile_for_test(&self) -> bool {
-        matches!(
-            self.controls.try_recv(),
-            Some((ControlKey::Reconcile, ControlCommand::Reconcile))
-        )
     }
 
     fn request_sweep(&self) {
@@ -577,26 +288,17 @@ pub(super) struct RouteManagerRuntime {
 }
 
 impl RouteManagerRuntime {
-    pub(super) fn start_paused(tag: String, manager: RouteManager) -> Self {
-        Self::start_with_state(tag, manager, false)
-    }
-
-    fn start_with_state(tag: String, manager: RouteManager, active: bool) -> Self {
-        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
-        let handle =
-            RouteManagerHandle::new(&manager.cfg, manager.metrics.clone(), Some(lifecycle_tx));
+    pub(super) fn start(tag: String, manager: RouteManager) -> Self {
+        let has_persistent = !manager.persistent.is_empty();
+        let handle = RouteManagerHandle::new(&manager.cfg, manager.metrics.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker_handle = Some(tokio::spawn(run_manager_worker(
             tag.clone(),
             manager,
             handle.clone(),
-            lifecycle_rx,
-            active,
             shutdown_rx,
         )));
-        if active {
-            handle.request_reconcile();
-        }
+        handle.request_reconcile();
 
         let sweep_handle = handle.clone();
         let sweep_task_id = Some(task_center::spawn_fixed(
@@ -607,17 +309,19 @@ impl RouteManagerRuntime {
                 async move { sweep_handle.request_sweep() }
             },
         ));
-        let reconcile_handle = handle.clone();
-        let reconcile_task_id = Some(task_center::spawn_fixed(
-            format!("ros_route:{tag}:reconcile"),
-            Duration::from_secs(RECONCILE_INTERVAL_SECS),
-            move || {
-                let reconcile_handle = reconcile_handle.clone();
-                async move {
-                    reconcile_handle.request_reconcile();
-                }
-            },
-        ));
+        let reconcile_task_id = has_persistent.then(|| {
+            let reconcile_handle = handle.clone();
+            task_center::spawn_fixed(
+                format!("ros_route:{tag}:reconcile"),
+                Duration::from_secs(RECONCILE_INTERVAL_SECS),
+                move || {
+                    let reconcile_handle = reconcile_handle.clone();
+                    async move {
+                        reconcile_handle.request_reconcile();
+                    }
+                },
+            )
+        });
         Self {
             handle,
             shutdown_tx: Some(shutdown_tx),
@@ -712,9 +416,9 @@ pub(super) struct RouteManager {
     leases: LeaseBook<RouteKey>,
     routes: AHashMap<RouteKey, RouteState>,
     connection_retry_after: AHashMap<RouteKey, u64>,
-    reconcile: BackgroundReconcile<Vec<RouterRoute>>,
+    reconcile: BackgroundReconcile<RouteSnapshot>,
     reconcile_retry: ReconcileRetry,
-    empty_state_needs_reconcile: bool,
+    startup_recovery_pending: bool,
     initialized: bool,
 }
 
@@ -738,7 +442,7 @@ impl RouteManager {
             connection_retry_after: AHashMap::new(),
             reconcile: BackgroundReconcile::new(),
             reconcile_retry: ReconcileRetry::default(),
-            empty_state_needs_reconcile: true,
+            startup_recovery_pending: true,
             initialized: false,
             cfg,
         }
@@ -801,7 +505,6 @@ impl RouteManager {
         if self.initialized {
             return Ok(());
         }
-        self.validate_gateways().await?;
         for key in self.persistent.clone() {
             let Some(gateway) = self.gateway_for(key.family()).map(str::to_string) else {
                 continue;
@@ -814,34 +517,6 @@ impl RouteManager {
             });
         }
         self.initialized = true;
-        Ok(())
-    }
-
-    async fn validate_gateways(&self) -> Result<()> {
-        for (family, gateway) in [
-            (RouteFamily::Ipv4, self.cfg.gateway4.as_deref()),
-            (RouteFamily::Ipv6, self.cfg.gateway6.as_deref()),
-        ] {
-            let Some(gateway) = gateway else { continue };
-            let nonce = validation_nonce();
-            let key = validation_route_key(family, &self.cfg.routing_table, nonce);
-            let comment = format!(
-                "{};nonce={nonce}",
-                RouteCommentCodec::prefix(
-                    &self.cfg.comment_prefix,
-                    &self.cfg.plugin_tag,
-                    COMMENT_KIND_GATEWAY_CHECK,
-                )
-            );
-            self.api
-                .validate_route_config(&key, gateway, self.cfg.distance, &comment)
-                .await
-                .map_err(|error| {
-                    DnsError::plugin(format!(
-                        "ros_route {family:?} gateway validation failed: {error}"
-                    ))
-                })?;
-        }
         Ok(())
     }
 
@@ -960,15 +635,33 @@ impl RouteManager {
         for ((key, _, _), result) in upserts.into_iter().zip(results) {
             match result {
                 Ok(router_id) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics
+                            .write_success_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics.last_write_success_timestamp_seconds.store(
+                            AppClock::now_timestamp() / 1_000,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     if let Some(state) = self.routes.get_mut(&key) {
                         state.router_id = Some(router_id);
                         state.sync_state = SyncState::Synced;
                     }
                     if !self.persistent.contains(&key) {
-                        self.leases.confirm_synced(&key, now_ms);
+                        self.leases.confirm_synced_with_max_interval(
+                            &key,
+                            now_ms,
+                            Some(ROUTE_MAX_REFRESH_INTERVAL_MS),
+                        );
                     }
                 }
                 Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics
+                            .write_error_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     first_error.get_or_insert(error);
                 }
             }
@@ -1131,8 +824,12 @@ impl RouteManager {
         if self.reconcile.is_running() {
             return Ok(());
         }
-        if self.persistent.is_empty() && self.leases.is_empty() && !self.empty_state_needs_reconcile
-        {
+        let mode = if self.startup_recovery_pending {
+            ReconcileMode::StartupRecovery
+        } else {
+            ReconcileMode::Persistent
+        };
+        if mode == ReconcileMode::Persistent && self.persistent.is_empty() {
             return Ok(());
         }
         let api = self.api.clone();
@@ -1140,8 +837,10 @@ impl RouteManager {
         let require_ipv4 = self.cfg.gateway4.is_some();
         let require_ipv6 = self.cfg.gateway6.is_some();
         self.reconcile.start(self.leases.revision(), async move {
-            api.list_managed_routes(&table, require_ipv4, require_ipv6)
-                .await
+            let routes = api
+                .list_managed_routes(&table, require_ipv4, require_ipv6)
+                .await?;
+            Ok(RouteSnapshot { mode, routes })
         });
         Ok(())
     }
@@ -1151,7 +850,7 @@ impl RouteManager {
             return;
         };
         match result {
-            Ok(Ok(snapshot)) => match self.apply_snapshot(snapshot).await {
+            Ok(Ok(snapshot)) => match self.apply_reconcile_result(snapshot).await {
                 Ok(()) => {
                     self.reconcile_retry.reset();
                     if let Some(metrics) = &self.metrics {
@@ -1172,6 +871,25 @@ impl RouteManager {
                 )))
                 .await
             }
+        }
+    }
+
+    async fn apply_reconcile_result(
+        &mut self,
+        snapshot: VersionedSnapshot<RouteSnapshot>,
+    ) -> Result<()> {
+        let VersionedSnapshot { generation, value } = snapshot;
+        match value.mode {
+            ReconcileMode::StartupRecovery => {
+                self.apply_snapshot(VersionedSnapshot {
+                    generation,
+                    value: value.routes,
+                })
+                .await?;
+                self.startup_recovery_pending = false;
+                Ok(())
+            }
+            ReconcileMode::Persistent => self.apply_persistent_snapshot(value.routes).await,
         }
     }
 
@@ -1330,6 +1048,7 @@ impl RouteManager {
                         recovered_seen,
                         snapshot.generation,
                         now,
+                        Some(ROUTE_MAX_REFRESH_INTERVAL_MS),
                     );
                 }
                 let lease = self.leases.get(&key).copied();
@@ -1427,12 +1146,142 @@ impl RouteManager {
         if let Err(error) = self.sync_keys(keys, now).await {
             first_error.get_or_insert(error);
         }
-        if first_error.is_none()
-            && self.persistent.is_empty()
-            && self.leases.is_empty()
-            && self.routes.is_empty()
-        {
-            self.empty_state_needs_reconcile = false;
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn apply_persistent_snapshot(&mut self, rows: Vec<RouterRoute>) -> Result<()> {
+        let now = now_millis();
+        let mut desired = AHashMap::<RouteKey, Vec<(RouterRoute, RouteCommentMeta)>>::new();
+        let mut stale = AHashMap::<RouteKey, Vec<RouterRoute>>::new();
+
+        for route in rows {
+            if is_default_route_dst(&route.dst_address) {
+                continue;
+            }
+            let Ok(prefix) = route.dst_address.parse::<IpPrefix>() else {
+                continue;
+            };
+            let key = RouteKey {
+                ip: prefix.address(),
+                prefix: prefix.prefix(),
+                table: self.cfg.routing_table.clone(),
+            };
+            let Some(comment) = route.comment.as_deref() else {
+                continue;
+            };
+            let Ok(Some(meta)) = RouteCommentCodec::decode(
+                &self.cfg.comment_prefix,
+                &self.cfg.plugin_tag,
+                route.family,
+                &route.dst_address,
+                comment,
+            ) else {
+                continue;
+            };
+            if self.persistent.contains(&key) {
+                desired.entry(key).or_default().push((route, meta));
+            } else if meta.kind == RouteCommentKind::Persistent {
+                stale.entry(key).or_default().push(route);
+            }
+        }
+
+        let mut first_error = None;
+        let mut sync = Vec::new();
+        for key in self.persistent.clone() {
+            let Some(gateway) = self.gateway_for(key.family()).map(str::to_string) else {
+                continue;
+            };
+            let expected = RouteCommentCodec::encode_persistent(
+                &self.cfg.comment_prefix,
+                &self.cfg.plugin_tag,
+            );
+            let mut candidates = desired.remove(&key).unwrap_or_default();
+            if candidates.is_empty() {
+                self.routes.insert(
+                    key.clone(),
+                    RouteState {
+                        gateway,
+                        distance: self.cfg.distance,
+                        router_id: None,
+                        sync_state: SyncState::PendingCreate,
+                    },
+                );
+                sync.push(key);
+                continue;
+            }
+            let canonical = candidates
+                .iter()
+                .position(|(route, meta)| {
+                    meta.kind == RouteCommentKind::Persistent
+                        && route.gateway.as_deref() == Some(gateway.as_str())
+                        && route.distance == Some(self.cfg.distance)
+                        && !route.disabled
+                        && route.comment.as_deref() == Some(expected.as_str())
+                })
+                .unwrap_or_default();
+            let (route, meta) = candidates.swap_remove(canonical);
+            for (duplicate, _) in candidates {
+                if let Err(error) = self.delete_route_if_still_owned(&duplicate).await {
+                    first_error.get_or_insert(error);
+                }
+            }
+            let dirty = meta.kind != RouteCommentKind::Persistent
+                || route.gateway.as_deref() != Some(gateway.as_str())
+                || route.distance != Some(self.cfg.distance)
+                || route.disabled
+                || route.comment.as_deref() != Some(expected.as_str());
+            self.routes.insert(
+                key.clone(),
+                RouteState {
+                    gateway,
+                    distance: self.cfg.distance,
+                    router_id: Some(route.id),
+                    sync_state: if dirty {
+                        SyncState::Dirty
+                    } else {
+                        SyncState::Synced
+                    },
+                },
+            );
+            if dirty {
+                sync.push(key);
+            }
+        }
+
+        for (key, mut routes) in stale {
+            if self
+                .leases
+                .get(&key)
+                .is_some_and(|lease| !lease.desired().is_expired(now))
+            {
+                let route = routes.swap_remove(0);
+                for duplicate in routes {
+                    if let Err(error) = self.delete_route_if_still_owned(&duplicate).await {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                if let Some(gateway) = self.gateway_for(key.family()).map(str::to_string) {
+                    self.routes.insert(
+                        key.clone(),
+                        RouteState {
+                            gateway,
+                            distance: self.cfg.distance,
+                            router_id: Some(route.id),
+                            sync_state: SyncState::Dirty,
+                        },
+                    );
+                    sync.push(key);
+                }
+            } else {
+                if let Err(error) = self.delete_routes_if_still_owned(&routes).await {
+                    first_error.get_or_insert(error);
+                }
+                self.forget_deleted(&key);
+            }
+        }
+
+        if let Err(error) = self.sync_keys(sync, now).await {
+            first_error.get_or_insert(error);
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -1546,8 +1395,6 @@ async fn run_manager_worker(
     tag: String,
     mut manager: RouteManager,
     handle: RouteManagerHandle,
-    mut lifecycle_rx: mpsc::Receiver<LifecycleCommand>,
-    mut active: bool,
     mut shutdown_rx: oneshot::Receiver<ShutdownRequest>,
 ) {
     let error_logs = ErrorLogThrottle::default();
@@ -1569,10 +1416,12 @@ async fn run_manager_worker(
             }
         };
         enum Event {
-            Observe(Vec<(RouteKey, RouteObservation)>),
+            Observe {
+                batch: Vec<(RouteKey, RouteObservation)>,
+                from_retry: bool,
+            },
             Control(ControlCommand),
             ReconcileCompleted,
-            Lifecycle(LifecycleCommand),
         }
         let event = tokio::select! {
             biased;
@@ -1582,10 +1431,9 @@ async fn run_manager_worker(
                 }
                 break;
             }
-            lifecycle = lifecycle_rx.recv() => lifecycle.map(Event::Lifecycle),
-            _ = manager.reconcile.wait(), if active && manager.reconcile.is_running() => Some(Event::ReconcileCompleted),
-            control = handle.controls.recv(), if active => control.map(|(_, command)| Event::Control(command)),
-            _ = retry_wakeup, if active => {
+            _ = manager.reconcile.wait(), if manager.reconcile.is_running() => Some(Event::ReconcileCompleted),
+            control = handle.controls.recv() => control.map(|(_, command)| Event::Control(command)),
+            _ = retry_wakeup => {
                 let now = tokio::time::Instant::now();
                 let keys = retries
                     .iter()
@@ -1604,85 +1452,29 @@ async fn run_manager_worker(
                         })
                     })
                     .collect::<Vec<_>>();
-                (!due.is_empty()).then_some(Event::Observe(due))
+                (!due.is_empty()).then_some(Event::Observe {
+                    batch: due,
+                    from_retry: true,
+                })
             }
-            _ = reconcile_retry_wakeup, if active => {
+            _ = reconcile_retry_wakeup => {
                 manager.reconcile_retry.mark_due();
                 Some(Event::Control(ControlCommand::Reconcile))
             }
-            observation = handle.observations.recv(), if active => observation.map(|first| {
+            observation = handle.observations.recv() => observation.map(|first| {
                 let mut batch = vec![first];
                 while batch.len() < UPSERT_PIPELINE_SIZE {
                     let Some(next) = handle.observations.try_recv() else { break };
                     batch.push(next);
                 }
-                Event::Observe(batch)
+                Event::Observe {
+                    batch,
+                    from_retry: false,
+                }
             }),
         };
         let Some(event) = event else { break };
         match event {
-            Event::Lifecycle(LifecycleCommand::Quiesce { done }) => {
-                active = false;
-                manager.reconcile.cancel().await;
-                let mut merged = AHashMap::<RouteKey, RouteObservation>::new();
-                for (key, command) in handle.observations.drain_where(|_| true) {
-                    merged
-                        .entry(key)
-                        .and_modify(|current| current.coalesce(command.clone()))
-                        .or_insert(command);
-                }
-                for (key, (_, command)) in retries.drain() {
-                    merged
-                        .entry(key)
-                        .and_modify(|current| current.coalesce(command.clone()))
-                        .or_insert(command);
-                }
-                let _ = done.send(RoutePendingWork {
-                    items: merged.into_iter().collect(),
-                });
-            }
-            Event::Lifecycle(LifecycleCommand::Activate { pending, done }) => {
-                let now = now_millis();
-                for (key, mut command) in pending.items {
-                    command.deadline = manager
-                        .policy()
-                        .cap_recovered(command.deadline, command.observed_at_ms);
-                    if command.deadline.is_expired(now) {
-                        for completion in command.completions {
-                            completion.finish(&Ok(()));
-                        }
-                        continue;
-                    }
-                    match handle.observations.try_push(key.clone(), command) {
-                        Ok(_) => {}
-                        Err(TryPushError::Full(command)) => {
-                            defer_route_observation(
-                                &mut retries,
-                                tokio::time::Instant::now(),
-                                key,
-                                command,
-                                manager.metrics.as_deref(),
-                            );
-                        }
-                        Err(TryPushError::Closed(command)) => {
-                            let result = Err(DnsError::plugin(
-                                "ros_route handoff observation mailbox is closed",
-                            ));
-                            for completion in command.completions {
-                                completion.finish(&result);
-                            }
-                            if let Some(metrics) = &manager.metrics {
-                                metrics
-                                    .dropped_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-                active = true;
-                handle.request_reconcile();
-                let _ = done.send(());
-            }
             Event::ReconcileCompleted => manager.harvest_reconcile().await,
             Event::Control(ControlCommand::Reconcile) => {
                 if let Err(error) = manager.start_reconcile().await {
@@ -1696,7 +1488,24 @@ async fn run_manager_worker(
                     warn!(plugin = %tag, err = %error, "ros_route sweep failed");
                 }
             }
-            Event::Observe(mut batch) => {
+            Event::Observe {
+                mut batch,
+                from_retry,
+            } => {
+                if !from_retry && let Some(retry_at) = retries.values().map(|(at, _)| *at).min() {
+                    for (key, command) in batch.drain(..) {
+                        defer_route_observation(
+                            &mut retries,
+                            manager.cfg.queue_capacity,
+                            retry_at,
+                            key,
+                            command,
+                            manager.metrics.as_deref(),
+                        );
+                    }
+                    handle.refresh_pending_metric_with(retries.len());
+                    continue;
+                }
                 let observations = batch
                     .iter()
                     .map(|(key, command)| (key.clone(), command.clone()))
@@ -1712,11 +1521,14 @@ async fn run_manager_worker(
                         completion.finish(&result);
                     }
                     if let Some(delay) = retry_delay {
-                        if retries.len() >= MANAGER_QUEUE_SIZE && !retries.contains_key(&key) {
+                        if retries.len() >= manager.cfg.queue_capacity
+                            && !retries.contains_key(&key)
+                        {
                             manager.discard_unsynced_observation(&key);
                         }
                         defer_route_observation(
                             &mut retries,
+                            manager.cfg.queue_capacity,
                             tokio::time::Instant::now() + delay,
                             key,
                             command,
@@ -1739,6 +1551,7 @@ async fn run_manager_worker(
 
 fn defer_route_observation(
     retries: &mut AHashMap<RouteKey, (tokio::time::Instant, RouteObservation)>,
+    capacity: usize,
     retry_at: tokio::time::Instant,
     key: RouteKey,
     command: RouteObservation,
@@ -1754,7 +1567,7 @@ fn defer_route_observation(
         }
         return;
     }
-    if retries.len() < MANAGER_QUEUE_SIZE {
+    if retries.len() < capacity {
         retries.insert(key, (retry_at, command));
         return;
     }
@@ -1769,31 +1582,6 @@ fn defer_route_observation(
         metrics
             .dropped_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-fn validation_nonce() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-}
-
-fn validation_route_key(family: RouteFamily, table: &str, nonce: u128) -> RouteKey {
-    match family {
-        RouteFamily::Ipv4 => {
-            // RFC 2544 benchmarking range 198.18.0.0/15.
-            let host = ((nonce as u32) & 0x0001_FFFF) | 0xC612_0000;
-            RouteKey::new(IpAddr::V4(Ipv4Addr::from(host)), table.to_string())
-        }
-        RouteFamily::Ipv6 => RouteKey::new(
-            // RFC 3849 documentation range 2001:db8::/32.
-            IpAddr::V6(Ipv6Addr::from(
-                0x2001_0DB8_0000_0000_0000_0000_0000_0000u128
-                    | (nonce & 0x0000_0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128),
-            )),
-            table.to_string(),
-        ),
     }
 }
 
@@ -1813,13 +1601,12 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::plugin::executor::ros_route::model::validation_comment;
 
     #[derive(Debug, Default)]
     struct MockApi {
         routes: Mutex<Vec<RouterRoute>>,
         connections: Mutex<AHashSet<IpAddr>>,
-        validation_attempts: AtomicUsize,
-        validation_failures: AtomicUsize,
         delete_failures: AtomicUsize,
     }
 
@@ -1911,26 +1698,6 @@ mod tests {
             Ok(id)
         }
 
-        async fn validate_route_config(
-            &self,
-            _key: &RouteKey,
-            _gateway: &str,
-            _distance: u8,
-            _comment: &str,
-        ) -> Result<()> {
-            self.validation_attempts.fetch_add(1, Ordering::Relaxed);
-            if self
-                .validation_failures
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Err(DnsError::plugin("validation unavailable"));
-            }
-            Ok(())
-        }
-
         async fn delete_route_if_matches(&self, expected: &RouterRoute) -> Result<bool> {
             if self
                 .delete_failures
@@ -1977,6 +1744,7 @@ mod tests {
             max_ttl: 3_600,
             fixed_ttl,
             conntrack_guard,
+            queue_capacity: 16_384,
         }
     }
 
@@ -2196,7 +1964,7 @@ mod tests {
             distance: Some(100),
             comment: Some(format!(
                 "{};nonce=1",
-                RouteCommentCodec::prefix("fdns", "route-test", COMMENT_KIND_GATEWAY_CHECK)
+                validation_comment("fdns", "route-test")
             )),
             disabled: true,
         };
@@ -2271,7 +2039,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_validation_cleanup_keeps_empty_reconcile_retry_enabled() {
+    async fn periodic_persistent_reconcile_ignores_dynamic_routes() {
+        let api = Arc::new(MockApi::default());
+        let mut manager = RouteManager::new(api.clone(), config(None, false));
+        let key = RouteKey::new("203.0.113.95".parse().expect("ip"), "policy".to_string());
+        let route = RouterRoute {
+            id: "*dynamic".to_string(),
+            family: RouteFamily::Ipv4,
+            dst_address: key.dst_address(),
+            routing_table: key.table.clone(),
+            gateway: Some("192.0.2.1".to_string()),
+            distance: Some(100),
+            comment: Some(RouteCommentCodec::encode_dynamic(
+                "fdns",
+                "route-test",
+                LeaseDeadline::At(now_millis().saturating_add(300_000)),
+                now_millis(),
+            )),
+            disabled: false,
+        };
+        api.routes.lock().expect("routes").push(route.clone());
+
+        manager
+            .apply_persistent_snapshot(vec![route])
+            .await
+            .expect("persistent reconcile");
+
+        assert!(manager.leases.get(&key).is_none());
+        assert_eq!(api.routes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_legacy_validation_cleanup_can_be_retried() {
         let api = Arc::new(MockApi::default());
         let mut manager = RouteManager::new(api.clone(), config(None, false));
         let key = RouteKey::new("198.18.0.11".parse().expect("ip"), "policy".to_string());
@@ -2284,7 +2083,7 @@ mod tests {
             distance: Some(100),
             comment: Some(format!(
                 "{};nonce=2",
-                RouteCommentCodec::prefix("fdns", "route-test", COMMENT_KIND_GATEWAY_CHECK)
+                validation_comment("fdns", "route-test")
             )),
             disabled: true,
         };
@@ -2300,7 +2099,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(manager.empty_state_needs_reconcile);
         assert_eq!(api.routes().len(), 1);
 
         manager
@@ -2311,7 +2109,6 @@ mod tests {
             .await
             .expect("retry cleanup");
         assert!(api.routes().is_empty());
-        assert!(!manager.empty_state_needs_reconcile);
     }
 
     #[tokio::test]
@@ -2396,82 +2193,6 @@ mod tests {
             );
             assert_eq!(api.routes().len(), 1);
         }
-    }
-
-    #[tokio::test]
-    async fn paused_runtime_hands_pending_observations_to_replacement() {
-        let old_api = Arc::new(MockApi::default());
-        let new_api = Arc::new(MockApi::default());
-        let cfg = config(Some(300), false);
-        let old_runtime = RouteManagerRuntime::start_paused(
-            "route-handoff-old".to_string(),
-            RouteManager::new(old_api.clone(), cfg.clone()),
-        );
-        let old_handle = old_runtime.handle();
-        old_handle
-            .try_observe(
-                vec![ObservedAddr {
-                    addr: "203.0.113.91".parse().expect("ip"),
-                    ttl_secs: 300,
-                }],
-                None,
-            )
-            .expect("queue old observation");
-        let pending = old_handle.quiesce().await;
-
-        let new_runtime = RouteManagerRuntime::start_paused(
-            "route-handoff-new".to_string(),
-            RouteManager::new(new_api.clone(), cfg),
-        );
-        new_runtime
-            .handle()
-            .activate(pending)
-            .await
-            .expect("activate replacement");
-        for _ in 0..64 {
-            if !new_api.routes().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(old_api.routes().is_empty());
-        assert_eq!(new_api.routes().len(), 1);
-
-        old_runtime.shutdown(false).await.expect("old shutdown");
-        new_runtime.shutdown(false).await.expect("new shutdown");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn initialization_failure_uses_fast_reconcile_retry() {
-        let api = Arc::new(MockApi::default());
-        api.validation_failures.store(2, Ordering::Release);
-        let runtime = RouteManagerRuntime::start_paused(
-            "route-reconcile-retry".to_string(),
-            RouteManager::new(api.clone(), config(None, false)),
-        );
-        runtime
-            .handle()
-            .activate(RoutePendingWork::default())
-            .await
-            .expect("activate");
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(api.validation_attempts.load(Ordering::Acquire), 1);
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(api.validation_attempts.load(Ordering::Acquire), 2);
-
-        tokio::time::advance(Duration::from_secs(2)).await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert!(api.validation_attempts.load(Ordering::Acquire) >= 3);
-        tokio::time::resume();
-        runtime.shutdown(false).await.expect("shutdown");
     }
 
     #[tokio::test]

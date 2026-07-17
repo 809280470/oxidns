@@ -115,6 +115,7 @@ export const WEBUI = {
     applying: "webui.plugins.applying",
     restarting: "webui.plugins.restarting",
     noConfigFields: "webui.plugins.noConfigFields",
+    advancedSettings: "webui.plugins.advancedSettings",
     yamlMustBeObject: "webui.plugins.yamlMustBeObject",
     invertMatch: "webui.plugins.invertMatch",
     referencePlaceholder: "webui.plugins.referencePlaceholder",

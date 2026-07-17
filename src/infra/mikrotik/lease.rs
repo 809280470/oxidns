@@ -7,9 +7,8 @@ use std::hash::Hash;
 
 use ahash::AHashMap;
 
-const MAX_REFRESH_SUPPRESS_MS: u64 = 60_000;
-const MIN_REFRESH_LEAD_MS: u64 = 1_000;
-const MAX_REFRESH_LEAD_MS: u64 = 60_000;
+#[cfg(feature = "plugin-ros-route")]
+pub(crate) const ROUTE_MAX_REFRESH_INTERVAL_MS: u64 = 300_000;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum LeaseDeadline {
@@ -80,6 +79,7 @@ impl LeasePolicy {
 
     /// Recovery may shorten a remote lease under a stricter current policy,
     /// but never extends it without a fresh DNS observation.
+    #[cfg(any(feature = "plugin-ros-route", test))]
     pub(crate) fn cap_recovered(self, remote: LeaseDeadline, last_seen_ms: u64) -> LeaseDeadline {
         let cap = match self.fixed_ttl {
             Some(0) => return remote,
@@ -114,10 +114,12 @@ impl LeaseRecord {
         self.last_observed_ms
     }
 
+    #[cfg(any(feature = "plugin-ros-route", test))]
     pub(crate) fn desired_revision(self) -> u64 {
         self.desired_revision
     }
 
+    #[cfg(feature = "plugin-ros-route")]
     pub(crate) fn has_synced(self) -> bool {
         self.synced.is_some()
     }
@@ -161,10 +163,7 @@ where
         self.entries.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
+    #[cfg(any(feature = "plugin-ros-route", test))]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
@@ -176,14 +175,6 @@ where
 
     pub(crate) fn get(&self, key: &K) -> Option<&LeaseRecord> {
         self.entries.get(key)
-    }
-
-    pub(crate) fn keys_with_revision_after(&self, revision: u64) -> Vec<K> {
-        self.entries
-            .iter()
-            .filter(|(_, record)| record.desired_revision > revision)
-            .map(|(key, _)| key.clone())
-            .collect()
     }
 
     pub(crate) fn observe(&mut self, key: K, deadline: LeaseDeadline, now_ms: u64) -> ObserveLease {
@@ -220,32 +211,23 @@ where
         ObserveLease::Inserted
     }
 
+    #[cfg(any(feature = "plugin-ros-address-list", test))]
     pub(crate) fn confirm_synced(&mut self, key: &K, now_ms: u64) -> bool {
+        self.confirm_synced_with_max_interval(key, now_ms, None)
+    }
+
+    pub(crate) fn confirm_synced_with_max_interval(
+        &mut self,
+        key: &K,
+        now_ms: u64,
+        max_interval_ms: Option<u64>,
+    ) -> bool {
         let Some(record) = self.entries.get_mut(key) else {
             return false;
         };
         record.synced = Some(record.desired);
         record.synced_window_ms = record.desired_window_ms;
-        record.next_refresh_at_ms = match record.desired {
-            LeaseDeadline::Timeless => u64::MAX,
-            LeaseDeadline::At(deadline) => {
-                let timeout = deadline.saturating_sub(now_ms);
-                let lead = (timeout / 4).clamp(MIN_REFRESH_LEAD_MS, MAX_REFRESH_LEAD_MS);
-                deadline
-                    .saturating_sub(lead)
-                    .min(now_ms.saturating_add(MAX_REFRESH_SUPPRESS_MS))
-            }
-        };
-        true
-    }
-
-    pub(crate) fn mark_unsynced(&mut self, key: &K) -> bool {
-        let Some(record) = self.entries.get_mut(key) else {
-            return false;
-        };
-        record.synced = None;
-        record.synced_window_ms = 0;
-        record.next_refresh_at_ms = 0;
+        record.next_refresh_at_ms = next_refresh_at(record.desired, now_ms, max_interval_ms);
         true
     }
 
@@ -257,27 +239,9 @@ where
         last_observed_ms: u64,
         generation: u64,
         now_ms: u64,
+        max_refresh_interval_ms: Option<u64>,
     ) -> bool {
-        self.recover_with_synced(
-            key,
-            deadline,
-            deadline,
-            last_observed_ms,
-            generation,
-            now_ms,
-        )
-    }
-
-    pub(crate) fn recover_with_synced(
-        &mut self,
-        key: K,
-        desired: LeaseDeadline,
-        synced: LeaseDeadline,
-        last_observed_ms: u64,
-        generation: u64,
-        now_ms: u64,
-    ) -> bool {
-        if desired.is_expired(now_ms) {
+        if deadline.is_expired(now_ms) {
             return false;
         }
         // Reconciliation mirrors RouterOS state without imposing an
@@ -285,17 +249,15 @@ where
         self.entries.insert(
             key,
             LeaseRecord {
-                desired,
-                synced: Some(synced),
-                desired_window_ms: lease_window_ms(desired, now_ms),
-                synced_window_ms: lease_window_ms(synced, now_ms),
+                desired: deadline,
+                synced: Some(deadline),
+                desired_window_ms: lease_window_ms(deadline, now_ms),
+                synced_window_ms: lease_window_ms(deadline, now_ms),
                 last_observed_ms,
-                next_refresh_at_ms: if desired != synced {
-                    now_ms
-                } else {
-                    match desired {
-                        LeaseDeadline::Timeless => u64::MAX,
-                        LeaseDeadline::At(deadline) => deadline.saturating_sub(MIN_REFRESH_LEAD_MS),
+                next_refresh_at_ms: match deadline {
+                    LeaseDeadline::Timeless => u64::MAX,
+                    LeaseDeadline::At(_) => {
+                        next_refresh_at(deadline, now_ms, max_refresh_interval_ms)
                     }
                 },
                 desired_revision: generation,
@@ -331,6 +293,19 @@ fn lease_window_ms(deadline: LeaseDeadline, now_ms: u64) -> u64 {
     match deadline {
         LeaseDeadline::Timeless => u64::MAX,
         LeaseDeadline::At(deadline) => deadline.saturating_sub(now_ms),
+    }
+}
+
+fn next_refresh_at(deadline: LeaseDeadline, now_ms: u64, max_interval_ms: Option<u64>) -> u64 {
+    match deadline {
+        LeaseDeadline::Timeless => u64::MAX,
+        LeaseDeadline::At(deadline) => {
+            let window = deadline.saturating_sub(now_ms);
+            let at_75_percent = now_ms.saturating_add(window.saturating_mul(3) / 4);
+            max_interval_ms
+                .map(|max| at_75_percent.min(now_ms.saturating_add(max)))
+                .unwrap_or(at_75_percent)
+        }
     }
 }
 
@@ -380,6 +355,24 @@ mod tests {
         let second = book.get(&"ip").expect("lease").desired_revision();
         assert!(second > first);
         assert_eq!(book.revision(), second);
+    }
+
+    #[test]
+    fn refresh_is_scheduled_at_75_percent_of_the_remaining_ttl() {
+        let mut book = LeaseBook::new();
+        book.observe("ip", LeaseDeadline::At(101_000), 1_000);
+        book.confirm_synced(&"ip", 1_000);
+        assert!(!book.get(&"ip").expect("lease").needs_sync(75_999));
+        assert!(book.get(&"ip").expect("lease").needs_sync(76_000));
+    }
+
+    #[test]
+    fn route_refresh_is_capped_at_five_minutes() {
+        let mut book = LeaseBook::new();
+        book.observe("ip", LeaseDeadline::At(3_601_000), 1_000);
+        book.confirm_synced_with_max_interval(&"ip", 1_000, Some(ROUTE_MAX_REFRESH_INTERVAL_MS));
+        assert!(!book.get(&"ip").expect("lease").needs_sync(300_999));
+        assert!(book.get(&"ip").expect("lease").needs_sync(301_000));
     }
 
     #[test]

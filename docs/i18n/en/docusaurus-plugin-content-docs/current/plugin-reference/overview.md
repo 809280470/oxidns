@@ -85,8 +85,8 @@ See [Executor Plugins](executor.mdx) for full field reference. Grouped as: polic
 | [`script`](executor.mdx#script) | Runs an external command and injects a stable subset of `DnsContext` as arguments or environment variables. |
 | [`ipset`](executor.mdx#ipset) | Writes response IPs into Linux `ipset` via the embedded netlink backend (no `ipset` binary required). |
 | [`nftset`](executor.mdx#nftset) | Writes response IPs into nftables sets via the embedded netlink backend (no `nft` binary required). |
-| [`ros_address_list`](executor.mdx#ros_address_list) | Recommended RouterOS integration: projects response IPs into an `address-list` for firewall, mangle, and policy-routing rules. |
-| [`ros_route`](executor.mdx#ros_route) | Advanced RouterOS integration: projects response IPs directly into policy routes when per-IP routes are explicitly required. |
+| [`ros_address_list`](executor.mdx#ros_address_list) | Projects response IPs into a RouterOS `address-list` consumed by firewall, mangle, or policy-routing rules. |
+| [`ros_route`](executor.mdx#ros_route) | Projects response IPs as per-IP static routes in a RouterOS routing table with the configured gateway and distance. |
 
 ### Maintenance and scheduling
 

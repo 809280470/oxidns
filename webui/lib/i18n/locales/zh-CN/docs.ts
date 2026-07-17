@@ -376,19 +376,21 @@ export const zhCNDocs = {
     send_timeout: "- 类型：`u64`；默认：`5`\n- RouterOS API 命令发送超时秒数，必须大于 `0`。",
     receive_timeout: "- 类型：`u64`；默认：`5`\n- RouterOS API 单段响应等待超时秒数，必须大于 `0`。",
     async: "- 类型：`bool`；默认：`true`\n- `true` 只投递后台同步；`false` 等待当前观测的一次同步尝试，但不会改变 DNS 应答。",
+    wait_timeout: "- 类型：`duration`；默认：`8s`\n- 仅在 `async: false` 时限制等待；超时后任务继续在后台执行。",
+    queue_capacity: "- 类型：`usize`；默认：`16384`\n- 分别限制入口队列和重试积压中的不同路由 key。",
     routing_table: "- 类型：`string`；必填：是\n- 目标策略路由表；插件不会创建 routing table 或 routing rule。",
     gateway4: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv4 路由下一跳。",
     gateway6: "- 类型：`string`；必填：gateway4/gateway6 至少一项\n- IPv6 路由下一跳。",
     distance: "- 类型：`u8`；默认：`100`\n- RouterOS 静态路由 distance。",
     comment_prefix: "- 类型：`string`；默认：`oxi`\n- 路由注释归属前缀；该值及插件 tag 不能包含 `;` 或 `=`。",
-    "persistent.ips": "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由。",
-    "persistent.files": "- 类型：`array<string>`\n- 仅在插件初始化时读取的固定路由文件；内容变化需重载插件或应用。",
+    "persistent.ips": "- 类型：`array<string>`\n- DNS 无关的固定 IP/CIDR 路由；persistent 是启动恢复和每 180 秒定时对账的期望状态。",
+    "persistent.files": "- 类型：`array<string>`\n- 仅在插件初始化或 reload 时读取的固定路由文件；定时对账使用内存集合，不重复读取文件。",
     min_ttl: "- 类型：`u32`；默认：`60`\n- 动态 DNS 路由 TTL 的最小钳制值。",
     max_ttl: "- 类型：`u32`；默认：`3600`\n- 动态 DNS 路由 TTL 的最大钳制值。",
-    fixed_ttl: "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL；设为 `0` 时不按时间过期，后续应答缺少该 IP 不会主动撤销。",
+    fixed_ttl: "- 类型：`u32`；默认：无\n- 覆盖动态 DNS 路由 TTL；设为 `0` 时不按时间过期，后续应答缺少该 IP 不会主动撤销。动态路由只在后续 DNS 再次观察到同一 IP 并达到阈值时刷新，不参与定时对账。",
     conntrack_guard:
       "- 类型：`bool`；默认：`false`\n- 仅在删除到期动态 `/32`、`/128` 主机路由前检查精确目标 IP；存在连接或查询失败时延后 30 秒。persistent 删除和关闭清理不受影响。",
-    cleanup_on_shutdown: "- 类型：`bool`；默认：`true`\n- 关闭时清理本插件拥有的动态和固定路由，清理总预算为 30 秒。生产重启或滚动发布需要策略连续性时建议设为 `false`。",
+    cleanup_on_shutdown: "- 类型：`bool`；默认：`true`\n- 正常关闭及应用级 reload 时清理该插件 tag 拥有的动态和固定路由；清理总预算为 30 秒。reload 按 shutdown/restart 处理，不移交旧实例待处理观测；需要策略连续性时建议设为 `false`。",
   },
   ros_address_list: {
     address:
@@ -405,6 +407,10 @@ export const zhCNDocs = {
       "- 类型：`u64`；必填：否；默认值：`5`\n- 作用：指定等待下一段 RouterOS API 响应数据的上限，单位为秒。\n- 配置建议：建议为 OxiDNS 使用专用且规模可控的 `address-list`，不建议接入已有的大型共享列表。只有在存量环境无法避免慢列表查询或 RouterOS 管理面响应较慢时，才考虑将该值调大，例如 `30` 或 `60`。",
     async:
       "- 类型：`bool`；必填：否；默认值：`true`\n- 作用：控制地址写入行为是否采用异步方式。启用后，DNS 应答路径只负责投递任务，由后台管理器完成与 RouterOS 的交互。\n- 影响：异步模式有助于降低请求路径阻塞风险；关闭后会改为同步提交，更适合需要立即确认提交结果的场景。",
+    wait_timeout:
+      "- 类型：`duration`；默认值：`8s`\n- 仅在 `async: false` 时限制等待；超时后任务继续在后台执行，不改变 DNS 响应。",
+    queue_capacity:
+      "- 类型：`usize`；默认值：`16384`\n- 分别限制入口队列和重试积压中的不同 IP。",
     address_list4:
       "- 类型：`string`；必填：否；默认值：无\n- 作用：指定 IPv4 地址写入的目标 `address-list` 名称。插件从 DNS 应答中提取到 A 记录后，将写入该列表。\n- 配置建议：如果策略仅处理 IPv4，应至少配置本项。",
     address_list6:
@@ -412,19 +418,19 @@ export const zhCNDocs = {
     comment_prefix:
       "- 类型：`string`；必填：否；默认值：`oxi`\n- 作用：指定插件写入 RouterOS 条目时使用的注释前缀。该前缀用于区分 OxiDNS 创建的动态项和常驻项，便于后续刷新、重载与清理。\n- 注意事项：该值及插件 `tag` 不应包含 `;` 或 `=`，以避免影响内部标记格式。",
     persistent:
-      "- 类型：`object`；必填：否；默认值：无\n- 作用：定义需要长期保留的静态地址集合。该部分不依赖 DNS 应答触发，可在插件启动后直接同步到 RouterOS，并由后台 reconcile 保持一致性。\n- 子字段：\n  - `ips`\n  - `files`",
+      "- 类型：`object`；必填：否；默认值：无\n- 作用：定义需要长期保留的期望状态。启动时恢复；配置非空时每 180 秒只对账这些持久项，动态项不参与。\n- 子字段：\n  - `ips`\n  - `files`",
     "persistent.ips":
       "- 类型：`array<string>`；必填：否；默认值：空\n- 作用：以内联方式声明常驻 IP 或 CIDR 网段。适用于数量较少且变更频率不高的固定策略对象。\n- 支持格式：单个 IPv4、单个 IPv6、IPv4 CIDR、IPv6 CIDR。",
     "persistent.files":
-      "- 类型：`array<string>`；必填：否；默认值：空\n- 作用：从外部文件加载常驻地址集合。适用于需要由其他系统生成、集中维护或批量管理的地址列表。\n- 行为说明：这些文件只在插件初始化时读取一次。文件变更后如需生效，需要 reload 插件或应用。",
+      "- 类型：`array<string>`；必填：否；默认值：空\n- 作用：从外部文件加载常驻地址集合。适用于需要由其他系统生成、集中维护或批量管理的地址列表。\n- 行为说明：这些文件只在插件初始化或 reload 时读取。定时对账使用内存集合，不重复读取文件。",
     min_ttl:
       "- 类型：`u64`；必填：否；默认值：`60`\n- 作用：定义动态地址项允许使用的最小 TTL。当 DNS 应答中的 TTL 过小或为零时，插件会提升到该值后再写入 RouterOS。\n- 适用场景：用于避免高频刷新造成的管理面抖动。",
     max_ttl:
       "- 类型：`u64`；必填：否；默认值：`3600`\n- 作用：定义动态地址项允许使用的最大 TTL。当 DNS 应答中的 TTL 过大时，插件会截断到该上限。\n- 适用场景：用于限制策略项在网络设备中的滞留时间，降低地址陈旧风险。",
     fixed_ttl:
-      "- 类型：`u64`；必填：否；默认值：无\n- 作用：为所有动态写入项指定固定 TTL。配置本项后，插件不再使用 DNS 记录中的原始 TTL，也不再受 `min_ttl` 与 `max_ttl` 的区间裁剪影响。若设为 `0`，则动态项不会设置 RouterOS `timeout`。\n- 适用场景：适合需要统一刷新周期、便于运维预估和策略收敛的场景。",
+      "- 类型：`u64`；必填：否；默认值：无\n- 作用：为所有动态写入项指定固定 TTL。配置本项后，插件不再使用 DNS 记录中的原始 TTL，也不再受 `min_ttl` 与 `max_ttl` 的区间裁剪影响。若设为 `0`，则动态项不会设置 RouterOS `timeout`。\n- 刷新边界：动态项只在后续 DNS 再次观察到同一 IP 并达到阈值时刷新，没有独立定时刷新。",
     cleanup_on_shutdown:
-      "- 类型：`bool`；必填：否；默认值：`true`\n- 作用：控制插件退出时是否清理由其管理的条目。启用后，插件在正常关闭阶段会删除自身写入并可识别归属的 RouterOS 地址项。\n- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启保留的场景。",
+      "- 类型：`bool`；必填：否；默认值：`true`\n- 作用：控制插件正常关闭及应用级 reload 时是否清理由其管理的条目。reload 按 shutdown/restart 处理，不移交旧实例待处理观测。\n- 影响：关闭该选项后，已写入条目会继续保留在 RouterOS 中，适合要求策略状态跨进程重启或 reload 保留的场景。",
   },
   upgrade: {
     force:

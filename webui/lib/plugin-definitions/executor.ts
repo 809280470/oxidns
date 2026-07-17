@@ -1725,7 +1725,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     kind: "ros_route",
     type: "executor",
     name: "RouterOS Route",
-    description: "把应答 IP 同步为 RouterOS 策略路由",
+    description: "把应答 IP 同步为 RouterOS routing table 中的逐 IP 静态路由",
     icon: "Route",
     metrics: {
       metricLabels: {
@@ -1733,6 +1733,9 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_route_dropped_total: "异步丢弃",
         ros_route_sync_error_total: "同步失败",
         ros_route_sync_timeout_total: "同步超时",
+        ros_route_write_success_total: "写入成功",
+        ros_route_write_error_total: "写入失败",
+        ros_route_last_write_success_timestamp_seconds: "最近写入成功",
         ros_route_delete_deferred_total: "延迟删除",
         ros_route_connection_check_error_total: "连接检查失败",
         ros_route_pending_observations: "待处理观测",
@@ -1752,7 +1755,11 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
         ros_route_sync_error_total:
           "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
-        ros_route_sync_timeout_total: "同步模式下入队或等待超时的观测总数。",
+        ros_route_sync_timeout_total: "同步模式下等待 manager 完成时超时的观测总数。",
+        ros_route_write_success_total: "RouterOS 路由 upsert 成功总数。",
+        ros_route_write_error_total: "RouterOS 路由 upsert 失败总数。",
+        ros_route_last_write_success_timestamp_seconds:
+          "最近一次 RouterOS 路由 upsert 成功的 Unix 时间。",
         ros_route_delete_deferred_total:
           "因 RouterOS conntrack 中仍存在目标连接而延迟删除路由的总次数。",
         ros_route_connection_check_error_total:
@@ -1762,6 +1769,10 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_route_degraded: "RouterOS transport 当前是否处于降级状态。",
       },
       cardPriority: [
+        "ros_route_last_write_success_timestamp_seconds",
+        "ros_route_write_error_total",
+        "ros_route_dropped_total",
+        "ros_route_degraded",
         "ros_route_managed_entries",
         "ros_route_pending_observations",
       ],
@@ -1780,6 +1791,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "tls",
         label: "TLS",
         type: "object",
+        advanced: true,
         preserveEmptyObject: true,
         description: "启用 RouterOS API-SSL（通常为 8729 端口）。",
         fields: [
@@ -1792,10 +1804,25 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           },
         ],
       },
-      { key: "connect_timeout", label: "连接超时", type: "number", default: 5 },
-      { key: "send_timeout", label: "发送超时", type: "number", default: 5 },
-      { key: "receive_timeout", label: "接收超时", type: "number", default: 5 },
-      { key: "async", label: "异步提交", type: "switch", default: true },
+      { key: "connect_timeout", label: "连接超时", type: "number", default: 5, advanced: true },
+      { key: "send_timeout", label: "发送超时", type: "number", default: 5, advanced: true },
+      { key: "receive_timeout", label: "接收超时", type: "number", default: 5, advanced: true },
+      { key: "async", label: "异步提交", type: "switch", default: true, advanced: true },
+      {
+        key: "wait_timeout",
+        label: "同步等待时间",
+        type: "text",
+        default: "8s",
+        advanced: true,
+        description: "仅 async=false 时生效；超时后任务继续在后台执行。",
+      },
+      {
+        key: "queue_capacity",
+        label: "队列容量",
+        type: "number",
+        default: 16384,
+        advanced: true,
+      },
       {
         key: "routing_table",
         label: "路由表",
@@ -1815,17 +1842,20 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         type: "text",
         placeholder: "fe80::2%ether1",
       },
-      { key: "distance", label: "路由距离", type: "number", default: 100 },
+      { key: "distance", label: "路由距离", type: "number", default: 100, advanced: true },
       {
         key: "comment_prefix",
         label: "注释前缀",
         type: "text",
         default: "oxi",
+        advanced: true,
       },
       {
         key: "persistent",
         label: "常驻路由",
         type: "object",
+        description: "期望状态；启动恢复并每 180 秒对账。动态路由不参与定时对账。",
+        advanced: true,
         fields: [
           stringArrayField("ips", "IP / CIDR", "1.1.1.1\n100.64.1.0/24", false),
           stringArrayField(
@@ -1841,18 +1871,21 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "动态路由最小 TTL",
         type: "number",
         default: 60,
+        advanced: true,
       },
       {
         key: "max_ttl",
         label: "动态路由最大 TTL",
         type: "number",
         default: 3600,
+        advanced: true,
       },
       {
         key: "fixed_ttl",
         label: "动态路由固定 TTL",
         type: "number",
-        description: "填 0 表示动态路由不按时间过期。",
+        description: "填 0 表示不按时间过期；动态路由只由后续 DNS 观察刷新。",
+        advanced: true,
       },
       {
         key: "conntrack_guard",
@@ -1861,12 +1894,15 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         default: false,
         description:
           "删除到期动态主机路由前检查 RouterOS conntrack；有目标连接时延后删除。",
+        advanced: true,
       },
       {
         key: "cleanup_on_shutdown",
         label: "关闭时清理",
         type: "switch",
         default: true,
+        description: "正常关闭及应用级 reload 时清理；需要策略连续性时设为 false。",
+        advanced: true,
       },
     ],
   },
@@ -1874,7 +1910,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     kind: "ros_address_list",
     type: "executor",
     name: "RouterOS Address List",
-    description: "把应答 IP 同步到 RouterOS address-list",
+    description: "把应答 IP 同步到供 firewall、mangle 或路由规则使用的 address-list",
     icon: "Network",
     metrics: {
       metricLabels: {
@@ -1882,6 +1918,9 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_address_list_dropped_total: "异步丢弃",
         ros_address_list_sync_error_total: "同步失败",
         ros_address_list_sync_timeout_total: "同步超时",
+        ros_address_list_write_success_total: "写入成功",
+        ros_address_list_write_error_total: "写入失败",
+        ros_address_list_last_write_success_timestamp_seconds: "最近写入成功",
         ros_address_list_pending_observations: "待处理观测",
         ros_address_list_managed_entries: "受管条目",
         ros_address_list_coalesced_total: "合并观测",
@@ -1902,7 +1941,13 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_address_list_sync_error_total:
           "同步模式下在 RouterOS 管理器侧失败的观测总数。",
         ros_address_list_sync_timeout_total:
-          "同步模式下入队或等待超时的观测总数。",
+          "同步模式下等待 manager 完成时超时的观测总数。",
+        ros_address_list_write_success_total:
+          "RouterOS address-list upsert 成功总数。",
+        ros_address_list_write_error_total:
+          "RouterOS address-list upsert 失败总数。",
+        ros_address_list_last_write_success_timestamp_seconds:
+          "最近一次 RouterOS address-list upsert 成功的 Unix 时间。",
         ros_address_list_pending_observations:
           "当前等待 manager 处理的合并后观测数。",
         ros_address_list_managed_entries:
@@ -1910,6 +1955,10 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_address_list_degraded: "RouterOS transport 当前是否处于降级状态。",
       },
       cardPriority: [
+        "ros_address_list_last_write_success_timestamp_seconds",
+        "ros_address_list_write_error_total",
+        "ros_address_list_dropped_total",
+        "ros_address_list_degraded",
         "ros_address_list_managed_entries",
         "ros_address_list_pending_observations",
       ],
@@ -1934,6 +1983,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "tls",
         label: "TLS",
         type: "object",
+        advanced: true,
         preserveEmptyObject: true,
         description: "启用 RouterOS API-SSL（通常为 8729 端口）。",
         fields: [
@@ -1959,6 +2009,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "连接超时",
         type: "number",
         default: 5,
+        advanced: true,
       },
       {
         key: "send_timeout",
@@ -1966,6 +2017,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "发送超时",
         type: "number",
         default: 5,
+        advanced: true,
       },
       {
         key: "receive_timeout",
@@ -1973,6 +2025,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "接收超时",
         type: "number",
         default: 5,
+        advanced: true,
       },
       {
         key: "async",
@@ -1980,6 +2033,22 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "异步提交",
         type: "switch",
         default: true,
+        advanced: true,
+      },
+      {
+        key: "wait_timeout",
+        description: "仅 async=false 时生效；超时后任务继续在后台执行。",
+        label: "同步等待时间",
+        type: "text",
+        default: "8s",
+        advanced: true,
+      },
+      {
+        key: "queue_capacity",
+        label: "队列容量",
+        type: "number",
+        default: 16384,
+        advanced: true,
       },
       {
         key: "address_list4",
@@ -1999,12 +2068,14 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "注释前缀",
         type: "text",
         default: "oxi",
+        advanced: true,
       },
       {
         key: "persistent",
-        description: "定义需要长期保留的静态地址集合。",
+        description: "期望状态；启动恢复并每 180 秒对账。动态项不参与定时对账。",
         label: "常驻地址",
         type: "object",
+        advanced: true,
         fields: [
           stringArrayField(
             "ips",
@@ -2038,6 +2109,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "动态项最小 TTL",
         type: "number",
         default: 60,
+        advanced: true,
       },
       {
         key: "max_ttl",
@@ -2045,19 +2117,22 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "动态项最大 TTL",
         type: "number",
         default: 3600,
+        advanced: true,
       },
       {
         key: "fixed_ttl",
-        description: "为所有动态写入项指定固定 TTL。",
+        description: "为动态项指定固定 TTL；刷新只由后续 DNS 观察触发。",
         label: "动态项固定 TTL",
         type: "number",
+        advanced: true,
       },
       {
         key: "cleanup_on_shutdown",
-        description: "控制插件退出时是否清理由其管理的条目。",
+        description: "控制正常关闭及应用级 reload 时是否清理由其管理的条目。",
         label: "关闭时清理",
         type: "switch",
         default: true,
+        advanced: true,
       },
     ],
   },

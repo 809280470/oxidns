@@ -693,7 +693,7 @@ plugins:
 
 #[cfg(feature = "plugin-ros-address-list")]
 #[tokio::test]
-async fn test_ros_address_list_plugin_init_accepts_tls_and_deprecated_max_entries() -> Result<()> {
+async fn test_ros_address_list_plugin_init_accepts_tls() -> Result<()> {
     let yaml = r#"
 plugins:
   - tag: ros_address_list_policy
@@ -709,7 +709,6 @@ plugins:
       receive_timeout: 1
       address_list4: "oxidns_ipv4"
       fixed_ttl: 0
-      max_entries: 1024
       cleanup_on_shutdown: false
 "#;
 

@@ -380,19 +380,21 @@ export const enUSDocs = {
     send_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API command-send timeout in seconds; must be greater than `0`.",
     receive_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API per-response-chunk timeout in seconds; must be greater than `0`.",
     async: "- Type: `bool`; Default: `true`\n- `true` queues background synchronization; `false` waits for one attempt for the current observation without changing the DNS response.",
+    wait_timeout: "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout.",
+    queue_capacity: "- Type: `usize`; Default: `16384`\n- Independently limits distinct route keys in ingress and retry stages.",
     routing_table: "- Type: `string`; Required: yes\n- Target policy-routing table; the plugin does not create tables or routing rules.",
     gateway4: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv4 route next hop.",
     gateway6: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
     distance: "- Type: `u8`; Default: `100`\n- RouterOS static-route distance.",
     comment_prefix: "- Type: `string`; Default: `oxi`\n- Route-comment ownership prefix; it and the plugin tag cannot contain `;` or `=`.",
-    "persistent.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes.",
-    "persistent.files": "- Type: `array<string>`\n- Persistent route files read only during plugin initialization; reload the plugin or application to apply changes.",
+    "persistent.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes. Persistent routes are desired state recovered at startup and reconciled every 180 seconds.",
+    "persistent.files": "- Type: `array<string>`\n- Read only during plugin initialization or reload; periodic reconcile uses the in-memory set and never rereads files.",
     min_ttl: "- Type: `u32`; Default: `60`\n- Minimum clamp for dynamic DNS-route TTLs.",
     max_ttl: "- Type: `u32`; Default: `3600`\n- Maximum clamp for dynamic DNS-route TTLs.",
-    fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry. Missing IPs in later answers are not withdrawn.",
+    fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry. Missing IPs in later answers are not withdrawn. Dynamic routes refresh only after a later DNS observation reaches the threshold and are excluded from periodic reconcile.",
     conntrack_guard:
       "- Type: `bool`; Default: `false`\n- Checks exact destination IPs before deleting expired dynamic `/32` and `/128` routes. Active connections or query failures defer deletion for 30 seconds. Persistent and shutdown cleanup bypass the guard.",
-    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin on shutdown, with a 30-second total cleanup budget. Set it to `false` when production restarts or rolling deployments require policy continuity.",
+    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin during normal shutdown and application-level reload, with a 30-second total cleanup budget. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance. Set it to `false` when policy continuity is required.",
   },
   ros_address_list: {
     address:
@@ -409,6 +411,10 @@ export const enUSDocs = {
       "- Type: `u64`; Required: No; Default: `5`\n- Function: Specify the maximum wait time, in seconds, for the next chunk of RouterOS API response data.\n- Configuration recommendation: Prefer a dedicated, size-controlled `address-list` for OxiDNS. Avoid connecting the plugin to an existing large shared list. Increase this value, for example to `30` or `60`, only when slow legacy list queries or a slow RouterOS management plane cannot be avoided.",
     async:
       "- Type: `bool`; required: no; default value: `true`\n- Function: Control whether the address writing behavior is asynchronous. When enabled, the DNS response path is only responsible for delivery tasks, and the background manager completes the interaction with RouterOS.\n- Impact: Asynchronous mode helps reduce the risk of request path blocking; after closing, it will be changed to synchronous submission, which is more suitable for scenarios that require immediate confirmation of submission results.",
+    wait_timeout:
+      "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout without changing DNS output.",
+    queue_capacity:
+      "- Type: `usize`; Default: `16384`\n- Independently limits distinct IPs in ingress and retry stages.",
     address_list4:
       "- Type: `string`; Required: No; Default: None\n- Function: Specify the target `address-list` name for writing IPv4 addresses. After the plugin extracts the A records from the DNS answer, it writes to this list.\n- Configuration recommendation: If the policy only handles IPv4, at least this item should be configured.",
     address_list6:
@@ -416,19 +422,19 @@ export const enUSDocs = {
     comment_prefix:
       "- Type: `string`; Required: No; Default: `oxi`\n- Function: Specifies the comment prefix used by the plug-in when writing RouterOS entries. This prefix is ​​used to distinguish dynamic entries and resident entries created by OxiDNS to facilitate subsequent refresh, reload and cleanup.\n- Note: This value and the plugin `tag` should not contain `;` or `=` to avoid affecting the internal tag format.",
     persistent:
-      "- Type: `object`; Required: No; Default: None\n- Function: Define a static address set that needs to be retained for a long time. This part does not rely on DNS response triggering, can be directly synchronized to RouterOS after the plug-in is started, and is maintained by background reconcile to maintain consistency.\n- Subfield:\n  - `ips`\n  - `files`",
+      "- Type: `object`; Required: no; Default: none\n- Defines desired state retained independently from DNS observations. It is recovered at startup and, when non-empty, reconciled every 180 seconds; dynamic entries are excluded.\n- Fields:\n  - `ips`\n  - `files`",
     "persistent.ips":
       "- Type: `array<string>`; required: no; default value: empty\n- Function: Declare the resident IP or CIDR network segment inline. Suitable for fixed strategy objects that are small in number and change infrequently.\n- Supported formats: single IPv4, single IPv6, IPv4 CIDR, IPv6 CIDR.",
     "persistent.files":
-      "- Type: `array<string>`; required: no; default value: empty\n- Function: Load the resident address set from an external file. Suitable for address lists that need to be generated by other systems, maintained centrally, or managed in batches.\n- Behavioral note: These files are only read once when the plugin is initialized. If the file changes need to take effect, you need to reload the plug-in or application.",
+      "- Type: `array<string>`; Required: no; Default: empty\n- Loads persistent addresses from external files. Files are read only during plugin initialization or reload; periodic reconcile uses the in-memory set and never rereads them.",
     min_ttl:
       "- Type: `u64`; Required: No; Default: `60`\n- Function: Define the minimum TTL allowed for dynamic address items. When the TTL in a DNS response is too small or zero, the plugin will increase it to that value before writing to RouterOS.\n- Applicable scenarios: Used to avoid management plane jitter caused by high-frequency refresh.",
     max_ttl:
       "- Type: `u64`; Required: No; Default: `3600`\n- Function: Define the maximum TTL allowed for dynamic address items. When the TTL in a DNS response is too large, the plugin truncates to that limit.\n- Applicable scenarios: Used to limit the residence time of policy items in network devices and reduce the risk of address staleness.",
     fixed_ttl:
-      "- Type: `u64`; Required: No; Default: None\n- Function: Specify a fixed TTL for all dynamically written items. After configuring this item, the plug-in will no longer use the original TTL in the DNS record, and will no longer be affected by the interval clipping of `min_ttl` and `max_ttl`. If set to `0`, dynamic items will not set RouterOS `timeout`.\n- Applicable scenarios: Suitable for scenarios that require a unified refresh cycle, easy operation and maintenance estimation, and policy convergence.",
+      "- Type: `u64`; Required: no; Default: none\n- Sets one TTL for all dynamic writes, bypassing DNS TTL and the `min_ttl`/`max_ttl` clamp. `0` omits RouterOS `timeout`. Dynamic entries refresh only when a later DNS observation reaches the threshold; there is no independent refresh timer.",
     cleanup_on_shutdown:
-      "- Type: `bool`; required: no; default value: `true`\n- Function: Control whether to clean up the entries managed by the plug-in when it exits. When enabled, the plug-in will delete the RouterOS address entries written by itself during the normal shutdown phase and can identify the owned RouterOS address entries.\n- Impact: After turning off this option, written entries will continue to be retained in RouterOS, which is suitable for scenarios that require policy status to be retained across process restarts.",
+      "- Type: `bool`; Required: No; Default: `true`\n- Function: Controls whether entries managed by the plugin are removed during normal shutdown and application-level reload. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance.\n- Impact: When disabled, existing entries remain in RouterOS, which is suitable when policy state must survive process restarts or reloads.",
   },
   upgrade: {
     force:
