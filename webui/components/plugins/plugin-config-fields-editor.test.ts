@@ -7,6 +7,7 @@ import { getLocalizedPluginKindDefinition } from "@/lib/plugin-definitions";
 import {
   createDefaultPluginConfigValues,
   createPluginConfigFormValues,
+  hasConfiguredAdvancedFields,
   isPluginConfigFormValid,
   serializePluginConfigValues,
 } from "./plugin-config-fields-editor";
@@ -45,8 +46,7 @@ if (!qnameDefinition) {
 
 const routerOsDefinitions = executorPluginDefinitions.filter(
   (definition) =>
-    definition.kind === "ros_route" ||
-    definition.kind === "ros_address_list",
+    definition.kind === "ros_route" || definition.kind === "ros_address_list",
 );
 
 describe("time matcher config form", () => {
@@ -185,8 +185,9 @@ describe("optional object config fields", () => {
     expect(routerOsDefinitions).toHaveLength(2);
     for (const definition of routerOsDefinitions) {
       const values = createDefaultPluginConfigValues(definition.configSchema);
-      expect(serializePluginConfigValues(definition.configSchema, values)).not
-        .toHaveProperty("tls");
+      expect(
+        serializePluginConfigValues(definition.configSchema, values),
+      ).not.toHaveProperty("tls");
     }
   });
 
@@ -201,6 +202,46 @@ describe("optional object config fields", () => {
         serializePluginConfigValues(definition.configSchema, values),
       ).toHaveProperty("tls", {});
     }
+  });
+});
+
+describe("advanced config field visibility", () => {
+  const advancedFields = [
+    {
+      key: "flag",
+      label: "Flag",
+      type: "switch" as const,
+      default: false,
+      advanced: true,
+    },
+    {
+      key: "limit",
+      label: "Limit",
+      type: "number" as const,
+      default: 0,
+      advanced: true,
+    },
+    {
+      key: "tls",
+      label: "TLS",
+      type: "object" as const,
+      advanced: true,
+      fields: [],
+    },
+  ];
+
+  it("stays collapsed when a new form has no explicitly configured values", () => {
+    expect(hasConfiguredAdvancedFields(advancedFields, {})).toBe(false);
+  });
+
+  it("reveals explicit defaults, false, zero, and empty objects", () => {
+    expect(hasConfiguredAdvancedFields(advancedFields, { flag: false })).toBe(
+      true,
+    );
+    expect(hasConfiguredAdvancedFields(advancedFields, { limit: 0 })).toBe(
+      true,
+    );
+    expect(hasConfiguredAdvancedFields(advancedFields, { tls: {} })).toBe(true);
   });
 });
 

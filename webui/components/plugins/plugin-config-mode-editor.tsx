@@ -38,6 +38,7 @@ interface PluginConfigModeEditorProps {
   pluginKind?: string;
   currentPluginName?: string;
   outboundProfileNames?: string[];
+  advancedInitiallyConfigured?: boolean;
 }
 
 export function PluginConfigModeEditor({
@@ -53,6 +54,7 @@ export function PluginConfigModeEditor({
   pluginKind,
   currentPluginName,
   outboundProfileNames,
+  advancedInitiallyConfigured = true,
 }: PluginConfigModeEditorProps) {
   const { t } = useI18n();
   const resolvedFieldLabel = fieldLabel ?? t(WEBUI.common.fields);
@@ -65,15 +67,17 @@ export function PluginConfigModeEditor({
   const [fieldValues, setFieldValues] = useState(() =>
     createPluginConfigFormValues(fields, values),
   );
+  const [configuredValues, setConfiguredValues] = useState<
+    Record<string, unknown>
+  >(() => (advancedInitiallyConfigured ? values : {}));
 
   const handleModeChange = (nextMode: "fields" | "yaml") => {
     if (nextMode === "yaml") {
+      const serializedValues = serializePluginConfigValues(fields, fieldValues);
       setYamlText(
-        stringifyArgsLevelPluginConfigYaml(
-          serializePluginConfigValues(fields, fieldValues),
-          alreadyArgsLevel,
-        ),
+        stringifyArgsLevelPluginConfigYaml(serializedValues, alreadyArgsLevel),
       );
+      setConfiguredValues(serializedValues);
       setYamlError(null);
       onValidityChange?.(isPluginConfigFormValid(fields, fieldValues));
     }
@@ -110,6 +114,7 @@ export function PluginConfigModeEditor({
       );
       onValidityChange?.(isPluginConfigFormValid(fields, parsedValues));
       setFieldValues(nextFieldValues);
+      setConfiguredValues(parsedValues);
       onChange(parsedValues);
       return;
     }
@@ -146,6 +151,7 @@ export function PluginConfigModeEditor({
           fields={fields}
           plugins={plugins}
           values={fieldValues}
+          configuredValues={configuredValues}
           onChange={handleFieldChange}
           defaultArrayObjectCollapsed={defaultArrayObjectCollapsed}
           readOnly={readOnly}

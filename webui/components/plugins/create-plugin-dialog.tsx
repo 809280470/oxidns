@@ -481,6 +481,7 @@ export function CreatePluginDialog({
                         pluginKind={selectedKind.kind}
                         currentPluginName={instanceName.trim() || undefined}
                         outboundProfileNames={outboundProfileNames}
+                        advancedInitiallyConfigured={false}
                       />
                     )}
                   </div>

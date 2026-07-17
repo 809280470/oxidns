@@ -123,6 +123,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "并发上游数",
         type: "number",
         default: 1,
+        advanced: true,
       },
       {
         key: "response_selection",
@@ -130,6 +131,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "结果选择",
         type: "select",
         default: "balanced",
+        advanced: true,
         options: [
           { label: "最快响应", value: "fastest" },
           { label: "平衡", value: "balanced" },
@@ -171,6 +173,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               type: "select",
               dynamicOptions: "outboundProfiles",
               placeholder: "profile-1",
+              advanced: true,
             },
             {
               key: "dial_addr",
@@ -179,6 +182,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "拨号 IP",
               type: "text",
               placeholder: "203.0.113.53",
+              advanced: true,
             },
             {
               key: "port",
@@ -186,6 +190,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "端口覆盖",
               type: "number",
               placeholder: "443",
+              advanced: true,
             },
             {
               key: "bootstrap",
@@ -194,12 +199,14 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "Bootstrap",
               type: "text",
               placeholder: "8.8.8.8:53",
+              advanced: true,
             },
             {
               key: "bootstrap_version",
               description: "指定 bootstrap 优先使用 IPv4 或 IPv6。",
               label: "Bootstrap IP 版本",
               type: "select",
+              advanced: true,
               options: [
                 { label: "IPv4", value: 4 },
                 { label: "IPv6", value: 6 },
@@ -211,6 +218,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "SOCKS5 代理",
               type: "text",
               placeholder: "user:pass@127.0.0.1:1080",
+              advanced: true,
             },
             {
               key: "idle_timeout",
@@ -218,6 +226,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "连接空闲超时(秒)",
               type: "number",
               placeholder: "30",
+              advanced: true,
             },
             {
               key: "max_conns",
@@ -225,6 +234,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "最大连接数",
               type: "number",
               placeholder: "256",
+              advanced: true,
             },
             {
               key: "min_conns",
@@ -233,6 +243,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "最小连接数",
               type: "number",
               placeholder: "0",
+              advanced: true,
             },
             {
               key: "insecure_skip_verify",
@@ -240,6 +251,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "跳过 TLS 校验",
               type: "switch",
               default: false,
+              advanced: true,
             },
             {
               key: "timeout",
@@ -247,12 +259,14 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "查询超时",
               type: "duration",
               placeholder: "3s",
+              advanced: true,
             },
             {
               key: "enable_pipeline",
               description: "控制 TCP 或 DoT 流水线。",
               label: "启用 Pipeline",
               type: "switch",
+              advanced: true,
             },
             {
               key: "enable_http3",
@@ -260,6 +274,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "启用 HTTP/3",
               type: "switch",
               default: false,
+              advanced: true,
             },
             {
               key: "so_mark",
@@ -267,6 +282,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "SO_MARK",
               type: "number",
               placeholder: "100",
+              advanced: true,
             },
             {
               key: "bind_to_device",
@@ -274,6 +290,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "绑定网卡",
               type: "text",
               placeholder: "eth0",
+              advanced: true,
             },
           ],
         },
@@ -355,6 +372,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "持久化文件",
         type: "text",
         placeholder: "./dns_cache.dump",
+        advanced: true,
       },
       {
         key: "dump_interval",
@@ -362,6 +380,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "落盘周期(秒)",
         type: "number",
         default: 600,
+        advanced: true,
       },
       {
         key: "short_circuit",
@@ -381,6 +400,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "负缓存 TTL 上限",
         type: "number",
         default: 300,
+        advanced: true,
       },
       {
         key: "negative_ttl_without_soa",
@@ -388,18 +408,21 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "无 SOA 负缓存 TTL",
         type: "number",
         default: 60,
+        advanced: true,
       },
       {
         key: "max_positive_ttl",
         description: "定义正响应 TTL 上限。",
         label: "正响应 TTL 上限",
         type: "number",
+        advanced: true,
       },
       {
         key: "min_positive_ttl",
         description: "定义正响应进入缓存所需的最小 TTL。",
         label: "正响应最小缓存 TTL",
         type: "number",
+        advanced: true,
       },
       {
         key: "ecs_in_key",
@@ -407,6 +430,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "ECS 参与缓存键",
         type: "switch",
         default: false,
+        advanced: true,
       },
     ],
     quickSetup: {
@@ -466,6 +490,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "备用路径并行待命",
         type: "switch",
         default: false,
+        advanced: true,
       },
       {
         key: "short_circuit",
@@ -577,6 +602,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "权威应答 (AA)",
         type: "switch",
         default: false,
+        advanced: true,
         description: "设置 DNS 响应的 Authoritative Answer 标志。",
       },
       {
@@ -584,6 +610,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "已验证数据 (AD)",
         type: "switch",
         default: false,
+        advanced: true,
         description: "设置 DNS 响应的 Authentic Data 标志。",
       },
       stringArrayField(
@@ -673,6 +700,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "IPv4 前缀长度",
         type: "number",
         default: 24,
+        advanced: true,
       },
       {
         key: "mask6",
@@ -680,6 +708,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "IPv6 前缀长度",
         type: "number",
         default: 48,
+        advanced: true,
       },
     ],
     quickSetup: {
@@ -795,6 +824,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         type: "select",
         dynamicOptions: "outboundProfiles",
         placeholder: "profile-1",
+        advanced: true,
       },
       {
         key: "socks5",
@@ -803,6 +833,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "SOCKS5 代理",
         type: "text",
         placeholder: "127.0.0.1:1080",
+        advanced: true,
       },
       {
         key: "probe_stagger",
@@ -810,6 +841,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "测速错峰(ms)",
         type: "number",
         default: 200,
+        advanced: true,
       },
       {
         key: "probe_timeout",
@@ -817,6 +849,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "单次超时(ms)",
         type: "number",
         default: 600,
+        advanced: true,
       },
       {
         key: "max_wait",
@@ -824,6 +857,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "最大等待(ms)",
         type: "number",
         default: 1000,
+        advanced: true,
       },
       {
         key: "top_n",
@@ -838,6 +872,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "DNSSEC 策略",
         type: "select",
         default: "reorder_only",
+        advanced: true,
         options: [
           { label: "Reorder only", value: "reorder_only" },
           { label: "Skip", value: "skip" },
@@ -849,12 +884,14 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "最大并发探测",
         type: "number",
         default: 256,
+        advanced: true,
       },
       {
         key: "cache",
         description: "配置 IP 探测评分缓存。",
         label: "评分缓存",
         type: "object",
+        advanced: true,
         summaryFields: ["enabled", "size"],
         fields: [
           {
@@ -912,6 +949,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "偏好状态缓存 TTL(秒)",
         type: "number",
         default: 3600,
+        advanced: true,
       },
     ],
     quickSetup: {},
@@ -936,6 +974,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "偏好状态缓存 TTL(秒)",
         type: "number",
         default: 3600,
+        advanced: true,
       },
     ],
     quickSetup: {},
@@ -1028,6 +1067,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "反查缓存容量",
         type: "number",
         default: 65535,
+        advanced: true,
       },
       {
         key: "handle_ptr",
@@ -1042,6 +1082,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "映射 TTL(秒)",
         type: "number",
         default: 7200,
+        advanced: true,
       },
     ],
   },
@@ -1142,6 +1183,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "异步写入",
         type: "switch",
         default: true,
+        advanced: true,
       },
       {
         key: "error_mode",
@@ -1154,6 +1196,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           { label: "Fail", value: "fail" },
         ],
         default: "continue",
+        advanced: true,
       },
       {
         key: "timeout",
@@ -1161,6 +1204,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "同步超时",
         type: "duration",
         default: "1s",
+        advanced: true,
       },
     ],
   },
@@ -1185,6 +1229,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "队列大小",
         type: "number",
         default: 8192,
+        advanced: true,
       },
       {
         key: "batch_size",
@@ -1192,6 +1237,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "批量写入条数",
         type: "number",
         default: 256,
+        advanced: true,
       },
       {
         key: "flush_interval_ms",
@@ -1199,6 +1245,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "Flush 间隔(ms)",
         type: "number",
         default: 200,
+        advanced: true,
       },
       {
         key: "memory_tail",
@@ -1206,6 +1253,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "内存 Tail 长度",
         type: "number",
         default: 1024,
+        advanced: true,
       },
       {
         key: "retention_days",
@@ -1220,6 +1268,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "清理周期(小时)",
         type: "number",
         default: 1,
+        advanced: true,
       },
       {
         key: "reader_concurrency",
@@ -1228,6 +1277,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "读取并发数",
         type: "number",
         default: 2,
+        advanced: true,
       },
     ],
   },
@@ -1383,6 +1433,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "异步发送",
         type: "switch",
         default: true,
+        advanced: true,
       },
       {
         key: "timeout",
@@ -1390,6 +1441,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "超时",
         type: "duration",
         default: "5s",
+        advanced: true,
       },
       {
         key: "error_mode",
@@ -1402,6 +1454,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           { label: "Fail", value: "fail" },
         ],
         default: "continue",
+        advanced: true,
       },
       {
         key: "headers",
@@ -1455,6 +1508,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         type: "select",
         dynamicOptions: "outboundProfiles",
         placeholder: "profile-1",
+        advanced: true,
       },
       {
         key: "socks5",
@@ -1462,6 +1516,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "SOCKS5 代理",
         type: "text",
         placeholder: "127.0.0.1:1080",
+        advanced: true,
       },
       {
         key: "insecure_skip_verify",
@@ -1469,6 +1524,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "跳过 HTTPS 证书校验",
         type: "switch",
         default: false,
+        advanced: true,
       },
       {
         key: "max_redirects",
@@ -1476,6 +1532,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "最大重定向次数",
         type: "number",
         default: 5,
+        advanced: true,
       },
       {
         key: "queue_size",
@@ -1483,6 +1540,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "异步队列大小",
         type: "number",
         default: 256,
+        advanced: true,
       },
     ],
   },
@@ -1549,6 +1607,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "超时",
         type: "duration",
         default: "5s",
+        advanced: true,
       },
       {
         key: "error_mode",
@@ -1561,6 +1620,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           { label: "Fail", value: "fail" },
         ],
         default: "continue",
+        advanced: true,
       },
       {
         key: "max_output_bytes",
@@ -1568,6 +1628,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "最大输出捕获字节",
         type: "number",
         default: 4096,
+        advanced: true,
       },
     ],
   },
@@ -1611,6 +1672,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "IPv4 前缀长度",
         type: "number",
         default: 24,
+        advanced: true,
       },
       {
         key: "mask6",
@@ -1618,6 +1680,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "IPv6 前缀长度",
         type: "number",
         default: 32,
+        advanced: true,
       },
     ],
     quickSetup: {
@@ -1673,48 +1736,56 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         description: "兼容写法下定义 IPv4 的 nftables 表 family。",
         label: "IPv4 表 family",
         type: "text",
+        advanced: true,
       },
       {
         key: "table_name4",
         description: "兼容写法下定义 IPv4 的 nftables 表名。",
         label: "IPv4 表名",
         type: "text",
+        advanced: true,
       },
       {
         key: "set_name4",
         description: "兼容写法下定义 IPv4 的 set 名称。",
         label: "IPv4 set 名称",
         type: "text",
+        advanced: true,
       },
       {
         key: "mask4",
         description: "兼容写法下定义 IPv4 前缀长度。",
         label: "IPv4 前缀长度",
         type: "number",
+        advanced: true,
       },
       {
         key: "table_family6",
         description: "兼容写法下定义 IPv6 的 nftables 表 family。",
         label: "IPv6 表 family",
         type: "text",
+        advanced: true,
       },
       {
         key: "table_name6",
         description: "兼容写法下定义 IPv6 的 nftables 表名。",
         label: "IPv6 表名",
         type: "text",
+        advanced: true,
       },
       {
         key: "set_name6",
         description: "兼容写法下定义 IPv6 的 set 名称。",
         label: "IPv6 set 名称",
         type: "text",
+        advanced: true,
       },
       {
         key: "mask6",
         description: "兼容写法下定义 IPv6 前缀长度。",
         label: "IPv6 前缀长度",
         type: "number",
+        advanced: true,
       },
     ],
     quickSetup: {
@@ -1755,7 +1826,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           "异步模式下因队列已满或通道关闭而丢弃的观测总数。",
         ros_route_sync_error_total:
           "同步模式下在 RouterOS 路由管理器侧失败的观测总数。",
-        ros_route_sync_timeout_total: "同步模式下等待 manager 完成时超时的观测总数。",
+        ros_route_sync_timeout_total:
+          "同步模式下等待 manager 完成时超时的观测总数。",
         ros_route_write_success_total: "RouterOS 路由 upsert 成功总数。",
         ros_route_write_error_total: "RouterOS 路由 upsert 失败总数。",
         ros_route_last_write_success_timestamp_seconds:
@@ -1804,10 +1876,34 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           },
         ],
       },
-      { key: "connect_timeout", label: "连接超时", type: "number", default: 5, advanced: true },
-      { key: "send_timeout", label: "发送超时", type: "number", default: 5, advanced: true },
-      { key: "receive_timeout", label: "接收超时", type: "number", default: 5, advanced: true },
-      { key: "async", label: "异步提交", type: "switch", default: true, advanced: true },
+      {
+        key: "connect_timeout",
+        label: "连接超时",
+        type: "number",
+        default: 5,
+        advanced: true,
+      },
+      {
+        key: "send_timeout",
+        label: "发送超时",
+        type: "number",
+        default: 5,
+        advanced: true,
+      },
+      {
+        key: "receive_timeout",
+        label: "接收超时",
+        type: "number",
+        default: 5,
+        advanced: true,
+      },
+      {
+        key: "async",
+        label: "异步提交",
+        type: "switch",
+        default: true,
+        advanced: true,
+      },
       {
         key: "wait_timeout",
         label: "同步等待时间",
@@ -1842,7 +1938,13 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         type: "text",
         placeholder: "fe80::2%ether1",
       },
-      { key: "distance", label: "路由距离", type: "number", default: 100, advanced: true },
+      {
+        key: "distance",
+        label: "路由距离",
+        type: "number",
+        default: 100,
+        advanced: true,
+      },
       {
         key: "comment_prefix",
         label: "注释前缀",
@@ -1854,7 +1956,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         key: "persistent",
         label: "常驻路由",
         type: "object",
-        description: "期望状态；启动恢复并每 180 秒对账。动态路由不参与定时对账。",
+        description:
+          "期望状态；启动恢复并每 180 秒对账。动态路由不参与定时对账。",
         advanced: true,
         fields: [
           stringArrayField("ips", "IP / CIDR", "1.1.1.1\n100.64.1.0/24", false),
@@ -1901,7 +2004,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "关闭时清理",
         type: "switch",
         default: true,
-        description: "正常关闭及应用级 reload 时清理；需要策略连续性时设为 false。",
+        description:
+          "正常关闭及应用级 reload 时清理；需要策略连续性时设为 false。",
         advanced: true,
       },
     ],
@@ -1910,7 +2014,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
     kind: "ros_address_list",
     type: "executor",
     name: "RouterOS Address List",
-    description: "把应答 IP 同步到供 firewall、mangle 或路由规则使用的 address-list",
+    description:
+      "把应答 IP 同步到供 firewall、mangle 或路由规则使用的 address-list",
     icon: "Network",
     metrics: {
       metricLabels: {
@@ -2072,7 +2177,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       {
         key: "persistent",
-        description: "期望状态；启动恢复并每 180 秒对账。动态项不参与定时对账。",
+        description:
+          "期望状态；启动恢复并每 180 秒对账。动态项不参与定时对账。",
         label: "常驻地址",
         type: "object",
         advanced: true,
@@ -2157,6 +2263,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "升级后清理缓存",
         type: "switch",
         default: true,
+        advanced: true,
       },
       {
         key: "repository",
@@ -2164,6 +2271,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "GitHub 仓库",
         type: "text",
         default: "svenshi/oxidns",
+        advanced: true,
       },
       {
         key: "asset",
@@ -2172,6 +2280,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "Release Asset",
         type: "text",
         default: "auto",
+        advanced: true,
       },
       {
         key: "bundle",
@@ -2193,6 +2302,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           "GitHub 个人访问令牌，用于提高 API 速率限制或访问私有仓库。",
         label: "GitHub Token",
         type: "text",
+        advanced: true,
       },
       {
         key: "cache_dir",
@@ -2200,6 +2310,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "下载缓存目录",
         type: "text",
         placeholder: "./upgrade/cache",
+        advanced: true,
       },
       {
         key: "backup_dir",
@@ -2207,6 +2318,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "备份目录",
         type: "text",
         placeholder: "./upgrade/backups",
+        advanced: true,
       },
       {
         key: "webui_dir",
@@ -2214,6 +2326,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "WebUI 目录",
         type: "text",
         placeholder: "./webui",
+        advanced: true,
       },
       {
         key: "skip_webui",
@@ -2235,6 +2348,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "超时",
         type: "duration",
         default: "30s",
+        advanced: true,
       },
       {
         key: "outbound",
@@ -2244,6 +2358,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         type: "select",
         dynamicOptions: "outboundProfiles",
         placeholder: "profile-1",
+        advanced: true,
       },
       {
         key: "socks5",
@@ -2251,6 +2366,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "SOCKS5 代理",
         type: "text",
         placeholder: "127.0.0.1:1080",
+        advanced: true,
       },
       {
         key: "insecure_skip_verify",
@@ -2258,6 +2374,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "跳过 HTTPS 证书校验",
         type: "switch",
         default: false,
+        advanced: true,
       },
     ],
     quickSetup: {
@@ -2334,6 +2451,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "超时",
         type: "duration",
         default: "30s",
+        advanced: true,
       },
       {
         key: "outbound",
@@ -2343,6 +2461,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         type: "select",
         dynamicOptions: "outboundProfiles",
         placeholder: "profile-1",
+        advanced: true,
       },
       {
         key: "socks5",
@@ -2350,6 +2469,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "SOCKS5 代理",
         type: "text",
         placeholder: "127.0.0.1:1080",
+        advanced: true,
       },
       {
         key: "startup_if_missing",
@@ -2504,6 +2624,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "时区",
         type: "text",
         placeholder: "Asia/Shanghai",
+        advanced: true,
       },
     ],
   },

@@ -270,5 +270,11 @@ export const nftSetTargetFields: ConfigField[] = [
     placeholder: "dns_v4",
     required: true,
   },
-  { key: "mask", label: "前缀长度", type: "number", placeholder: "24" },
+  {
+    key: "mask",
+    label: "前缀长度",
+    type: "number",
+    placeholder: "24",
+    advanced: true,
+  },
 ];
