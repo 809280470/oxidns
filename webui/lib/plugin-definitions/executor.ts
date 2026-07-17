@@ -251,7 +251,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
               label: "跳过 TLS 校验",
               type: "switch",
               default: false,
-              advanced: true,
             },
             {
               key: "timeout",
@@ -1524,7 +1523,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "跳过 HTTPS 证书校验",
         type: "switch",
         default: false,
-        advanced: true,
       },
       {
         key: "max_redirects",
@@ -2374,7 +2372,6 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "跳过 HTTPS 证书校验",
         type: "switch",
         default: false,
-        advanced: true,
       },
     ],
     quickSetup: {

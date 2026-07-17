@@ -151,7 +151,7 @@ export function createDefaultPluginConfigValues(fields: ConfigField[]) {
       defaults[field.key] = [];
     } else if (field.type === "time" && field.timeRange) {
       defaults[field.key] = field.timeRange.defaultValue;
-    } else if (field.type === "object" && field.fields) {
+    } else if (field.type === "object" && field.fields && !field.advanced) {
       const objectDefaults = createDefaultPluginConfigValues(field.fields);
       if (field.preserveEmptyObject) {
         objectDefaults[OBJECT_PRESENCE_KEY] = false;

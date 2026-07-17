@@ -49,6 +49,14 @@ const routerOsDefinitions = executorPluginDefinitions.filter(
     definition.kind === "ros_route" || definition.kind === "ros_address_list",
 );
 
+const ipSelectorDefinition = executorPluginDefinitions.find(
+  (definition) => definition.kind === "ip_selector",
+);
+
+if (!ipSelectorDefinition) {
+  throw new Error("ip_selector executor definition must exist");
+}
+
 describe("time matcher config form", () => {
   it("normalizes legacy weekday aliases to ISO numbers while preserving monthdays", () => {
     const config = {
@@ -232,6 +240,17 @@ describe("advanced config field visibility", () => {
 
   it("stays collapsed when a new form has no explicitly configured values", () => {
     expect(hasConfiguredAdvancedFields(advancedFields, {})).toBe(false);
+  });
+
+  it("does not materialize defaults for unopened advanced objects", () => {
+    const values = createDefaultPluginConfigValues(
+      ipSelectorDefinition.configSchema,
+    );
+
+    expect(values).not.toHaveProperty("cache");
+    expect(
+      serializePluginConfigValues(ipSelectorDefinition.configSchema, values),
+    ).not.toHaveProperty("cache");
   });
 
   it("reveals explicit defaults, false, zero, and empty objects", () => {
