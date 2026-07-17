@@ -19,9 +19,9 @@ use http::{Method, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiHandler, ApiRegister, json_error, json_ok, json_response};
+use crate::build_info::BuildInfo;
 use crate::config;
 use crate::infra::VERSION;
-use crate::infra::build_info::BuildInfo;
 use crate::infra::control::{
     AppController, ControlRequestError, ProcessMemoryKind, ReloadSnapshot, config_version,
 };
@@ -229,7 +229,7 @@ impl ApiHandler for SystemHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
         let snapshot = self.controller.snapshot();
         let metrics = self.controller.sample_process_metrics();
-        let build = match crate::infra::build_info::snapshot() {
+        let build = match crate::build_info::snapshot() {
             Ok(build) => build,
             Err(err) => {
                 return json_error(
@@ -736,10 +736,7 @@ plugins:
             Some("rss" | "private_working_set" | "private_commit" | "working_set")
         ));
         assert_eq!(value["build"]["version"], VERSION);
-        assert_eq!(
-            value["build"]["bundle"],
-            crate::infra::build_info::PRIMARY_BUNDLE
-        );
+        assert_eq!(value["build"]["bundle"], crate::build_info::PRIMARY_BUNDLE);
         assert!(
             value["build"]["supported_plugins"]["executors"]
                 .as_array()

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Build-time feature and plugin capability reporting.
+//! Build-time features and runtime plugin capability reporting.
 
 use serde::Serialize;
 

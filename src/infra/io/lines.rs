@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Sven Shi
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Shared helpers for provider plugins.
+//! Streaming helpers for line-oriented rule files.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
