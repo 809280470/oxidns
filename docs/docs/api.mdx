@@ -9,7 +9,9 @@ OxiDNS 的管理 API 是独立控制平面，负责：
 
 * 进程与启动健康检查
 * 配置检查与配置文本校验
-* 重载与关闭控制
+* 重载、重启与关闭控制
+* 运行日志读取与 SSE 推送
+* 可选的 release 升级控制
 * 插件扩展 API
 * Prometheus 指标导出
 
@@ -305,6 +307,20 @@ API 路由分成三类：
 
 * `202 Accepted`
 
+### `POST /api/restart`
+
+作用：
+
+* 请求应用优雅关闭当前运行实例，并使用原始命令行参数重新执行 OxiDNS。
+* Unix 平台会替换当前进程映像并保持 PID；非 Unix 平台会启动替代进程后退出当前进程。
+
+返回：
+
+* `202 Accepted`
+  * 重启请求已受理。
+* `500 Internal Server Error`
+  * 应用控制通道已关闭，无法提交重启请求。
+
 ### `POST /api/reload`
 
 作用：
@@ -419,6 +435,77 @@ API 路由分成三类：
 适用场景：
 
 * 控制平面先验校验配置，再决定是否落盘。
+
+## 运行日志接口
+
+日志接口仅在进程日志缓冲区可用时注册。
+
+### `GET /api/logs`
+
+读取内存环形缓冲区中的最近日志。
+
+查询参数：
+
+* `limit`
+  * 返回条数，默认 `200`，范围 `1..=1000`。
+* `level`
+  * 可选最低日志级别：`trace`、`debug`、`info`、`warn` 或 `error`。
+
+响应包含 `ok`、实际返回数量 `total` 和 `entries` 数组。该接口读取的是内存尾部，不替代持久化日志文件。
+
+### `GET /api/logs/stream`
+
+通过 SSE 推送新日志。
+
+查询参数：
+
+* `tail`
+  * 建立连接时先回放的最近日志条数，默认 `0`，最大 `500`。
+* `level`
+  * 可选最低日志级别。
+
+每条日志使用 `event: log`，`data` 为日志 JSON；连接每 15 秒发送 heartbeat。客户端应使用 `Accept: text/event-stream`，并处理断线重连和消费落后时的日志缺口。
+
+## 升级接口
+
+这些路由仅在编译时启用 `plugin-upgrade` 时存在，官方 `standard` 和 `full` bundle 默认包含该 feature。
+
+`POST /api/upgrade/check` 和 `POST /api/upgrade/apply` 接受可选 JSON 请求体：
+
+```json
+{
+  "repository": "svenshi/oxidns",
+  "bundle": "auto",
+  "outbound": "remote",
+  "socks5": null,
+  "allow_prerelease": false,
+  "target": "latest",
+  "github_token": null
+}
+```
+
+所有字段均可省略。`github_token` 属于敏感信息，不应写入日志、截图或长期保存的请求记录。
+
+### `POST /api/upgrade/check`
+
+检查目标 release，返回当前版本、最新版本、是否存在更新、选中的 asset 名和 release URL。该操作不会下载或替换文件。
+
+### `POST /api/upgrade/apply`
+
+异步执行下载、digest 校验、备份、二进制与 WebUI 替换，并在需要时请求应用重启。
+
+返回：
+
+* `202 Accepted`
+  * 升级任务已启动；后续状态通过 `/api/upgrade/status` 查询。
+* `409 Conflict`
+  * 已有升级任务正在执行。
+
+### `GET /api/upgrade/status`
+
+返回最近一次 API 升级任务状态。`state` 可能为 `idle`、`running`、`restarting`、`completed`、`skipped` 或 `failed`，并包含开始/完成时间、错误、已安装版本和是否需要重启。
+
+升级会替换运行文件并可能重启服务。远程调用前应确认认证、备份、工作目录、WebUI 路径和回滚方式；不要把该接口暴露给不受信任的网络。
 
 ## 插件扩展 API
 
@@ -723,6 +810,7 @@ GET /api/plugins/reverse_lookup_main?ip=8.8.8.8
 * `forward_timeout_total`
 * `forward_latency_count`
 * `forward_latency_sum_ms`
+* `forward_incomplete_alias_selected_total`
 * `forward_upstream_query_total`
 * `forward_upstream_success_total`
 * `forward_upstream_error_total`
@@ -737,6 +825,19 @@ GET /api/plugins/reverse_lookup_main?ip=8.8.8.8
 * `hosts_miss_total`
 * `ratelimit_allowed_total`
 * `ratelimit_rejected_total`
+* `ip_selector_probe_total`
+* `ip_selector_probe_latency_count`
+* `ip_selector_probe_latency_sum_ms`
+* `ip_selector_selected_total`
+* `ip_selector_dropped_probe_total`
+* `ip_selector_cache_entries`
+* `network_resolver_cache_hit_total`
+* `network_resolver_cache_miss_total`
+* `network_resolver_error_total`
+* `network_resolver_refresh_total`
+* `network_resolver_refresh_latency_ms_total`
+* `network_upstream_pool_refresh_total`
+* `network_upstream_pool_refresh_latency_ms_total`
 * `server_request_total`
 * `server_completed_total`
 * `server_controlled_total`
@@ -757,11 +858,21 @@ GET /api/plugins/reverse_lookup_main?ip=8.8.8.8
 * `ros_address_list_sync_error_total`
 * `ros_address_list_sync_timeout_total`
 * `ros_address_list_pending_observations` / `ros_address_list_managed_entries`
-* `ros_address_list_coalesced_total` / `ros_address_list_capacity_rejected_total`
+* `ros_address_list_write_success_total` / `ros_address_list_write_error_total`
+* `ros_address_list_last_write_success_timestamp_seconds`
+* `ros_address_list_coalesced_total`
 * `ros_address_list_reconnect_total` / `ros_address_list_connect_attempt_total` / `ros_address_list_backoff_total`
 * `ros_address_list_reconcile_error_total` / `ros_address_list_last_reconcile_success_timestamp_seconds`
 * `ros_address_list_degraded` / `ros_address_list_cleanup_error_total`
-* `ros_route_*` 提供对应的 route manager 指标，并保留 conntrack 延迟/错误计数。
+* `ros_route_observe_total` / `ros_route_dropped_total`
+* `ros_route_sync_error_total` / `ros_route_sync_timeout_total`
+* `ros_route_write_success_total` / `ros_route_write_error_total`
+* `ros_route_pending_observations` / `ros_route_managed_entries`
+* `ros_route_coalesced_total` / `ros_route_delete_deferred_total`
+* `ros_route_reconnect_total` / `ros_route_connect_attempt_total` / `ros_route_backoff_total`
+* `ros_route_connection_check_error_total` / `ros_route_reconcile_error_total`
+* `ros_route_last_write_success_timestamp_seconds` / `ros_route_last_reconcile_success_timestamp_seconds`
+* `ros_route_degraded` / `ros_route_cleanup_error_total`
 * `reverse_lookup_ptr_hit_total`
 * `reverse_lookup_ptr_miss_total`
 * `reverse_lookup_cache_insert_total`

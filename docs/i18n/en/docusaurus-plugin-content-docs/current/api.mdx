@@ -9,7 +9,9 @@ OxiDNS exposes a standalone control plane for:
 
 * Process and startup health checks
 * Config checks and raw config text validation
-* Reload and shutdown control
+* Reload, restart, and shutdown control
+* Runtime log reads and SSE streaming
+* Optional release-upgrade control
 * Plugin extension APIs
 * Prometheus metrics export
 
@@ -305,6 +307,20 @@ Response:
 
 * `202 Accepted`
 
+### `POST /api/restart`
+
+Purpose:
+
+* Gracefully shuts down the running instance and executes OxiDNS again with the original command-line arguments.
+* Unix replaces the current process image and keeps the PID; non-Unix platforms start a replacement process before exiting the current process.
+
+Responses:
+
+* `202 Accepted`
+  * The restart request was accepted.
+* `500 Internal Server Error`
+  * The application control channel is closed and cannot accept the restart request.
+
 ### `POST /api/reload`
 
 Purpose:
@@ -419,6 +435,77 @@ Request body requirements:
 Good fit:
 
 * Validate a config in the control plane before writing it to disk.
+
+## Runtime Log Endpoints
+
+Log routes are registered only when the process log buffer is available.
+
+### `GET /api/logs`
+
+Reads recent entries from the in-memory ring buffer.
+
+Query parameters:
+
+* `limit`
+  * Number of entries to return. Defaults to `200`; range `1..=1000`.
+* `level`
+  * Optional minimum level: `trace`, `debug`, `info`, `warn`, or `error`.
+
+The response contains `ok`, the returned count in `total`, and an `entries` array. This endpoint reads the in-memory tail and does not replace persisted log files.
+
+### `GET /api/logs/stream`
+
+Streams new log entries over SSE.
+
+Query parameters:
+
+* `tail`
+  * Number of recent entries replayed when the connection opens. Defaults to `0`; maximum `500`.
+* `level`
+  * Optional minimum log level.
+
+Each log uses `event: log` with a JSON `data` payload. The connection sends a heartbeat every 15 seconds. Clients should send `Accept: text/event-stream`, reconnect after disconnects, and tolerate gaps when a consumer falls behind.
+
+## Upgrade Endpoints
+
+These routes exist only when the binary is compiled with `plugin-upgrade`. The official `standard` and `full` bundles include that feature.
+
+`POST /api/upgrade/check` and `POST /api/upgrade/apply` accept an optional JSON body:
+
+```json
+{
+  "repository": "svenshi/oxidns",
+  "bundle": "auto",
+  "outbound": "remote",
+  "socks5": null,
+  "allow_prerelease": false,
+  "target": "latest",
+  "github_token": null
+}
+```
+
+Every field is optional. `github_token` is sensitive and must not be copied into logs, screenshots, or long-lived request records.
+
+### `POST /api/upgrade/check`
+
+Checks the target release and returns the current version, latest version, update availability, selected asset name, and release URL. It does not download or replace files.
+
+### `POST /api/upgrade/apply`
+
+Starts an asynchronous download, digest verification, backup, binary/WebUI replacement, and application restart when required.
+
+Responses:
+
+* `202 Accepted`
+  * The upgrade task started; poll `/api/upgrade/status` for progress.
+* `409 Conflict`
+  * Another upgrade task is already running.
+
+### `GET /api/upgrade/status`
+
+Returns the latest API-triggered upgrade state. `state` is one of `idle`, `running`, `restarting`, `completed`, `skipped`, or `failed`, together with start/completion timestamps, any error, the installed version, and restart requirement.
+
+An upgrade replaces runtime files and may restart the service. Before remote use, verify authentication, backups, working directory, WebUI path, and rollback procedure. Do not expose this endpoint to untrusted networks.
 
 ## Plugin Extension APIs
 
@@ -729,6 +816,7 @@ Current exported metrics include:
 * `forward_timeout_total`
 * `forward_latency_count`
 * `forward_latency_sum_ms`
+* `forward_incomplete_alias_selected_total`
 * `forward_upstream_query_total`
 * `forward_upstream_success_total`
 * `forward_upstream_error_total`
@@ -743,6 +831,19 @@ Current exported metrics include:
 * `hosts_miss_total`
 * `ratelimit_allowed_total`
 * `ratelimit_rejected_total`
+* `ip_selector_probe_total`
+* `ip_selector_probe_latency_count`
+* `ip_selector_probe_latency_sum_ms`
+* `ip_selector_selected_total`
+* `ip_selector_dropped_probe_total`
+* `ip_selector_cache_entries`
+* `network_resolver_cache_hit_total`
+* `network_resolver_cache_miss_total`
+* `network_resolver_error_total`
+* `network_resolver_refresh_total`
+* `network_resolver_refresh_latency_ms_total`
+* `network_upstream_pool_refresh_total`
+* `network_upstream_pool_refresh_latency_ms_total`
 * `server_request_total`
 * `server_completed_total`
 * `server_controlled_total`
@@ -763,11 +864,21 @@ Current exported metrics include:
 * `ros_address_list_sync_error_total`
 * `ros_address_list_sync_timeout_total`
 * `ros_address_list_pending_observations` / `ros_address_list_managed_entries`
-* `ros_address_list_coalesced_total` / `ros_address_list_capacity_rejected_total`
+* `ros_address_list_write_success_total` / `ros_address_list_write_error_total`
+* `ros_address_list_last_write_success_timestamp_seconds`
+* `ros_address_list_coalesced_total`
 * `ros_address_list_reconnect_total` / `ros_address_list_connect_attempt_total` / `ros_address_list_backoff_total`
 * `ros_address_list_reconcile_error_total` / `ros_address_list_last_reconcile_success_timestamp_seconds`
 * `ros_address_list_degraded` / `ros_address_list_cleanup_error_total`
-* Corresponding `ros_route_*` manager metrics, plus its conntrack defer/error counters.
+* `ros_route_observe_total` / `ros_route_dropped_total`
+* `ros_route_sync_error_total` / `ros_route_sync_timeout_total`
+* `ros_route_write_success_total` / `ros_route_write_error_total`
+* `ros_route_pending_observations` / `ros_route_managed_entries`
+* `ros_route_coalesced_total` / `ros_route_delete_deferred_total`
+* `ros_route_reconnect_total` / `ros_route_connect_attempt_total` / `ros_route_backoff_total`
+* `ros_route_connection_check_error_total` / `ros_route_reconcile_error_total`
+* `ros_route_last_write_success_timestamp_seconds` / `ros_route_last_reconcile_success_timestamp_seconds`
+* `ros_route_degraded` / `ros_route_cleanup_error_total`
 * `reverse_lookup_ptr_hit_total`
 * `reverse_lookup_ptr_miss_total`
 * `reverse_lookup_cache_insert_total`

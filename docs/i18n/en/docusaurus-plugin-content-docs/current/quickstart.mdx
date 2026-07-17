@@ -73,14 +73,14 @@ On OpenWrt, running the installer again reinstalls the selected `luci-app-oxidns
   <TabItem value="unix" label="Linux / macOS" default>
 
 ```bash
-curl -fsSL https://oxidns.org/install.sh | sudo env OXIDNS_VERSION=v1.0.1 sh
+curl -fsSL https://oxidns.org/install.sh | sudo env OXIDNS_VERSION=vX.Y.Z sh
 ```
 
   </TabItem>
   <TabItem value="windows" label="Windows">
 
 ```powershell
-$env:OXIDNS_VERSION = "v1.0.1"; irm https://oxidns.org/install.ps1 | iex
+$env:OXIDNS_VERSION = "vX.Y.Z"; irm https://oxidns.org/install.ps1 | iex
 ```
 
   </TabItem>
