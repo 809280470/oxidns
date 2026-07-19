@@ -36,6 +36,11 @@ impl ApiHandler for MatcherStatusHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
         if let Some(enabled) = self.desired {
             self.control.set_enabled(enabled);
+            tracing::info!(
+                matcher = %self.tag,
+                enabled,
+                "matcher runtime control updated"
+            );
         }
         json_ok(
             StatusCode::OK,
