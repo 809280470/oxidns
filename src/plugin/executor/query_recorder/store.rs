@@ -658,11 +658,24 @@ fn run_clear_history(
     tables: &TableNames,
     tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
 ) -> Result<ClearHistoryResult> {
+    run_clear_history_with_checkpoint(conn, path, tables, tail, &mut checkpoint_wal)
+}
+
+fn run_clear_history_with_checkpoint<F>(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    checkpoint: &mut F,
+) -> Result<ClearHistoryResult>
+where
+    F: FnMut(&Connection) -> Result<()>,
+{
     // Start from an empty WAL and keep it bounded throughout the operation.
     // A single DELETE transaction for a large recorder can otherwise grow the
     // WAL close to the amount of history being removed before the final
     // checkpoint gets a chance to truncate it.
-    checkpoint_wal(conn)?;
+    checkpoint(conn)?;
     let before = read_space_stats(conn, path)?;
     let mut cleared_records = 0usize;
     let mut peak_wal_bytes = 0;
@@ -683,15 +696,15 @@ fn run_clear_history(
             break;
         }
         cleared_records = cleared_records.saturating_add(deleted);
+        // Deletes are auto-committed per batch. Clear the in-memory replay
+        // buffer before the next fallible checkpoint so a partial clear can
+        // never advertise rows that no longer exist in SQLite.
+        clear_tail(tail);
         observe_wal_size(path, &mut peak_wal_bytes)?;
-        checkpoint_wal(conn)?;
+        checkpoint(conn)?;
     }
 
-    let mut tail_guard = tail
-        .lock()
-        .map_err(|_| "query_recorder tail buffer lock poisoned".to_string())?;
-    tail_guard.clear();
-    drop(tail_guard);
+    clear_tail(tail);
 
     let reclaimable = read_space_stats(conn, path)?;
     let space =
@@ -705,6 +718,11 @@ fn run_clear_history(
         cleared_records,
         space,
     })
+}
+
+fn clear_tail(tail: &Arc<Mutex<VecDeque<RecordDetail>>>) {
+    let mut tail_guard = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    tail_guard.clear();
 }
 
 fn reclaim_database_space(
@@ -1807,6 +1825,10 @@ fn non_negative_usize(value: i64) -> rusqlite::Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
     use rusqlite::{Connection, params};
     use serde_json::json;
 
@@ -1912,6 +1934,57 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM questions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(question_count, 0);
+    }
+
+    #[test]
+    fn test_clear_history_clears_tail_before_partial_batch_checkpoint_failure() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let tables = TableNames {
+            records: "records".to_string(),
+            steps: "steps".to_string(),
+            questions: "questions".to_string(),
+            meta: "meta".to_string(),
+        };
+        create_schema(&mut conn, &tables).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let mut first_detail = None;
+        for request_id in 0..=CLEANUP_BATCH_SIZE {
+            let mut record = sample_record_row();
+            record.request_id = request_id as u16;
+            let detail = insert_record(&tx, &tables, record, Vec::new()).unwrap();
+            if first_detail.is_none() {
+                first_detail = Some(detail);
+            }
+        }
+        tx.commit().unwrap();
+
+        let tail = Arc::new(Mutex::new(VecDeque::from([first_detail.unwrap()])));
+        let checkpoint_calls = Cell::new(0);
+        let mut checkpoint = |_: &Connection| {
+            let calls = checkpoint_calls.get() + 1;
+            checkpoint_calls.set(calls);
+            if calls == 2 {
+                Err(DnsError::runtime("injected checkpoint failure"))
+            } else {
+                Ok(())
+            }
+        };
+
+        let result = run_clear_history_with_checkpoint(
+            &mut conn,
+            Path::new("/nonexistent/query-recorder-review.sqlite"),
+            &tables,
+            &tail,
+            &mut checkpoint,
+        );
+
+        assert!(result.is_err());
+        assert!(tail.lock().unwrap().is_empty());
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 
     fn sample_record_row() -> RecordRow {
