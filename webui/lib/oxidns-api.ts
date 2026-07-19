@@ -92,6 +92,12 @@ export interface ControlResponse {
   reload: ReloadSnapshot;
 }
 
+export interface MatcherStatusResponse {
+  ok: boolean;
+  matcher: string;
+  enabled: boolean;
+}
+
 export type ProcessMemoryKind =
   | "rss"
   | "private_working_set"
@@ -500,6 +506,34 @@ export async function requestRestart(): Promise<void> {
     headers: apiHeaders(),
   });
   await readJsonResponse<unknown>(response);
+}
+
+export async function fetchMatcherStatus(
+  tag: string,
+): Promise<MatcherStatusResponse> {
+  const response = await fetch(
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/status`),
+    {
+      method: "GET",
+      headers: apiHeaders(),
+    },
+  );
+  return readJsonResponse<MatcherStatusResponse>(response);
+}
+
+export async function setMatcherEnabled(
+  tag: string,
+  enabled: boolean,
+): Promise<MatcherStatusResponse> {
+  const action = enabled ? "enable" : "disable";
+  const response = await fetch(
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/${action}`),
+    {
+      method: "POST",
+      headers: apiHeaders(),
+    },
+  );
+  return readJsonResponse<MatcherStatusResponse>(response);
 }
 
 export async function fetchCacheEntries(

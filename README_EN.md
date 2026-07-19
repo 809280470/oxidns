@@ -81,7 +81,7 @@ It is better suited for users who want explicit control over DNS behavior, rathe
 | Data sets | `domain_set`, `dynamic_domain_set`, `ip_set`, `geoip`, `geosite`, `adguard_rule` |
 | Outbound networking | `network.outbound` centralizes nameservers and SOCKS5 settings for HTTP downloads, upgrade checks, webhooks, and upstreams |
 | System integrations | `ipset`, `nftset`, `ros_address_list`, `ros_route`, `reverse_lookup` |
-| Debugging and operations | Health checks, config validation, hot reload, query records, Prometheus plugin metrics, real-time logs |
+| Debugging and operations | Health checks, config validation, hot reload, matcher runtime switches, query records, Prometheus plugin metrics, real-time logs |
 | Deployment | Multi-platform builds, Debian packages, OpenWrt LuCI app, standalone WebUI hosting, service installation |
 
 ---

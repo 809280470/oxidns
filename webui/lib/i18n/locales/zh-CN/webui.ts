@@ -164,6 +164,13 @@ export const zhCNWebui = {
     timeRangeIncomplete: "开始时间和结束时间必须同时填写",
     timeRangeEqual: "开始时间和结束时间不能相同",
     timeRangeInvalid: "时间必须使用 HH:MM 格式",
+    matcherRuntimeControl: "运行时匹配",
+    matcherEnable: "开启 matcher",
+    matcherDisable: "关闭 matcher",
+    matcherControlLoading: "正在读取 matcher 运行状态",
+    matcherControlUnavailable:
+      "matcher 运行时接口不可用，请先应用配置或检查后端版本",
+    matcherControlFailed: "更新 matcher 运行状态失败",
   },
   pluginTypes: {
     server: "Server",

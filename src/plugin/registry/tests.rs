@@ -117,6 +117,10 @@ impl Provider for CaptureProvider {
         self
     }
 
+    async fn reload(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn contains_name(&self, _name: &Name) -> bool {
         false
     }
@@ -229,6 +233,15 @@ async fn test_init_plugins_passes_quick_setup_dependents_to_create_context() {
             kind: DependencyKind::Executor,
             field: "args[0].matches[0] -> quick_setup(qname).domain_set_tags[0]".to_string(),
         }]
+    );
+    assert_eq!(
+        registry
+            .runtime_controls()
+            .into_iter()
+            .map(|(tag, _)| tag)
+            .collect::<Vec<_>>(),
+        vec!["zzz_provider"],
+        "quick-setup matchers must remain internal and must not expose runtime controls"
     );
 
     registry.destroy().await;

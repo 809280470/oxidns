@@ -20,6 +20,7 @@ import type { PluginCardTemplateProps } from "./types";
 import { pluginTypeColors, pluginTypeIcons } from "./display";
 import { getPluginCatalogItem, renderPluginKindIcon } from "./catalog";
 import { PluginDeleteButton } from "./plugin-delete-button";
+import { MatcherRuntimeSwitch } from "./matcher-runtime-switch";
 
 export function PluginCardTemplate({
   plugin,
@@ -108,6 +109,7 @@ export function PluginCardTemplate({
               </div>
             </div>
           )}
+          <MatcherRuntimeSwitch plugin={plugin} />
           <Tooltip>
             <TooltipTrigger asChild>
               <Button

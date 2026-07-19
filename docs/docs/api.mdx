@@ -535,6 +535,30 @@ API 路由分成三类：
 
 清空缓存。
 
+### matcher
+
+配置在 `plugins:` 中、具有稳定 tag 的 matcher 都会注册以下运行时控制接口：
+
+```text
+GET  /api/plugins/<matcher_tag>/status
+POST /api/plugins/<matcher_tag>/enable
+POST /api/plugins/<matcher_tag>/disable
+```
+
+三个接口返回相同的状态结构：
+
+```json
+{
+  "ok": true,
+  "matcher": "match_cn",
+  "enabled": true
+}
+```
+
+`enable` 和 `disable` 均为幂等操作，不需要请求体。matcher 被关闭后不会执行内部匹配逻辑，其基础结果固定为 `false`；现有取反语义仍会继续应用，因此 `!$match_cn` 在该 matcher 关闭时为 `true`。
+
+开关只属于当前 runtime，不写入 YAML；应用级 reload 或进程重启后恢复为开启。`sequence` 和 `any_match` 内的 quick-setup matcher 使用内部 `qs.match...` tag，不注册控制接口。如需运行时控制，应先将其提取为 `plugins:` 中的独立 matcher 并通过 `$tag` 引用。
+
 ### provider
 
 #### `POST /api/plugins/<provider_tag>/reload`
@@ -549,7 +573,11 @@ API 路由分成三类：
 * `200 OK`
   * provider 已成功 reload。
 * `400 Bad Request`
-  * provider 不存在、不是运行中的 provider，或 reload 过程中返回错误。
+  * provider 在 reload 过程中返回错误。
+* `404 Not Found`
+  * 对应 tag 不是当前 runtime 中已加载的 provider，因此没有注册该路由。
+* `409 Conflict`
+  * 同一个 provider 已有 reload 正在执行；新请求会立即返回 `provider_reload_busy`，不会排队。
 
 适用场景：
 

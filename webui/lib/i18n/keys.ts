@@ -162,6 +162,12 @@ export const WEBUI = {
     timeRangeIncomplete: "webui.plugins.timeRangeIncomplete",
     timeRangeEqual: "webui.plugins.timeRangeEqual",
     timeRangeInvalid: "webui.plugins.timeRangeInvalid",
+    matcherRuntimeControl: "webui.plugins.matcherRuntimeControl",
+    matcherEnable: "webui.plugins.matcherEnable",
+    matcherDisable: "webui.plugins.matcherDisable",
+    matcherControlLoading: "webui.plugins.matcherControlLoading",
+    matcherControlUnavailable: "webui.plugins.matcherControlUnavailable",
+    matcherControlFailed: "webui.plugins.matcherControlFailed",
   },
   pluginTypes: {
     server: "webui.pluginTypes.server",

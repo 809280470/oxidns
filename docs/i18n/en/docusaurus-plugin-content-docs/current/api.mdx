@@ -537,6 +537,30 @@ Query parameters:
 
 Clears the cache.
 
+### matcher
+
+Every matcher declared in `plugins:` with a stable tag registers these runtime-control endpoints:
+
+```text
+GET  /api/plugins/<matcher_tag>/status
+POST /api/plugins/<matcher_tag>/enable
+POST /api/plugins/<matcher_tag>/disable
+```
+
+All three endpoints return the same status shape:
+
+```json
+{
+  "ok": true,
+  "matcher": "match_cn",
+  "enabled": true
+}
+```
+
+`enable` and `disable` are idempotent and require no request body. A disabled matcher skips its internal predicate and produces a base result of `false`; existing negation still applies, so `!$match_cn` evaluates to `true` while that matcher is disabled.
+
+The switch belongs only to the current runtime and is not written to YAML. An application reload or process restart restores the matcher to enabled. Quick-setup matchers inside `sequence` or `any_match` use internal `qs.match...` tags and do not register these endpoints. Extract a quick-setup expression into a standalone matcher under `plugins:` and reference it with `$tag` when runtime control is required.
+
 ### provider
 
 #### `POST /api/plugins/<provider_tag>/reload`
@@ -551,7 +575,11 @@ Responses:
 * `200 OK`
   * The provider reload succeeded.
 * `400 Bad Request`
-  * The provider does not exist, is not a live provider, or returned an error while reloading.
+  * The provider returned an error while reloading.
+* `404 Not Found`
+  * The tag is not a loaded provider in the current runtime, so no route was registered for it.
+* `409 Conflict`
+  * A reload is already running for the same provider. The new request returns `provider_reload_busy` immediately instead of waiting in a queue.
 
 Good fit:
 

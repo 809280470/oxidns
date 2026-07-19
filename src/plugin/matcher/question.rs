@@ -152,6 +152,10 @@ mod tests {
             self
         }
 
+        async fn reload(&self) -> DnsResult<()> {
+            Ok(())
+        }
+
         fn contains_question(&self, question: &Question) -> bool {
             question.name().to_fqdn() == "match.example."
         }

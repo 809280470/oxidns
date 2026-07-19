@@ -21,7 +21,7 @@ use std::net::IpAddr;
 
 use async_trait::async_trait;
 
-use crate::infra::error::{DnsError, Result as DnsResult};
+use crate::infra::error::Result as DnsResult;
 use crate::plugin::Plugin;
 use crate::proto::{Name, Question};
 
@@ -37,6 +37,11 @@ pub mod geosite;
 pub mod ip_set;
 #[cfg(feature = "provider-protobuf")]
 pub(crate) mod v2ray;
+
+mod control;
+#[cfg(feature = "api")]
+pub(crate) use control::ProviderReloadError;
+pub(crate) use control::ProviderRuntimeControl;
 
 #[async_trait]
 #[allow(dead_code)]
@@ -63,12 +68,7 @@ pub trait Provider: Plugin {
     }
 
     /// Reload the provider's internal data using the same startup config.
-    async fn reload(&self) -> DnsResult<()> {
-        Err(DnsError::plugin(format!(
-            "provider '{}' does not support reload",
-            self.tag()
-        )))
-    }
+    async fn reload(&self) -> DnsResult<()>;
 
     #[inline]
     fn supports_ip_matching(&self) -> bool {
@@ -80,9 +80,6 @@ pub trait Provider: Plugin {
         false
     }
 }
-
-mod api;
-pub(crate) use api::register_reload_api_route;
 
 #[cfg(all(test, feature = "api"))]
 mod tests {
@@ -98,7 +95,10 @@ mod tests {
     use hyper_util::rt::TokioExecutor;
 
     use super::*;
-    use crate::api::{ApiHub, clear_global_api, global_api_test_guard, install_global_api};
+    use crate::api::{
+        ApiHub, ApiRegister, clear_global_api, global_api_test_guard, install_global_api,
+        register_plugin_runtime_control_routes,
+    };
     use crate::config::types::{ApiConfig, ApiHttpConfig, PluginConfig};
     use crate::infra::clock::AppClock;
     use crate::plugin::dependency::DependencyKind;
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_reload_api_calls_targeted_reload() -> DnsResult<()> {
+    async fn runtime_control_api_controls_matcher_and_reloads_provider() -> DnsResult<()> {
         let _guard = global_api_test_guard().await;
         clear_global_api();
         plugin::reset_runtime_for_test().await;
@@ -217,6 +217,7 @@ mod tests {
             .await
             .expect("plugin init should succeed");
         plugin::set_current_runtime_for_test(registry.clone()).await;
+        register_plugin_runtime_control_routes(&ApiRegister::new(hub.clone()), &registry)?;
         hub.start().await.expect("api hub should start");
 
         let client: Client<HttpConnector, Empty<bytes::Bytes>> =
@@ -248,6 +249,56 @@ mod tests {
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["action"], "reload_provider");
         assert_eq!(payload["provider"], "reloadable");
+
+        let uri: Uri = format!("http://{listen}/api/plugins/match_qname/status")
+            .parse()
+            .expect("uri should parse");
+        let response = client
+            .request(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Empty::new())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+        let payload = serde_json::from_slice::<serde_json::Value>(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body should collect")
+                .to_bytes(),
+        )
+        .expect("response should be valid json");
+        assert_eq!(payload["matcher"], "match_qname");
+        assert_eq!(payload["enabled"], true);
+
+        let uri: Uri = format!("http://{listen}/api/plugins/match_qname/disable")
+            .parse()
+            .expect("uri should parse");
+        let response = client
+            .request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .body(Empty::new())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = serde_json::from_slice::<serde_json::Value>(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body should collect")
+                .to_bytes(),
+        )
+        .expect("response should be valid json");
+        assert_eq!(payload["enabled"], false);
 
         hub.stop().await;
         plugin::reset_runtime_for_test().await;

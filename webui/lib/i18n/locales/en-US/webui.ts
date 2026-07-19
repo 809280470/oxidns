@@ -171,6 +171,13 @@ export const enUSWebui = {
     timeRangeIncomplete: "Start and end time must be set together",
     timeRangeEqual: "Start and end time must be different",
     timeRangeInvalid: "Time must use the HH:MM format",
+    matcherRuntimeControl: "Runtime matching",
+    matcherEnable: "Enable matcher",
+    matcherDisable: "Disable matcher",
+    matcherControlLoading: "Loading matcher runtime state",
+    matcherControlUnavailable:
+      "The matcher runtime API is unavailable; apply the config or check the backend version",
+    matcherControlFailed: "Failed to update matcher runtime state",
   },
   pluginTypes: {
     server: "Server",

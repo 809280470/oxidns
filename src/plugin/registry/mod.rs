@@ -16,9 +16,10 @@ use crate::config::types::PluginConfig;
 use crate::infra::error::{DnsError, Result};
 use crate::plugin::dependency::DependencyKind;
 use crate::plugin::executor::Executor;
-use crate::plugin::matcher::Matcher;
-use crate::plugin::provider::{Provider, register_reload_api_route};
-use crate::plugin::{PluginCreateContext, PluginFactory, PluginInfo, PluginType};
+use crate::plugin::matcher::{Matcher, attach_runtime_control};
+use crate::plugin::provider::{Provider, ProviderRuntimeControl};
+use crate::plugin::runtime_control::PluginRuntimeControl;
+use crate::plugin::{PluginCreateContext, PluginFactory, PluginHolder, PluginInfo, PluginType};
 
 mod catalog;
 mod context;
@@ -310,8 +311,6 @@ impl PluginRegistry {
             let plugin_info = self
                 .create_plugin_info_and_init(plugin_config, factory.as_ref(), &create_context)
                 .await?;
-            let plugin_type = plugin_info.plugin_type;
-
             // DashMap allows insertion even with Arc<Self>
             if self
                 .plugins
@@ -322,9 +321,6 @@ impl PluginRegistry {
                     "Duplicate runtime plugin tag '{}'",
                     plugin_config.tag
                 )));
-            }
-            if plugin_type == PluginType::Provider {
-                register_reload_api_route(self.clone(), &plugin_config.tag)?;
             }
             lock_mutex(&self.init_order).push(plugin_config.tag.clone());
         }
@@ -349,6 +345,26 @@ impl PluginRegistry {
 
         // Initialize and wrap into PluginType (with Arc)
         let plugin_holder = uninitialized.init_and_wrap(&init_context).await?;
+        // Configured matchers and providers receive category-specific runtime
+        // controls. Runtime-only quick-setup plugins bypass this construction
+        // path and remain private implementation details.
+        let (plugin_holder, runtime_control) = match plugin_holder {
+            PluginHolder::Matcher(matcher) => {
+                let (matcher, control) = attach_runtime_control(matcher);
+                (
+                    PluginHolder::Matcher(matcher),
+                    Some(PluginRuntimeControl::Matcher(control)),
+                )
+            }
+            PluginHolder::Provider(provider) => {
+                let control = Arc::new(ProviderRuntimeControl::new(provider.clone()));
+                (
+                    PluginHolder::Provider(provider),
+                    Some(PluginRuntimeControl::Provider(control)),
+                )
+            }
+            other => (other, None),
+        };
 
         // Initialize and wrap into PluginHolder (with Arc)
         Ok(PluginInfo {
@@ -357,6 +373,7 @@ impl PluginRegistry {
             plugin_type: plugin_holder.plugin_type(),
             plugin_holder,
             args: config.args.clone(),
+            runtime_control,
         })
     }
 
@@ -376,7 +393,16 @@ impl PluginRegistry {
                 tag, plugin.plugin_name
             )));
         }
-        plugin.to_provider().reload().await
+        let Some(PluginRuntimeControl::Provider(control)) = plugin.runtime_control() else {
+            return Err(DnsError::plugin(format!(
+                "provider '{}' has no runtime reload control",
+                tag
+            )));
+        };
+        control
+            .reload()
+            .await
+            .map_err(|error| error.into_dns_error())
     }
 
     fn plugin_kind_name(plugin_type: PluginType) -> &'static str {
@@ -524,6 +550,20 @@ impl PluginRegistry {
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    pub(crate) fn runtime_controls(&self) -> Vec<(String, PluginRuntimeControl)> {
+        let mut controls = self
+            .plugins
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .runtime_control()
+                    .map(|control| (entry.tag.clone(), control))
+            })
+            .collect::<Vec<_>>();
+        controls.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        controls
     }
 
     /// Get the number of registered plugins

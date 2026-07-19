@@ -41,6 +41,7 @@ import { PluginConfigModeEditor } from "./plugin-config-mode-editor";
 import { PluginMetricsPanel } from "./plugin-metrics-panel";
 import { PluginDeleteButton } from "./plugin-delete-button";
 import type { PluginReferenceImpact } from "@/lib/plugin-reference-operations";
+import { MatcherRuntimeSwitch } from "./matcher-runtime-switch";
 
 export function PluginDetailTemplate({
   plugin,
@@ -305,6 +306,7 @@ export function PluginDetailTemplate({
           )}
 
           <div className="mt-4 flex flex-wrap items-center gap-2">
+            <MatcherRuntimeSwitch plugin={plugin} showLabel />
             <Button
               variant="outline"
               size="sm"

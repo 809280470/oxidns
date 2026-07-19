@@ -7,6 +7,12 @@ import Admonition from "@theme/Admonition";
 
 Matcher plugins return `true` or `false`. They are mainly used by `sequence.matches`.
 
+## Runtime Enable and Disable
+
+Matchers declared in `plugins:` with stable tags can be enabled, disabled, and inspected through the management API or WebUI for the current runtime. A disabled matcher skips its internal predicate and produces a base result of `false`; outer negation still applies, so `!$matcher` evaluates to `true`.
+
+This state is not written to the configuration, and a full reload or process restart restores the matcher to enabled. Quick-setup matchers do not have stable public tags and therefore do not expose runtime switches; extract the expression into a standalone matcher when control is required. See the [Management API](../api.mdx#matcher) for endpoint details.
+
 ## Matcher Expression Rules
 
 Inside `sequence`, quick-setup matcher expressions are usually the clearest form to start with:
