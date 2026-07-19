@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
 
-use super::backend::{ClearHistoryResult, RecorderBackend, WriterCommand, WriterThreadContext};
+use super::backend::{
+    CleanupResult, ClearHistoryResult, DatabaseCoordinator, RecorderBackend, SpaceReclaimResult,
+    SpaceStats, WriterCommand, WriterThreadContext,
+};
 use super::model::{
     DistributionQuery, DistributionResponse, DistributionRow, LatencyHistogramBucket, LatencyQuery,
     LatencySlowRow, LatencySummary, ListCursor, ListQuery, PendingRecord, PluginStatsKind,
@@ -26,6 +29,7 @@ use crate::infra::error::{DnsError, Result};
 const SCHEMA_VERSION: &str = "v1";
 const QUESTIONS_BACKFILL_MARKER: &str = "questions_backfilled";
 const CLEANUP_BATCH_SIZE: usize = 1_000;
+const VACUUM_BATCH_PAGES: u64 = 1_000;
 const PLUGIN_STATS_SAMPLE_LIMIT: usize = 10_000;
 const RECORD_ROW_COLUMNS: [&str; 27] = [
     "id",
@@ -305,6 +309,7 @@ pub(super) fn run_writer_thread(
     mut conn: Connection,
 ) -> Result<()> {
     let WriterThreadContext {
+        path,
         tables,
         stop_requested,
         tail,
@@ -312,6 +317,7 @@ pub(super) fn run_writer_thread(
         broadcaster,
         batch_size,
         flush_interval,
+        database_coordinator,
     } = context;
 
     let mut pending = Vec::with_capacity(batch_size);
@@ -320,6 +326,23 @@ pub(super) fn run_writer_thread(
             Ok(WriterCommand::Insert(record)) => {
                 pending.push(*record);
                 if pending.len() >= batch_size {
+                    flush_pending_coordinated(
+                        &mut conn,
+                        &tables,
+                        &mut pending,
+                        &tail,
+                        memory_tail,
+                        &broadcaster,
+                        &database_coordinator,
+                    )?;
+                }
+            }
+            Ok(WriterCommand::Cleanup {
+                cutoff_ms,
+                reply_tx,
+            }) => {
+                let result = (|| {
+                    let _access = database_coordinator.write_access()?;
                     flush_pending(
                         &mut conn,
                         &tables,
@@ -328,66 +351,64 @@ pub(super) fn run_writer_thread(
                         memory_tail,
                         &broadcaster,
                     )?;
-                }
-            }
-            Ok(WriterCommand::Cleanup { cutoff_ms }) => {
-                flush_pending(
-                    &mut conn,
-                    &tables,
-                    &mut pending,
-                    &tail,
-                    memory_tail,
-                    &broadcaster,
-                )?;
-                run_cleanup(&mut conn, &tables, cutoff_ms)?;
+                    run_cleanup(&mut conn, &path, &tables, cutoff_ms)
+                })()
+                .map_err(|err: DnsError| err.to_string());
+                let _ = reply_tx.send(result);
             }
             Ok(WriterCommand::ClearHistory { reply_tx }) => {
-                let result = flush_pending(
-                    &mut conn,
-                    &tables,
-                    &mut pending,
-                    &tail,
-                    memory_tail,
-                    &broadcaster,
-                )
-                .and_then(|_| run_clear_history(&mut conn, &tables, &tail))
-                .map_err(|err| err.to_string());
+                let result = (|| {
+                    let _access = database_coordinator.write_access()?;
+                    flush_pending(
+                        &mut conn,
+                        &tables,
+                        &mut pending,
+                        &tail,
+                        memory_tail,
+                        &broadcaster,
+                    )?;
+                    run_clear_history(&mut conn, &path, &tables, &tail)
+                })()
+                .map_err(|err: DnsError| err.to_string());
                 let _ = reply_tx.send(result);
             }
             #[cfg(test)]
             Ok(WriterCommand::Flush { reply_tx }) => {
-                let result = flush_pending(
+                let result = flush_pending_coordinated(
                     &mut conn,
                     &tables,
                     &mut pending,
                     &tail,
                     memory_tail,
                     &broadcaster,
+                    &database_coordinator,
                 )
                 .map_err(|err| err.to_string());
                 let _ = reply_tx.send(result);
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush_pending(
+                flush_pending_coordinated(
                     &mut conn,
                     &tables,
                     &mut pending,
                     &tail,
                     memory_tail,
                     &broadcaster,
+                    &database_coordinator,
                 )?;
                 if stop_requested.load(Ordering::Relaxed) {
                     break;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                flush_pending(
+                flush_pending_coordinated(
                     &mut conn,
                     &tables,
                     &mut pending,
                     &tail,
                     memory_tail,
                     &broadcaster,
+                    &database_coordinator,
                 )?;
                 break;
             }
@@ -395,6 +416,20 @@ pub(super) fn run_writer_thread(
     }
 
     Ok(())
+}
+
+fn flush_pending_coordinated(
+    conn: &mut Connection,
+    tables: &TableNames,
+    pending: &mut Vec<PendingRecord>,
+    tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
+    memory_tail: usize,
+    broadcaster: &broadcast::Sender<RecordDetail>,
+    database_coordinator: &DatabaseCoordinator,
+) -> Result<()> {
+    let _access = database_coordinator.read_access()?;
+    let _writer = database_coordinator.writer()?;
+    flush_pending(conn, tables, pending, tail, memory_tail, broadcaster)
 }
 
 fn flush_pending(
@@ -578,7 +613,16 @@ where
         .transpose()
 }
 
-fn run_cleanup(conn: &mut Connection, tables: &TableNames, cutoff_ms: i64) -> rusqlite::Result<()> {
+fn run_cleanup(
+    conn: &mut Connection,
+    path: &Path,
+    tables: &TableNames,
+    cutoff_ms: i64,
+) -> Result<CleanupResult> {
+    checkpoint_wal(conn)?;
+    let before = read_space_stats(conn, path)?;
+    let mut deleted_records = 0usize;
+    let mut peak_wal_bytes = 0;
     loop {
         let deleted = conn.execute(
             &format!(
@@ -596,26 +640,213 @@ fn run_cleanup(conn: &mut Connection, tables: &TableNames, cutoff_ms: i64) -> ru
         if deleted == 0 {
             break;
         }
+        deleted_records = deleted_records.saturating_add(deleted);
+        observe_wal_size(path, &mut peak_wal_bytes)?;
+        checkpoint_wal(conn)?;
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE); PRAGMA incremental_vacuum;")
+    let reclaimable = read_space_stats(conn, path)?;
+    let space = reclaim_database_space(conn, path, before, reclaimable, peak_wal_bytes)?;
+    Ok(CleanupResult {
+        deleted_records,
+        space,
+    })
 }
 
 fn run_clear_history(
     conn: &mut Connection,
+    path: &Path,
     tables: &TableNames,
     tail: &Arc<Mutex<VecDeque<RecordDetail>>>,
 ) -> Result<ClearHistoryResult> {
-    let tx = conn.transaction()?;
-    let cleared_records = tx.execute(&format!("DELETE FROM {}", tables.records), [])?;
-    tx.commit()?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;")?;
+    // Start from an empty WAL and keep it bounded throughout the operation.
+    // A single DELETE transaction for a large recorder can otherwise grow the
+    // WAL close to the amount of history being removed before the final
+    // checkpoint gets a chance to truncate it.
+    checkpoint_wal(conn)?;
+    let before = read_space_stats(conn, path)?;
+    let mut cleared_records = 0usize;
+    let mut peak_wal_bytes = 0;
+    loop {
+        let deleted = conn.execute(
+            &format!(
+                "DELETE FROM {records}
+                 WHERE id IN (
+                    SELECT id FROM {records}
+                    ORDER BY id ASC
+                    LIMIT ?1
+                 )",
+                records = tables.records
+            ),
+            params![CLEANUP_BATCH_SIZE as i64],
+        )?;
+        if deleted == 0 {
+            break;
+        }
+        cleared_records = cleared_records.saturating_add(deleted);
+        observe_wal_size(path, &mut peak_wal_bytes)?;
+        checkpoint_wal(conn)?;
+    }
 
     let mut tail_guard = tail
         .lock()
         .map_err(|_| "query_recorder tail buffer lock poisoned".to_string())?;
     tail_guard.clear();
+    drop(tail_guard);
 
-    Ok(ClearHistoryResult { cleared_records })
+    let reclaimable = read_space_stats(conn, path)?;
+    let space =
+        reclaim_database_space(conn, path, before, reclaimable, peak_wal_bytes).map_err(|err| {
+            DnsError::runtime(format!(
+                "query history cleared ({cleared_records} records), but space reclaim failed: {err}"
+            ))
+        })?;
+
+    Ok(ClearHistoryResult {
+        cleared_records,
+        space,
+    })
+}
+
+fn reclaim_database_space(
+    conn: &Connection,
+    path: &Path,
+    before: SpaceStats,
+    reclaimable: SpaceStats,
+    mut peak_wal_bytes: u64,
+) -> Result<SpaceReclaimResult> {
+    let migrated = match reclaimable.auto_vacuum {
+        0 => {
+            conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+            true
+        }
+        1 => false,
+        2 => {
+            run_incremental_vacuum(conn, path, &mut peak_wal_bytes)?;
+            false
+        }
+        mode => {
+            return Err(DnsError::runtime(format!(
+                "query_recorder returned unsupported auto_vacuum mode {mode}"
+            )));
+        }
+    };
+
+    observe_wal_size(path, &mut peak_wal_bytes)?;
+    checkpoint_wal(conn)?;
+
+    let after = read_space_stats(conn, path)?;
+    if migrated && after.auto_vacuum != 2 {
+        return Err(DnsError::runtime(format!(
+            "query_recorder legacy database migration did not enable incremental auto-vacuum (mode {})",
+            after.auto_vacuum
+        )));
+    }
+    if after.freelist_count != 0 {
+        return Err(DnsError::runtime(format!(
+            "query_recorder space reclaim left {} free pages",
+            after.freelist_count
+        )));
+    }
+    if reclaimable.freelist_count > 0 && after.page_count >= reclaimable.page_count {
+        return Err(DnsError::runtime(format!(
+            "query_recorder space reclaim made no page-count progress ({} pages, {} free)",
+            after.page_count, reclaimable.freelist_count
+        )));
+    }
+
+    Ok(SpaceReclaimResult {
+        before,
+        reclaimable,
+        after,
+        migrated,
+        peak_wal_bytes,
+    })
+}
+
+fn run_incremental_vacuum(conn: &Connection, path: &Path, peak_wal_bytes: &mut u64) -> Result<()> {
+    // `PRAGMA incremental_vacuum` is a multi-step statement that yields one
+    // zero-column row per reclaimed page. `Connection::execute_batch` only
+    // steps a result-producing statement once. Reclaim a bounded number of
+    // pages per statement and truncate the WAL between batches so a manual
+    // clear cannot trade a smaller main file for an unbounded WAL peak.
+    loop {
+        let before = pragma_u64(conn, "PRAGMA freelist_count")?;
+        if before == 0 {
+            return Ok(());
+        }
+
+        let mut statement =
+            conn.prepare(&format!("PRAGMA incremental_vacuum({VACUUM_BATCH_PAGES})"))?;
+        let mut rows = statement.query([])?;
+        while rows.next()?.is_some() {}
+        drop(rows);
+        drop(statement);
+        observe_wal_size(path, peak_wal_bytes)?;
+        checkpoint_wal(conn)?;
+
+        let after = pragma_u64(conn, "PRAGMA freelist_count")?;
+        if after >= before {
+            return Err(DnsError::runtime(format!(
+                "query_recorder incremental vacuum made no progress ({after} of {before} free pages remain)"
+            )));
+        }
+    }
+}
+
+fn checkpoint_wal(conn: &Connection) -> Result<()> {
+    let (busy, _log_frames, _checkpointed_frames) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+    if busy != 0 {
+        return Err(DnsError::runtime(format!(
+            "query_recorder WAL checkpoint remained busy ({busy})"
+        )));
+    }
+    Ok(())
+}
+
+fn observe_wal_size(path: &Path, peak_wal_bytes: &mut u64) -> Result<()> {
+    *peak_wal_bytes = (*peak_wal_bytes).max(file_size(&wal_path(path))?);
+    Ok(())
+}
+
+fn read_space_stats(conn: &Connection, path: &Path) -> Result<SpaceStats> {
+    let auto_vacuum = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))?;
+    let page_size = pragma_u64(conn, "PRAGMA page_size")?;
+    let page_count = pragma_u64(conn, "PRAGMA page_count")?;
+    let freelist_count = pragma_u64(conn, "PRAGMA freelist_count")?;
+    Ok(SpaceStats {
+        auto_vacuum,
+        page_size,
+        page_count,
+        freelist_count,
+        database_bytes: file_size(path)?,
+        wal_bytes: file_size(&wal_path(path))?,
+    })
+}
+
+fn pragma_u64(conn: &Connection, pragma: &str) -> Result<u64> {
+    let value = conn.query_row(pragma, [], |row| row.get::<_, i64>(0))?;
+    non_negative_u64(value).map_err(Into::into)
+}
+
+fn file_size(path: &Path) -> Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn wal_path(path: &Path) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
+    path.push("-wal");
+    PathBuf::from(path)
 }
 
 pub(super) fn query_records(
