@@ -23,25 +23,25 @@ Further separate cache lookup, admission, TTL decisions, lazy refresh, eviction 
 
 </RoadmapItem>
 
-<RoadmapItem type="active" label="In progress" title="Standard-mode WebUI" desc="A form-driven, turnkey experience built on standard scenario templates">
-
-Provide a standardized configuration entry point for users who do not want to edit YAML directly. Common scenarios such as ad blocking, anti-poisoning, family filtering, and split-tunnel acceleration will be configured through forms, toggles, and presets, with a path into the advanced configuration mode for complete rule editing. The goal is to reduce initial setup and day-to-day maintenance cost without weakening OxiDNS's policy model.
-
-</RoadmapItem>
-
 <RoadmapItem type="future" label="Soon" title="Plugin API Expansion & WebUI Wiring" desc="Fill in management APIs for existing plugins; wire them into the WebUI" num={2}>
 
 Apply the rule "per-entity / status / action → API; counters / histograms / low-cardinality gauges → metrics" and fill in runtime management APIs (upstream probe, job pause / run-now, rule enumeration, hot-client buckets, cache top-N, …) for existing plugins such as `forward`, `cron`, `download`, `script`, `ip_selector`, `cache`, and `rate_limiter`. Wire each endpoint into a corresponding WebUI detail panel and round out Prometheus metrics along the same boundary to improve observability and day-2 operations.
 
 </RoadmapItem>
 
-<RoadmapItem type="done" label="2026-07-17" title="MikroTik RouterOS Plugin Pair" desc="ros_address_list and ros_route synchronize address lists and static routes">
+<RoadmapItem type="active" label="In progress" title="Standard-mode WebUI" desc="A form-driven, turnkey experience built on standard scenario templates">
+
+Provide a standardized configuration entry point for users who do not want to edit YAML directly. Common scenarios such as ad blocking, anti-poisoning, family filtering, and split-tunnel acceleration will be configured through forms, toggles, and presets, with a path into the advanced configuration mode for complete rule editing. The goal is to reduce initial setup and day-to-day maintenance cost without weakening OxiDNS's policy model.
+
+</RoadmapItem>
+
+<RoadmapItem type="version" label="2026-07-17" title="MikroTik RouterOS Plugin Pair" desc="ros_address_list and ros_route synchronize address lists and static routes">
 
 Completed the `ros_address_list` and `ros_route` RouterOS executors. `ros_address_list` synchronizes A/AAAA addresses from DNS responses into RouterOS address lists, while `ros_route` installs per-address static routes in a selected routing table. They share asynchronous queues, batching, TTL leases, reconnect, reconciliation, deduplication, shutdown cleanup, and metrics. The route plugin also supports conntrack-aware deferred deletion to reduce the risk of removing routes that still carry active connections.
 
 </RoadmapItem>
 
-<RoadmapItem type="done" label="2026-07-02" title="OpenWrt LuCI App" desc="Use luci-app-oxidns to install the core, manage the service, edit config, and view logs from LuCI">
+<RoadmapItem type="version" label="2026-07-02" title="OpenWrt LuCI App" desc="Use luci-app-oxidns to install the core, manage the service, edit config, and view logs from LuCI">
 
 Added [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns): OpenWrt users can install the OxiDNS core, manage the init service, edit configuration, and view logs from LuCI under `Services -> OxiDNS`. The LuCI app does not embed the OxiDNS core; on first install it downloads and verifies the official Linux musl release archive from GitHub Releases. Future core upgrades continue to use OxiDNS's built-in upgrade capability.
 

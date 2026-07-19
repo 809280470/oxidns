@@ -23,25 +23,25 @@ import RoadmapTimeline, { RoadmapItem } from '@site/src/components/RoadmapTimeli
 
 </RoadmapItem>
 
-<RoadmapItem type="active" label="进行中" title="标准模式 WebUI" desc="基于标准场景模板，提供表单化、开箱即用的配置体验">
-
-面向不想直接编写 YAML 的用户，提供一套标准化配置入口。常见场景（去广告、防污染、家庭过滤、分流加速等）通过表单、开关和预置模板完成，同时保留进入高级配置模式继续编辑完整规则的入口。目标是在不削弱 OxiDNS 策略能力的前提下，显著降低首次安装和日常维护门槛。
-
-</RoadmapItem>
-
 <RoadmapItem type="future" label="敬请期待" title="插件 API 扩展与 WebUI 接入" desc="为已有插件补齐管理 API，WebUI 接入新增端点与详情面板" num={2}>
 
 按"个体枚举 / 状态查询 / 动作触发"归 API、"计数器 / 直方图 / 低基数 gauge"归 metrics 的划分原则，为 `forward`、`cron`、`download`、`script`、`ip_selector`、`cache`、`rate_limiter` 等已有插件补齐运行时管理 API（上游探测、任务暂停 / 立即执行、规则枚举、热点客户端、缓存 top-N 等），并在 WebUI 的插件详情面板里接入对应端点；同时按上述边界补全 Prometheus 指标，提升整体可观测性与运维效率。
 
 </RoadmapItem>
 
-<RoadmapItem type="done" label="2026-07-17" title="MikroTik RouterOS 双插件" desc="ros_address_list 与 ros_route 完成地址列表和静态路由同步">
+<RoadmapItem type="active" label="进行中" title="标准模式 WebUI" desc="基于标准场景模板，提供表单化、开箱即用的配置体验">
+
+面向不想直接编写 YAML 的用户，提供一套标准化配置入口。常见场景（去广告、防污染、家庭过滤、分流加速等）通过表单、开关和预置模板完成，同时保留进入高级配置模式继续编辑完整规则的入口。目标是在不削弱 OxiDNS 策略能力的前提下，显著降低首次安装和日常维护门槛。
+
+</RoadmapItem>
+
+<RoadmapItem type="version" label="2026-07-17" title="MikroTik RouterOS 双插件" desc="ros_address_list 与 ros_route 完成地址列表和静态路由同步">
 
 完成 `ros_address_list` 与 `ros_route` 两个 RouterOS executor。`ros_address_list` 将 DNS 响应中的 A/AAAA 地址同步到 RouterOS address-list，`ros_route` 将目标地址同步为指定 routing table 中的逐 IP 静态路由。两者共用异步队列、批处理、TTL lease、重连、reconcile、去重、关闭清理和指标体系；路由插件还支持基于 conntrack 的延迟删除，降低活跃连接被提前移除路由的风险。
 
 </RoadmapItem>
 
-<RoadmapItem type="done" label="2026-07-02" title="OpenWrt LuCI 插件" desc="通过 luci-app-oxidns 在 LuCI 中安装内核、托管服务、编辑配置并查看日志">
+<RoadmapItem type="version" label="2026-07-02" title="OpenWrt LuCI 插件" desc="通过 luci-app-oxidns 在 LuCI 中安装内核、托管服务、编辑配置并查看日志">
 
 新增 [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns)：OpenWrt 用户可以在 LuCI 的 `Services -> OxiDNS` 中安装 OxiDNS core、管理 init 服务、编辑配置并查看日志。LuCI 插件不内置 OxiDNS 内核，首次安装时会从官方 GitHub Releases 下载并校验 Linux musl release archive；后续内核升级继续使用 OxiDNS 自带升级能力。
 
