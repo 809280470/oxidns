@@ -192,6 +192,7 @@ export const zhCNWebui = {
     providerReloadFailed: "重新加载失败",
     providerReloadBusy: "该 provider 正在重新加载，请稍后再试",
     providerReloadNotApplied: "请先应用当前配置",
+    providerReloadSkipped: "当前 provider 未被运行时使用",
     providerReloadUnavailable: "离线模式下不可用",
     providerReloadTopologyHint:
       "该操作不会应用 YAML、tag 或依赖拓扑变更；这些变更仍需执行应用级 reload。",

@@ -3,21 +3,30 @@
 
 //! Runtime switch shared by every configured matcher instance.
 
+#[cfg(any(feature = "api", test))]
 use std::sync::Arc;
+#[cfg(any(feature = "api", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(any(feature = "api", test))]
 use async_trait::async_trait;
 
+#[cfg(any(feature = "api", test))]
 use crate::core::context::DnsContext;
+#[cfg(any(feature = "api", test))]
 use crate::infra::error::Result as DnsResult;
+#[cfg(any(feature = "api", test))]
 use crate::plugin::Plugin;
+#[cfg(any(feature = "api", test))]
 use crate::plugin::matcher::Matcher;
 
+#[cfg(any(feature = "api", test))]
 #[derive(Debug)]
 pub(crate) struct MatcherRuntimeControl {
     enabled: AtomicBool,
 }
 
+#[cfg(any(feature = "api", test))]
 impl MatcherRuntimeControl {
     fn new() -> Self {
         Self {
@@ -36,12 +45,14 @@ impl MatcherRuntimeControl {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 #[derive(Debug)]
 struct ControlledMatcher {
     inner: Arc<dyn Matcher>,
     control: Arc<MatcherRuntimeControl>,
 }
 
+#[cfg(any(feature = "api", test))]
 #[async_trait]
 impl Plugin for ControlledMatcher {
     fn tag(&self) -> &str {
@@ -53,6 +64,7 @@ impl Plugin for ControlledMatcher {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 impl Matcher for ControlledMatcher {
     #[inline]
     fn is_match(&self, context: &mut DnsContext) -> bool {
@@ -60,6 +72,7 @@ impl Matcher for ControlledMatcher {
     }
 }
 
+#[cfg(any(feature = "api", test))]
 pub(crate) fn attach_runtime_control(
     matcher: Arc<dyn Matcher>,
 ) -> (Arc<dyn Matcher>, Arc<MatcherRuntimeControl>) {

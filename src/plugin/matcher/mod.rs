@@ -46,6 +46,7 @@ pub mod string_exp;
 pub mod time;
 pub mod true_matcher;
 
+#[cfg(feature = "api")]
 pub(crate) use control::{MatcherRuntimeControl, attach_runtime_control};
 
 #[allow(dead_code)]

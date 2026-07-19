@@ -5,12 +5,14 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "api")]
 use crate::plugin::matcher::MatcherRuntimeControl;
 use crate::plugin::provider::ProviderRuntimeControl;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) enum PluginRuntimeControl {
+    #[cfg(feature = "api")]
     Matcher(Arc<MatcherRuntimeControl>),
     Provider(Arc<ProviderRuntimeControl>),
 }

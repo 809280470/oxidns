@@ -16,7 +16,9 @@ use crate::config::types::PluginConfig;
 use crate::infra::error::{DnsError, Result};
 use crate::plugin::dependency::DependencyKind;
 use crate::plugin::executor::Executor;
-use crate::plugin::matcher::{Matcher, attach_runtime_control};
+use crate::plugin::matcher::Matcher;
+#[cfg(feature = "api")]
+use crate::plugin::matcher::attach_runtime_control;
 use crate::plugin::provider::{Provider, ProviderRuntimeControl};
 use crate::plugin::runtime_control::PluginRuntimeControl;
 use crate::plugin::{PluginCreateContext, PluginFactory, PluginHolder, PluginInfo, PluginType};
@@ -350,11 +352,18 @@ impl PluginRegistry {
         // path and remain private implementation details.
         let (plugin_holder, runtime_control) = match plugin_holder {
             PluginHolder::Matcher(matcher) => {
-                let (matcher, control) = attach_runtime_control(matcher);
-                (
-                    PluginHolder::Matcher(matcher),
-                    Some(PluginRuntimeControl::Matcher(control)),
-                )
+                #[cfg(feature = "api")]
+                {
+                    let (matcher, control) = attach_runtime_control(matcher);
+                    (
+                        PluginHolder::Matcher(matcher),
+                        Some(PluginRuntimeControl::Matcher(control)),
+                    )
+                }
+                #[cfg(not(feature = "api"))]
+                {
+                    (PluginHolder::Matcher(matcher), None)
+                }
             }
             PluginHolder::Provider(provider) => {
                 let control = Arc::new(ProviderRuntimeControl::new(provider.clone()));

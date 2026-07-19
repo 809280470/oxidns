@@ -27,6 +27,7 @@ import {
 import { usePluginAppliedStatus } from "@/hooks/use-plugin-applied";
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
+import { providerHasLiveDependents } from "@/lib/provider-reload";
 import { useAppStore } from "@/lib/store";
 import type { PluginInstance } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -48,10 +49,14 @@ export function ProviderRuntimeControl({
   const reloadProvider = useAppStore((state) => state.reloadProvider);
   const clearResult = useAppStore((state) => state.clearProviderReloadResult);
   const isOfflineMode = useAppStore((state) => state.isOfflineMode);
+  const dependencyGraph = useAppStore((state) => state.dependencyGraph);
 
   const pending = Boolean(reloadState?.pending);
   const outcome = reloadState?.outcome ?? "idle";
-  const unavailable = isOfflineMode || appliedStatus === "not-applied";
+  const liveStatus = providerHasLiveDependents(plugin.name, dependencyGraph);
+  const skipped = liveStatus === false;
+  const unavailable =
+    isOfflineMode || appliedStatus === "not-applied" || skipped;
 
   useEffect(() => {
     if (outcome !== "success") return;
@@ -62,9 +67,11 @@ export function ProviderRuntimeControl({
   if (plugin.type !== "provider") return null;
 
   const statusLabel = unavailable
-    ? appliedStatus === "not-applied"
-      ? t(WEBUI.plugins.providerReloadNotApplied)
-      : t(WEBUI.plugins.providerReloadUnavailable)
+    ? skipped
+      ? t(WEBUI.plugins.providerReloadSkipped)
+      : appliedStatus === "not-applied"
+        ? t(WEBUI.plugins.providerReloadNotApplied)
+        : t(WEBUI.plugins.providerReloadUnavailable)
     : pending
       ? t(WEBUI.plugins.providerReloadPending)
       : outcome === "success"

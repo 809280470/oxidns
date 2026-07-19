@@ -189,6 +189,7 @@ export const WEBUI = {
     providerReloadFailed: "webui.plugins.providerReloadFailed",
     providerReloadBusy: "webui.plugins.providerReloadBusy",
     providerReloadNotApplied: "webui.plugins.providerReloadNotApplied",
+    providerReloadSkipped: "webui.plugins.providerReloadSkipped",
     providerReloadUnavailable: "webui.plugins.providerReloadUnavailable",
     providerReloadTopologyHint: "webui.plugins.providerReloadTopologyHint",
   },

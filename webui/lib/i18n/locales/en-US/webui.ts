@@ -204,6 +204,7 @@ export const enUSWebui = {
     providerReloadFailed: "Reload failed",
     providerReloadBusy: "This provider is already reloading; try again shortly",
     providerReloadNotApplied: "Apply the current configuration first",
+    providerReloadSkipped: "This provider is not used by the runtime",
     providerReloadUnavailable: "Unavailable in offline mode",
     providerReloadTopologyHint:
       "This does not apply YAML, tag, or dependency-topology changes; those changes still require an application reload.",
