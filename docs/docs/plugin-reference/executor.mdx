@@ -1788,7 +1788,7 @@ old-static.example.com static.example.net
 - tag: query_recorder_main
   type: query_recorder
   args:
-    # SQLite 文件路径；不同 recorder 应使用不同 path
+    # SQLite 文件路径；多个 recorder 可以共用同一文件
     path: "./data/query-recorder-main.sqlite"
     # 热路径入队缓冲大小
     queue_size: 8192
@@ -1865,7 +1865,10 @@ old-static.example.com static.example.net
   - `qr_<safe_tag>_<fnv64hex>_v1_meta`
 - `records` 主表只保存固定字段集合；`steps` 表保存 `sequence` 路径事件，用于执行路径分析和命中率统计；`questions` 表是从 `questions_json` 派生的索引表，用于加速 qname/qtype 查询；`meta` 表记录已完成的派生表迁移。
 - 每个 recorder 独占自己的有界队列、SQLite 连接、后台写线程、内存 tail 和 SSE 广播器。
-- 默认假定不同 recorder 使用不同 `path`；v1 不做跨 recorder 写线程复用或路径协调。
+- 共用同一 `path` 的 recorder 会按规范化文件路径协调 reader、writer 和维护操作；表和内存状态仍按 tag 隔离。
+- 定时保留期清理会删除过期记录、回收全部完整空闲页，并在最后截断 WAL。只有删除产生完整空闲页时，数据库文件才会实际变小；少量删除可能只释放页内空间供后续写入复用。
+- 旧数据库若仍是 `auto_vacuum=NONE`，第一次定时清理或手动清空会执行一次完整 `VACUUM`，迁移到 `INCREMENTAL` 模式。该过程可能短暂停止 recorder 的数据库读写，并需要额外临时磁盘空间，但不会阻塞 DNS 请求处理。
+- 维护失败不会终止后台 writer；定时任务会在后续周期重试，并通过结构化日志报告回收前后的页数、文件大小和失败阶段。
 
 ### 数据结构约定
 
@@ -1912,7 +1915,8 @@ old-static.example.com static.example.net
   - 返回单条完整记录，并附带 `steps`。
 - `DELETE /plugins/<tag>/records`
   - 清空当前 recorder 的所有历史记录和 `steps`，并清空内存 tail。
-  - 操作会先 flush 后台写入队列，返回 `cleared_records` 表示删除的主表记录数。
+  - 操作会先 flush 后台写入队列，再用小批次自动提交删除记录；每批删除和每批页面回收后都会截断 WAL，避免一个覆盖整次清空的大事务导致 WAL 持续增长。返回 `cleared_records` 表示删除的主表记录数。
+  - 若历史已删除但磁盘回收失败，接口返回 `query_recorder_clear_failed`，错误信息会明确说明历史已经清除；后续维护仍可重试空间回收。
 - `GET /plugins/<tag>/stats/plugins`
   - 返回按 `matcher / executor / builtin` 聚合的命中统计。
   - 支持 `since_ms`、`until_ms`、`kind=matcher|executor|builtin|all` 和 records 的过滤参数。

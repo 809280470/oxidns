@@ -1709,7 +1709,7 @@ Persists the entry request, the post-`next` response, and `sequence` execution-p
 - tag: query_recorder_main
   type: query_recorder
   args:
-    # SQLite path for this recorder. Different recorders should use different paths.
+    # SQLite path for this recorder. Multiple recorders may share one file.
     path: "./data/query-recorder-main.sqlite"
     # Hot-path enqueue buffer size
     queue_size: 8192
@@ -1783,7 +1783,10 @@ Persists the entry request, the post-`next` response, and `sequence` execution-p
   - `qr_<safe_tag>_<fnv64hex>_v1_meta`
 - `records` contains only the fixed schema fields for structured snapshots. `steps` stores `sequence` path events for path analysis and hit-rate reporting. `questions` is a derived index table from `questions_json` for faster qname/qtype queries. `meta` records completed derived-table migrations.
 - Every recorder owns its own bounded queue, SQLite connection, writer thread, tail buffer, and SSE broadcaster.
-- v1 assumes different recorders use different `path` values. There is no cross-recorder writer sharing or path coordination.
+- Recorders that share the same `path` coordinate readers, writers, and maintenance by normalized database path; tables and in-memory state remain isolated by tag.
+- Periodic retention cleanup deletes expired rows, reclaims every completely free page, and truncates the WAL last. The database file shrinks only when deletion produces complete free pages; small deletions may instead leave reusable space inside live pages.
+- If an existing database still uses `auto_vacuum=NONE`, its first periodic or manual cleanup performs one full `VACUUM` to migrate it to `INCREMENTAL`. This may temporarily pause recorder database reads and writes and require additional temporary disk space, but it does not block DNS request processing.
+- A maintenance failure does not stop the writer. Periodic cleanup retries on a later interval and structured logs report page counts, file sizes, and the failure stage.
 
 ### Data Shape
 
@@ -1830,7 +1833,8 @@ Persists the entry request, the post-`next` response, and `sequence` execution-p
   - Returns one full record plus `steps`.
 - `DELETE /plugins/<tag>/records`
   - Clears all history rows and `steps` for the current recorder, and clears the in-memory tail.
-  - The operation first flushes the background writer queue and returns `cleared_records` for the number of deleted main-table rows.
+  - The operation first flushes the background writer queue, then deletes records in small auto-committed batches. It truncates the WAL after every deletion and page-reclamation batch, avoiding one transaction spanning the full clear operation. It returns `cleared_records` for the number of deleted main-table rows.
+  - If history deletion succeeds but disk reclamation fails, the endpoint returns `query_recorder_clear_failed` with a message that history was already cleared; later maintenance can retry space reclamation.
 - `GET /plugins/<tag>/stats/plugins`
   - Returns hit stats grouped by `matcher / executor / builtin`.
   - Supports `since_ms`, `until_ms`, `kind=matcher|executor|builtin|all`, and the record filters.
