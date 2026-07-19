@@ -11,9 +11,15 @@ OxiDNS's complete development roadmap since v0.1.0. Upcoming work appears at the
 
 <RoadmapTimeline>
 
-<RoadmapItem type="future" label="Soon" title="Simple-mode WebUI" desc="Template-driven config delivering an AdGuard Home-style turnkey experience" num={3}>
+<RoadmapItem type="future" label="Planned" title="DHCP Service and DNS Integration" desc="Unify lease management, address allocation, and local DNS naming" num={5}>
 
-For users who don't want to touch YAML: a set of preset scenario templates (ad blocking, anti-poisoning, family filtering, split-tunnel acceleration) configured entirely through forms and toggles, with an escape hatch back to the full editor for advanced rules. The target experience matches AdGuard Home's simple admin UI, bringing OxiDNS's setup bar close to out-of-the-box.
+Add an optional DHCP service covering address pools, static leases, lease persistence, and common DHCP options. Hostname/IP data from leases will be exposed safely to local DNS policy, while the management API and WebUI provide lease inspection, configuration, and essential administrative actions. The DHCP runtime will remain decoupled from the DNS plugin pipeline and integrate through an explicit data interface rather than placing lease state on the request hot path.
+
+</RoadmapItem>
+
+<RoadmapItem type="future" label="Planned" title="Cache Plugin Refactor and Performance Work" desc="Reshape cache architecture, reduce hit-path cost, and improve stability at scale" num={4}>
+
+Further separate cache lookup, admission, TTL decisions, lazy refresh, eviction maintenance, persistence, and metrics so DNS cache semantics remain distinct from generic storage primitives. The performance work will target message cloning, temporary allocations, timestamp write amplification, and lock contention on cache hits; improve same-key refresh deduplication, batched expiration, and sampled-LRU behavior; and add focused benchmarks and regressions for hit, miss, stale, write, concurrent refresh, and large-capacity workloads.
 
 </RoadmapItem>
 
@@ -23,13 +29,19 @@ Apply the rule "per-entity / status / action → API; counters / histograms / lo
 
 </RoadmapItem>
 
-<RoadmapItem type="future" label="Soon" title="MikroTik Deep Integration" desc="Bidirectional IP set sync between OxiDNS and RouterOS" num={1}>
+<RoadmapItem type="active" label="In progress" title="Standard-mode WebUI" desc="A form-driven, turnkey experience built on standard scenario templates">
 
-On top of the existing one-way push, add pulling RouterOS address lists as an OxiDNS data source and actively pushing local IP sets to RouterOS — bidirectional DNS-policy and routing-policy integration.
+Provide a standardized configuration entry point for users who do not want to edit YAML directly. Common scenarios such as ad blocking, anti-poisoning, family filtering, and split-tunnel acceleration will be configured through forms, toggles, and presets, with a path into the advanced configuration mode for complete rule editing. The goal is to reduce initial setup and day-to-day maintenance cost without weakening OxiDNS's policy model.
 
 </RoadmapItem>
 
-<RoadmapItem type="done" label="2026-07-02" title="OpenWrt LuCI App" desc="Use luci-app-oxidns to install the core, manage the service, edit config, and view logs from LuCI">
+<RoadmapItem type="version" label="2026-07-17" title="MikroTik RouterOS Plugin Pair" desc="ros_address_list and ros_route synchronize address lists and static routes">
+
+Completed the `ros_address_list` and `ros_route` RouterOS executors. `ros_address_list` synchronizes A/AAAA addresses from DNS responses into RouterOS address lists, while `ros_route` installs per-address static routes in a selected routing table. They share asynchronous queues, batching, TTL leases, reconnect, reconciliation, deduplication, shutdown cleanup, and metrics. The route plugin also supports conntrack-aware deferred deletion to reduce the risk of removing routes that still carry active connections.
+
+</RoadmapItem>
+
+<RoadmapItem type="version" label="2026-07-02" title="OpenWrt LuCI App" desc="Use luci-app-oxidns to install the core, manage the service, edit config, and view logs from LuCI">
 
 Added [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns): OpenWrt users can install the OxiDNS core, manage the init service, edit configuration, and view logs from LuCI under `Services -> OxiDNS`. The LuCI app does not embed the OxiDNS core; on first install it downloads and verifies the official Linux musl release archive from GitHub Releases. Future core upgrades continue to use OxiDNS's built-in upgrade capability.
 
@@ -37,7 +49,7 @@ Added [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns): OpenWrt u
 
 <RoadmapItem type="version" title="IP Optimization" desc="Parallel latency testing of A/AAAA addresses; return the lowest-latency IP" version="v1.2.0" date="2026-06-03">
 
-Test multiple A/AAAA addresses from a DNS response in parallel and return the lowest-latency IP to the client, improving real-world access speed. Implementation is complete and ships with v1.2.0.
+Test multiple A/AAAA addresses from a DNS response in parallel and return the lowest-latency IP to the client, improving real-world access speed. This capability shipped with v1.2.0.
 
 </RoadmapItem>
 

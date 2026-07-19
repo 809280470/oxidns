@@ -7,10 +7,45 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 
 # 版本更新
 
+## 2026-07
+
+<div className="release-stack">
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-19" defaultOpen>
+       **版本定位**
+
+       - Minor Release。v1.5.0 以 RouterOS 策略同步和运行时运维能力为主线：新增 `ros_route` 静态策略路由插件，完整重构 `ros_address_list`，并为 matcher/provider 增加管理 API 与 WebUI 运行时控制。
+       - 同时新增可配置 `response` 执行器、时区感知的 `time` matcher，完善 query recorder 空间回收、DNS CNAME 响应裁决、WebUI 高级配置、OpenWrt/ARMv7/Docker 发布链路。
+
+       **主要变更**
+
+       - `feat(routeros)`：新增 `ros_route`，将 DNS A/AAAA 观察结果同步为指定 RouterOS routing table 的逐 IP 静态路由，支持 IPv4/IPv6 网关、distance、TTL lease、persistent IP/CIDR、可选 conntrack 延迟删除、启动恢复和受限关闭清理。
+       - `refactor(routeros)`：`ros_address_list` 与 `ros_route` 共用 TLS/API-SSL transport、有限并行批处理、按 key 合并的有界队列、租约、reconcile、重试和生命周期原语。RouterOS 不可达不再阻塞 DNS 启动；同步模式受 `wait_timeout` 限制且失败不改变 DNS 应答；删除前重新确认内部 ID、目标 key 与 ownership comment，避免误删外部条目。
+       - `feat(runtime_control)`：所有 matcher 支持运行时状态查询、启用和禁用；provider 支持串行化 reload，重复并发请求返回冲突。管理 API、日志和 WebUI 插件详情面板同步接入，并在不启用 API feature 的构建中保持能力关闭。
+       - `feat(response/matcher)`：新增 `response` 执行器，可按 zone record 模板生成 Answer/Authority/Additional、RCODE 与响应 flags，并支持 `{qname}`/`{qclass}` 占位符；`time` matcher 支持 IANA 时区、多个时间段、跨午夜窗口、weekday 和 monthday 组合。
+       - `refactor(query_recorder)`：统一协调同一 SQLite 数据库的读、写与维护操作；历史清理和定期 retention 按批删除、截断 WAL、迁移旧库到 incremental auto-vacuum 并实际回收磁盘空间，同时保持内存 tail 与数据库结果一致。
+       - `fix(dns/forward/cache)`：新增共享 query-aware 响应分类器；并发上游正确区分完整正响应、确定负响应和 incomplete alias，裸 CNAME 不再错误胜出、参与负共识或写入地址缓存；cache dump/load、lazy refresh、TTL 与过期年龄处理同步加固，并减少重复 CNAME 扫描。
+       - `feat(webui)`：配置表单增加可折叠高级字段并保留显式默认值、`false`、`0` 与空对象；YAML 编辑器由 Monaco 迁移到本地 CodeMirror，补齐校验、补全和数组/时间段序列化；仪表盘增强 DNS 流量、进程内存与指标不可用状态展示。
+       - `feat(release/operations)`：新增 ARMv7 release target；安装脚本可在 OpenWrt 自动安装 `luci-app-oxidns` 及中文包；Docker 运行时切换为 Alpine 构建阶段 + BusyBox musl 镜像；升级模块拆分发布发现、摘要校验、归档与二进制/WebUI 安装，并修正 full/slim target 选择。
+       - `fix(config/api/health)`：插件 tag 拒绝路径不安全字符和保留 quick-setup namespace，插件 API 路由统一 URL 编码；health endpoint 在插件初始化完成后再返回健康状态；新增 `response`/RouterOS 配置、feature 与 build-info 能力同步。
+       - `deps/ci/docs`：升级依赖与 GitHub Actions 配置，`oxidns-proto` 修复 nightly Clippy 兼容性；整理 server、plugin、infra、upgrade 与 provider/V2Ray 模块边界，并补齐双语 API、插件、OpenWrt、安装和运维文档。
+
+       **配置与升级说明**
+
+       - 根 crate 版本号升级为 `1.5.0`；`oxidns-proto` 升级为 `0.1.4`；release tag 应使用 `v1.5.0`。
+       - 大多数 v1.4.0 配置可以直接升级；新增能力均为可选。升级前仍应运行 `oxidns check`。不安全的插件 tag 与保留 quick-setup tag 现在会被拒绝，命中时必须重命名并同步所有引用。
+       - **RouterOS ownership 迁移**：`ros_address_list.comment_prefix` 默认值从 `fdns` 改为 `oxi`。若要继续识别、刷新或清理由旧版本创建的条目，请在原插件配置中显式设置 `comment_prefix: fdns`；改用 `oxi` 前请自行处理旧 namespace 条目。
+       - `ros_address_list` 新增可选 `tls`、`wait_timeout`、`queue_capacity`；原有 address-list、persistent 与 TTL 配置仍有效。`cleanup_on_shutdown` 仍默认为 `true`，应用 reload 会先关闭旧实例；要求策略连续性的部署应评估设为 `false`，并避免两个进程同时使用相同 tag、comment prefix 和目标列表。
+       - `ros_route` 是新插件，要求预先在 RouterOS 创建 routing table/rule 并配置至少一个网关。`fixed_ttl: 0` 会创建不会自然过期的动态路由，且动态租约没有数量上限；启用前必须评估 RouterOS 路由表与 OxiDNS 内存容量。自定义构建可分别使用 `plugin-ros-address-list` / `plugin-ros-route`，`plugin-mikrotik` 继续作为两者的聚合 feature。
+       - query recorder 旧数据库会在首次 retention cleanup 或手动清空历史时迁移到 incremental auto-vacuum；大库首次迁移/回收可能产生明显磁盘 I/O，建议避开业务高峰并预留空间。
+       - `forward.concurrent: 1` 仍不会隐式重试未启动上游；不完整 CNAME 响应在没有更好结果时仍可返回，但不会作为地址答案缓存。旧 cache dump 中的 CNAME-only 地址项会在加载或命中校验时丢弃。
+       - 容器镜像改为 musl/BusyBox 运行时并保留 CA 与时区数据；使用容器、OpenWrt 或 ARMv7 的部署，请先在测试环境验证启动参数、挂载路径、时区和升级/回滚流程。
+   </ReleaseCard>
+</div>
+
 ## 2026-06
 
 <div className="release-stack">
-   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24" defaultOpen>
+   <ReleaseCard version="v1.4.0" badge="Minor Release" date="2026-06-24">
        **版本定位**
 
        - Minor Release。v1.4.0 的核心是补齐复杂网络环境下的“出口控制、上游诊断和并发裁决”能力：新增 `network.outbound` 统一出口层，新增 `oxidns probe upstream` 上游诊断命令，增强 `forward` 多上游并发结果选择，并优化缓存、DoH 入站、WebUI 升级体验和查询记录读取性能。

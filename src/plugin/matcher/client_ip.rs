@@ -18,8 +18,8 @@ use crate::infra::error::Result as DnsResult;
 use crate::plugin::dependency::DependencySpec;
 use crate::plugin::matcher::Matcher;
 #[cfg(test)]
-use crate::plugin::matcher::matcher_utils::parse_ip_prefix_matcher;
-use crate::plugin::matcher::matcher_utils::{
+use crate::plugin::matcher::rules::parse_ip_prefix_matcher;
+use crate::plugin::matcher::rules::{
     ensure_ip_capable_providers, parse_ip_rules_and_set_tags, parse_quick_setup_rules,
     parse_rules_from_value, provider_dependency_specs, resolve_provider_tags,
     validate_non_empty_ip_rules_or_set_tags,

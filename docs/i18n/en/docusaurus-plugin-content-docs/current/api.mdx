@@ -9,7 +9,9 @@ OxiDNS exposes a standalone control plane for:
 
 * Process and startup health checks
 * Config checks and raw config text validation
-* Reload and shutdown control
+* Reload, restart, and shutdown control
+* Runtime log reads and SSE streaming
+* Optional release-upgrade control
 * Plugin extension APIs
 * Prometheus metrics export
 
@@ -200,9 +202,11 @@ Example shape:
   "plugins": {
     "total": 12,
     "servers": 4
-  }
+ }
 }
 ```
+
+`/api/health` returns `200` after plugin initialization completes, even when no server plugin is configured. In that state, the response `status` and `checks.server_startup` are `not_ready`, distinguishing management API availability from DNS service readiness.
 
 `build_bundle` is the primary build bundle of the running binary: `minimal`, `standard`, `full`, or `custom`. Use `GET /api/build` when you need the full feature and plugin capability snapshot.
 
@@ -302,6 +306,20 @@ Purpose:
 Response:
 
 * `202 Accepted`
+
+### `POST /api/restart`
+
+Purpose:
+
+* Gracefully shuts down the running instance and executes OxiDNS again with the original command-line arguments.
+* Unix replaces the current process image and keeps the PID; non-Unix platforms start a replacement process before exiting the current process.
+
+Responses:
+
+* `202 Accepted`
+  * The restart request was accepted.
+* `500 Internal Server Error`
+  * The application control channel is closed and cannot accept the restart request.
 
 ### `POST /api/reload`
 
@@ -418,6 +436,77 @@ Good fit:
 
 * Validate a config in the control plane before writing it to disk.
 
+## Runtime Log Endpoints
+
+Log routes are registered only when the process log buffer is available.
+
+### `GET /api/logs`
+
+Reads recent entries from the in-memory ring buffer.
+
+Query parameters:
+
+* `limit`
+  * Number of entries to return. Defaults to `200`; range `1..=1000`.
+* `level`
+  * Optional minimum level: `trace`, `debug`, `info`, `warn`, or `error`.
+
+The response contains `ok`, the returned count in `total`, and an `entries` array. This endpoint reads the in-memory tail and does not replace persisted log files.
+
+### `GET /api/logs/stream`
+
+Streams new log entries over SSE.
+
+Query parameters:
+
+* `tail`
+  * Number of recent entries replayed when the connection opens. Defaults to `0`; maximum `500`.
+* `level`
+  * Optional minimum log level.
+
+Each log uses `event: log` with a JSON `data` payload. The connection sends a heartbeat every 15 seconds. Clients should send `Accept: text/event-stream`, reconnect after disconnects, and tolerate gaps when a consumer falls behind.
+
+## Upgrade Endpoints
+
+These routes exist only when the binary is compiled with `plugin-upgrade`. The official `standard` and `full` bundles include that feature.
+
+`POST /api/upgrade/check` and `POST /api/upgrade/apply` accept an optional JSON body:
+
+```json
+{
+  "repository": "svenshi/oxidns",
+  "bundle": "auto",
+  "outbound": "remote",
+  "socks5": null,
+  "allow_prerelease": false,
+  "target": "latest",
+  "github_token": null
+}
+```
+
+Every field is optional. `github_token` is sensitive and must not be copied into logs, screenshots, or long-lived request records.
+
+### `POST /api/upgrade/check`
+
+Checks the target release and returns the current version, latest version, update availability, selected asset name, and release URL. It does not download or replace files.
+
+### `POST /api/upgrade/apply`
+
+Starts an asynchronous download, digest verification, backup, binary/WebUI replacement, and application restart when required.
+
+Responses:
+
+* `202 Accepted`
+  * The upgrade task started; poll `/api/upgrade/status` for progress.
+* `409 Conflict`
+  * Another upgrade task is already running.
+
+### `GET /api/upgrade/status`
+
+Returns the latest API-triggered upgrade state. `state` is one of `idle`, `running`, `restarting`, `completed`, `skipped`, or `failed`, together with start/completion timestamps, any error, the installed version, and restart requirement.
+
+An upgrade replaces runtime files and may restart the service. Before remote use, verify authentication, backups, working directory, WebUI path, and rollback procedure. Do not expose this endpoint to untrusted networks.
+
 ## Plugin Extension APIs
 
 ### Unified Format
@@ -448,6 +537,32 @@ Query parameters:
 
 Clears the cache.
 
+### matcher
+
+Every matcher declared in `plugins:` with a stable tag registers these runtime-control endpoints:
+
+```text
+GET  /api/plugins/<matcher_tag>/status
+POST /api/plugins/<matcher_tag>/enable
+POST /api/plugins/<matcher_tag>/disable
+```
+
+All three endpoints return the same status shape:
+
+```json
+{
+  "ok": true,
+  "matcher": "match_cn",
+  "enabled": true
+}
+```
+
+`enable` and `disable` are idempotent and require no request body. A disabled matcher skips its internal predicate and produces a base result of `false`; existing negation still applies, so `!$match_cn` evaluates to `true` while that matcher is disabled.
+
+The switch belongs only to the current runtime and is not written to YAML. An application reload or process restart restores the matcher to enabled. Quick-setup matchers inside `sequence` or `any_match` use internal `qs.match...` tags and do not register these endpoints. Extract a quick-setup expression into a standalone matcher under `plugins:` and reference it with `$tag` when runtime control is required.
+
+The WebUI presents disabling as a temporary bypass and explains the different effects on positive and negated references before applying it. Restoring matching does not require editing or reapplying YAML.
+
 ### provider
 
 #### `POST /api/plugins/<provider_tag>/reload`
@@ -462,7 +577,11 @@ Responses:
 * `200 OK`
   * The provider reload succeeded.
 * `400 Bad Request`
-  * The provider does not exist, is not a live provider, or returned an error while reloading.
+  * The provider returned an error while reloading.
+* `404 Not Found`
+  * The tag is not a loaded provider in the current runtime, so no route was registered for it.
+* `409 Conflict`
+  * A reload is already running for the same provider. The new request returns `provider_reload_busy` immediately instead of waiting in a queue.
 
 Good fit:
 
@@ -474,6 +593,8 @@ Good fit:
 * When the change also updates `config.yaml`, provider topology, the plugin list, or other non-provider structures, `POST /api/reload` is still required.
 
 </Admonition>
+
+The WebUI exposes **Reload data** on every applied provider card and detail view. It does not show a configuration-change confirmation; while the command is running, duplicate requests for the same provider are disabled and the success, failure, or busy result is surfaced inline.
 
 #### `GET /api/plugins/<cache_tag>/dump`
 
@@ -727,6 +848,7 @@ Current exported metrics include:
 * `forward_timeout_total`
 * `forward_latency_count`
 * `forward_latency_sum_ms`
+* `forward_incomplete_alias_selected_total`
 * `forward_upstream_query_total`
 * `forward_upstream_success_total`
 * `forward_upstream_error_total`
@@ -741,6 +863,19 @@ Current exported metrics include:
 * `hosts_miss_total`
 * `ratelimit_allowed_total`
 * `ratelimit_rejected_total`
+* `ip_selector_probe_total`
+* `ip_selector_probe_latency_count`
+* `ip_selector_probe_latency_sum_ms`
+* `ip_selector_selected_total`
+* `ip_selector_dropped_probe_total`
+* `ip_selector_cache_entries`
+* `network_resolver_cache_hit_total`
+* `network_resolver_cache_miss_total`
+* `network_resolver_error_total`
+* `network_resolver_refresh_total`
+* `network_resolver_refresh_latency_ms_total`
+* `network_upstream_pool_refresh_total`
+* `network_upstream_pool_refresh_latency_ms_total`
 * `server_request_total`
 * `server_completed_total`
 * `server_controlled_total`
@@ -760,6 +895,22 @@ Current exported metrics include:
 * `ros_address_list_dropped_total`
 * `ros_address_list_sync_error_total`
 * `ros_address_list_sync_timeout_total`
+* `ros_address_list_pending_observations` / `ros_address_list_managed_entries`
+* `ros_address_list_write_success_total` / `ros_address_list_write_error_total`
+* `ros_address_list_last_write_success_timestamp_seconds`
+* `ros_address_list_coalesced_total`
+* `ros_address_list_reconnect_total` / `ros_address_list_connect_attempt_total` / `ros_address_list_backoff_total`
+* `ros_address_list_reconcile_error_total` / `ros_address_list_last_reconcile_success_timestamp_seconds`
+* `ros_address_list_degraded` / `ros_address_list_cleanup_error_total`
+* `ros_route_observe_total` / `ros_route_dropped_total`
+* `ros_route_sync_error_total` / `ros_route_sync_timeout_total`
+* `ros_route_write_success_total` / `ros_route_write_error_total`
+* `ros_route_pending_observations` / `ros_route_managed_entries`
+* `ros_route_coalesced_total` / `ros_route_delete_deferred_total`
+* `ros_route_reconnect_total` / `ros_route_connect_attempt_total` / `ros_route_backoff_total`
+* `ros_route_connection_check_error_total` / `ros_route_reconcile_error_total`
+* `ros_route_last_write_success_timestamp_seconds` / `ros_route_last_reconcile_success_timestamp_seconds`
+* `ros_route_degraded` / `ros_route_cleanup_error_total`
 * `reverse_lookup_ptr_hit_total`
 * `reverse_lookup_ptr_miss_total`
 * `reverse_lookup_cache_insert_total`

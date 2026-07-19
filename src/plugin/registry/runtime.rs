@@ -70,27 +70,32 @@ impl PluginRuntimeManager {
             None
         };
         let _guard = self.lifecycle.lock().await;
-        let previous_outbound = outbound::global();
-        outbound::install_global(&config.network.outbound)?;
 
         let mut candidate = PluginRegistry::new();
         #[cfg(debug_assertions)]
         candidate.set_test_runtime_guard(test_guard);
         candidate.load_catalog(try_global_catalog()?);
         let candidate = Arc::new(candidate);
-        if let Err(err) = candidate.clone().init_plugins(config.plugins).await {
-            candidate.destroy().await;
-            outbound::restore_global(previous_outbound);
-            return Err(err);
-        }
 
-        // Poison-tolerant swap: the install must always succeed once the
-        // candidate is built, otherwise a failed swap would masquerade as a
-        // successful reload while readers keep seeing the old/empty runtime.
-        let previous = write_rwlock(&self.current).replace(candidate.clone());
+        let previous = write_rwlock(&self.current).take();
         if let Some(previous) = previous {
             previous.destroy().await;
         }
+        outbound::clear_global();
+        outbound::install_global(&config.network.outbound)?;
+
+        let matcher_runtime_controls_enabled = cfg!(feature = "api") && config.api.http.is_some();
+        if let Err(err) = candidate
+            .clone()
+            .init_plugins_with_runtime_controls(config.plugins, matcher_runtime_controls_enabled)
+            .await
+        {
+            candidate.destroy().await;
+            outbound::clear_global();
+            return Err(err);
+        }
+
+        write_rwlock(&self.current).replace(candidate.clone());
         Ok(candidate)
     }
 
@@ -161,10 +166,11 @@ impl PluginRuntimeManager {
     #[cfg(test)]
     async fn set_current_runtime_for_test(&self, runtime: Arc<PluginRuntime>) {
         let _guard = self.lifecycle.lock().await;
-        let previous = write_rwlock(&self.current).replace(runtime);
+        let previous = write_rwlock(&self.current).take();
         if let Some(previous) = previous {
             previous.destroy().await;
         }
+        write_rwlock(&self.current).replace(runtime);
     }
 }
 

@@ -144,6 +144,22 @@ export const enUSDocs = {
     short_circuit:
       "- Type: `bool`; required: no; default value: `false`\n- Function: After hitting and generating a local response, whether to stop the subsequent executor chain immediately.\n- Note: By default, only response is set and execution continues; when explicitly enabled, `Stop` is returned.",
   },
+  response: {
+    rcode:
+      "- Type: `string` or `number`; Required: No; Default: `NOERROR`\n- Function: Set a base DNS RCODE; only `0..15` is supported.",
+    answers:
+      "- Type: `array`; Required: No; Default: empty array\n- Every item must be one zone-style RR: `<owner> <ttl> <class> <type> <rdata>`.",
+    authorities:
+      "- Type: `array`; Required: No; Default: empty array\n- Every item must be one zone-style RR. Put SOA here for NODATA negative caching.",
+    additionals:
+      "- Type: `array`; Required: No; Default: empty array\n- Every item must be one zone-style RR.",
+    authoritative:
+      "- Type: `bool`; Required: No; Default: `false`\n- Function: Set the AA flag.",
+    authentic_data:
+      "- Type: `bool`; Required: No; Default: `false`\n- Function: Set the AD flag.",
+    short_circuit:
+      "- Type: `bool`; Required: No; Default: `true`\n- Function: Stop the current executor chain after setting the response.",
+  },
   redirect: {
     rules:
       "- Type: `array`; Required: No; Default: empty array\n- Function: Define inline redirection rules.\n- Rule format:\n  - `<domain name rule> <target domain name>`\n- `<Domain Name Rules>` supports:\n  - `full:`\n  - `domain:`\n  - `keyword:`\n  - `regexp:`\n  - Unprefixed domain name (processed by `full:` exact match)\n- Instructions for use: `redirect` itself does not resolve the target domain name. It usually needs to be used before `forward` in `sequence`, and `forward` generates the real response of the target domain name.",
@@ -356,6 +372,30 @@ export const enUSDocs = {
     mask6:
       "- Type: `integer`; Required: No; Default: Implementation determined\n- Function: Define the IPv4/IPv6 prefix length separately under compatible writing methods.",
   },
+  ros_route: {
+    address: "- Type: `string`; Required: yes\n- RouterOS API endpoint, usually `host:port`.",
+    username: "- Type: `string`; Required: yes\n- RouterOS API login username.",
+    password: "- Type: `string`; Required: yes\n- RouterOS API login password.",
+    connect_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API connection timeout in seconds; must be greater than `0`.",
+    send_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API command-send timeout in seconds; must be greater than `0`.",
+    receive_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API per-response-chunk timeout in seconds; must be greater than `0`.",
+    async: "- Type: `bool`; Default: `true`\n- `true` queues background synchronization; `false` waits for one attempt for the current observation without changing the DNS response.",
+    wait_timeout: "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout.",
+    queue_capacity: "- Type: `usize`; Default: `16384`\n- Independently limits distinct route keys in ingress and retry stages.",
+    routing_table: "- Type: `string`; Required: yes\n- Target policy-routing table; the plugin does not create tables or routing rules.",
+    gateway4: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv4 route next hop.",
+    gateway6: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
+    distance: "- Type: `u8`; Default: `100`\n- RouterOS static-route distance.",
+    comment_prefix: "- Type: `string`; Default: `oxi`\n- Route-comment ownership prefix; it and the plugin tag cannot contain `;` or `=`.",
+    "persistent.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes. Persistent routes are desired state recovered at startup and reconciled every 180 seconds.",
+    "persistent.files": "- Type: `array<string>`\n- Read only during plugin initialization or reload; periodic reconcile uses the in-memory set and never rereads files.",
+    min_ttl: "- Type: `u32`; Default: `60`\n- Minimum clamp for dynamic DNS-route TTLs.",
+    max_ttl: "- Type: `u32`; Default: `3600`\n- Maximum clamp for dynamic DNS-route TTLs.",
+    fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry. Missing IPs in later answers are not withdrawn. Dynamic routes refresh only after a later DNS observation reaches the threshold and are excluded from periodic reconcile.",
+    conntrack_guard:
+      "- Type: `bool`; Default: `false`\n- Checks exact destination IPs before deleting expired dynamic `/32` and `/128` routes. Active connections or query failures defer deletion for 30 seconds. Persistent and shutdown cleanup bypass the guard.",
+    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin during normal shutdown and application-level reload, with a 30-second total cleanup budget. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance. Set it to `false` when policy continuity is required.",
+  },
   ros_address_list: {
     address:
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the RouterOS API service address, usually written as `host:port`. This address will be used to establish a management connection after the plug-in is started and maintain synchronization with the device during operation.\n- Configuration recommendations: When using the RouterOS API plaintext port, it is usually `8728`. If an encrypted API is deployed, the actual port should be filled in.",
@@ -371,26 +411,30 @@ export const enUSDocs = {
       "- Type: `u64`; Required: No; Default: `5`\n- Function: Specify the maximum wait time, in seconds, for the next chunk of RouterOS API response data.\n- Configuration recommendation: Prefer a dedicated, size-controlled `address-list` for OxiDNS. Avoid connecting the plugin to an existing large shared list. Increase this value, for example to `30` or `60`, only when slow legacy list queries or a slow RouterOS management plane cannot be avoided.",
     async:
       "- Type: `bool`; required: no; default value: `true`\n- Function: Control whether the address writing behavior is asynchronous. When enabled, the DNS response path is only responsible for delivery tasks, and the background manager completes the interaction with RouterOS.\n- Impact: Asynchronous mode helps reduce the risk of request path blocking; after closing, it will be changed to synchronous submission, which is more suitable for scenarios that require immediate confirmation of submission results.",
+    wait_timeout:
+      "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout without changing DNS output.",
+    queue_capacity:
+      "- Type: `usize`; Default: `16384`\n- Independently limits distinct IPs in ingress and retry stages.",
     address_list4:
       "- Type: `string`; Required: No; Default: None\n- Function: Specify the target `address-list` name for writing IPv4 addresses. After the plugin extracts the A records from the DNS answer, it writes to this list.\n- Configuration recommendation: If the policy only handles IPv4, at least this item should be configured.",
     address_list6:
       "- Type: `string`; Required: No; Default: None\n- Function: Specify the target `address-list` name for IPv6 address writing. The plug-in writes to this list after extracting the AAAA records from the DNS response.\n- Configuration recommendation: If the policy needs to cover IPv6, this item should be configured at the same time, and corresponding matching and routing rules should be established on the RouterOS side.",
     comment_prefix:
-      "- Type: `string`; Required: No; Default: `fdns`\n- Function: Specifies the comment prefix used by the plug-in when writing RouterOS entries. This prefix is ​​used to distinguish dynamic entries and resident entries created by OxiDNS to facilitate subsequent refresh, reload and cleanup.\n- Note: This value and the plugin `tag` should not contain `;` or `=` to avoid affecting the internal tag format.",
+      "- Type: `string`; Required: No; Default: `oxi`\n- Function: Specifies the comment prefix used by the plug-in when writing RouterOS entries. This prefix is ​​used to distinguish dynamic entries and resident entries created by OxiDNS to facilitate subsequent refresh, reload and cleanup.\n- Note: This value and the plugin `tag` should not contain `;` or `=` to avoid affecting the internal tag format.",
     persistent:
-      "- Type: `object`; Required: No; Default: None\n- Function: Define a static address set that needs to be retained for a long time. This part does not rely on DNS response triggering, can be directly synchronized to RouterOS after the plug-in is started, and is maintained by background reconcile to maintain consistency.\n- Subfield:\n  - `ips`\n  - `files`",
+      "- Type: `object`; Required: no; Default: none\n- Defines desired state retained independently from DNS observations. It is recovered at startup and, when non-empty, reconciled every 180 seconds; dynamic entries are excluded.\n- Fields:\n  - `ips`\n  - `files`",
     "persistent.ips":
       "- Type: `array<string>`; required: no; default value: empty\n- Function: Declare the resident IP or CIDR network segment inline. Suitable for fixed strategy objects that are small in number and change infrequently.\n- Supported formats: single IPv4, single IPv6, IPv4 CIDR, IPv6 CIDR.",
     "persistent.files":
-      "- Type: `array<string>`; required: no; default value: empty\n- Function: Load the resident address set from an external file. Suitable for address lists that need to be generated by other systems, maintained centrally, or managed in batches.\n- Behavioral note: These files are only read once when the plugin is initialized. If the file changes need to take effect, you need to reload the plug-in or application.",
+      "- Type: `array<string>`; Required: no; Default: empty\n- Loads persistent addresses from external files. Files are read only during plugin initialization or reload; periodic reconcile uses the in-memory set and never rereads them.",
     min_ttl:
       "- Type: `u64`; Required: No; Default: `60`\n- Function: Define the minimum TTL allowed for dynamic address items. When the TTL in a DNS response is too small or zero, the plugin will increase it to that value before writing to RouterOS.\n- Applicable scenarios: Used to avoid management plane jitter caused by high-frequency refresh.",
     max_ttl:
       "- Type: `u64`; Required: No; Default: `3600`\n- Function: Define the maximum TTL allowed for dynamic address items. When the TTL in a DNS response is too large, the plugin truncates to that limit.\n- Applicable scenarios: Used to limit the residence time of policy items in network devices and reduce the risk of address staleness.",
     fixed_ttl:
-      "- Type: `u64`; Required: No; Default: None\n- Function: Specify a fixed TTL for all dynamically written items. After configuring this item, the plug-in will no longer use the original TTL in the DNS record, and will no longer be affected by the interval clipping of `min_ttl` and `max_ttl`. If set to `0`, dynamic items will not set RouterOS `timeout`.\n- Applicable scenarios: Suitable for scenarios that require a unified refresh cycle, easy operation and maintenance estimation, and policy convergence.",
+      "- Type: `u64`; Required: no; Default: none\n- Sets one TTL for all dynamic writes, bypassing DNS TTL and the `min_ttl`/`max_ttl` clamp. `0` omits RouterOS `timeout`. Dynamic entries refresh only when a later DNS observation reaches the threshold; there is no independent refresh timer.",
     cleanup_on_shutdown:
-      "- Type: `bool`; required: no; default value: `true`\n- Function: Control whether to clean up the entries managed by the plug-in when it exits. When enabled, the plug-in will delete the RouterOS address entries written by itself during the normal shutdown phase and can identify the owned RouterOS address entries.\n- Impact: After turning off this option, written entries will continue to be retained in RouterOS, which is suitable for scenarios that require policy status to be retained across process restarts.",
+      "- Type: `bool`; Required: No; Default: `true`\n- Function: Controls whether entries managed by the plugin are removed during normal shutdown and application-level reload. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance.\n- Impact: When disabled, existing entries remain in RouterOS, which is suitable when policy state must survive process restarts or reloads.",
   },
   upgrade: {
     force:
@@ -505,6 +549,20 @@ export const enUSDocs = {
   },
   random: {
     args: "`args` of `random` only accepts a probability value.\n\n- Type: `array`; Required: Yes; Default: None\n- Value range: `0.0` to `1.0`\n- Function: Define the probability of returning `true` for this match.\n- Operational impact:\n  - `0.0` means always miss.\n  - `1.0` means always hit.",
+  },
+  time: {
+    timezone:
+      "- Type: `string`; Required: No; Default: system timezone\n- Function: Set the IANA timezone used for matching, such as `Asia/Shanghai` or `UTC`.\n- Operational impact: When omitted, the system timezone is resolved; initialization fails if it is unavailable so a policy never silently uses the wrong timezone.",
+    periods:
+      "- Type: `array`; Required: Yes; Count: `1..=64`\n- Function: Define recurring matching windows; any matching window returns `true`.\n- Operational impact: Time, weekday, and day-of-month conditions in one window must all match.",
+    "periods[].start":
+      "- Type: `string`; Required: set together with `end` or omit both\n- Format: `HH:MM`, from `00:00` to `23:59`.\n- Notes: Equal start and end times are invalid; a start later than end crosses midnight.",
+    "periods[].end":
+      "- Type: `string`; Required: set together with `start` or omit both\n- Format: `HH:MM`. The interval uses `[start, end)`, so the exact end time does not match.",
+    "periods[].weekdays":
+      "- Type: `array[string]`; Required: No\n- Values: case-insensitive `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, or `sun`.\n- Operational impact: Omit to allow every weekday.",
+    "periods[].monthdays":
+      "- Type: `array[integer]`; Required: No\n- Values: `1..=31`.\n- Operational impact: Omit to allow every day; a day absent from a month does not match.",
   },
   rate_limiter: {
     qps: "- Type: `number`; Required: No; Default: `20`\n- Function: Define the token replenishment rate per second.\n- Operational impact:\n  - The larger the value, the more requests allowed to pass per unit time.",

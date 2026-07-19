@@ -22,6 +22,8 @@ use crate::core::context::DnsContext;
 use crate::infra::error::{DnsError, Result};
 use crate::plugin::Plugin;
 
+mod control;
+
 pub mod any_match;
 pub mod client_ip;
 pub mod cname;
@@ -30,7 +32,6 @@ pub mod false_matcher;
 pub mod has_resp;
 pub mod has_wanted_ans;
 pub mod mark;
-pub mod matcher_utils;
 pub mod ptr_ip;
 pub mod qclass;
 pub mod qname;
@@ -40,8 +41,13 @@ pub mod random;
 pub mod rate_limiter;
 pub mod rcode;
 pub mod resp_ip;
+pub(crate) mod rules;
 pub mod string_exp;
+pub mod time;
 pub mod true_matcher;
+
+#[cfg(feature = "api")]
+pub(crate) use control::{MatcherRuntimeControl, attach_runtime_control};
 
 #[allow(dead_code)]
 pub trait Matcher: Plugin {

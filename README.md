@@ -76,12 +76,12 @@ OxiDNS 不试图替你隐藏复杂性。
 | --- | --- |
 | 协议 | UDP、TCP、DoT、DoQ、DoH |
 | 策略模型 | `sequence`、`matcher`、`executor`、`provider` |
-| 执行器 | `forward`、`cache`、`fallback`、`hosts`、`arbitrary`、`redirect`、`ecs_handler`、`ttl`、`black_hole`、`ip_selector`、`download`、`upgrade`、`reload`、`reload_provider`、`script`、`http_request`、`learn_domain`、`query_summary`、`query_recorder`、`metrics_collector` |
-| 匹配器 | `qname`、`question`、`qtype`、`qclass`、`client_ip`、`resp_ip`、`rcode`、`rate_limiter` 等 |
+| 执行器 | `forward`、`cache`、`fallback`、`hosts`、`arbitrary`、`response`、`redirect`、`ecs_handler`、`ttl`、`black_hole`、`ip_selector`、`download`、`upgrade`、`reload`、`reload_provider`、`script`、`http_request`、`learn_domain`、`query_summary`、`query_recorder`、`metrics_collector` |
+| 匹配器 | `qname`、`question`、`qtype`、`qclass`、`client_ip`、`resp_ip`、`rcode`、`time`、`rate_limiter` 等 |
 | 数据集 | `domain_set`、`dynamic_domain_set`、`ip_set`、`geoip`、`geosite`、`adguard_rule` |
 | 出站网络 | `network.outbound` 统一配置 HTTP 下载、升级检查、webhook 与 upstream 使用的 nameservers 与 SOCKS5 |
-| 系统联动 | `ipset`、`nftset`、`ros_address_list`、`reverse_lookup` |
-| 调试与运维 | 健康检查、配置校验、热重载、查询记录、Prometheus 插件指标、实时日志 |
+| 系统联动 | `ipset`、`nftset`、`ros_address_list`、`ros_route`、`reverse_lookup` |
+| 调试与运维 | 健康检查、配置校验、热重载、matcher 临时旁路、provider 定向重载、查询记录、Prometheus 插件指标、实时日志 |
 | 部署能力 | 多平台构建、Debian 包、OpenWrt LuCI 插件、独立 WebUI 托管、服务化安装 |
 
 ---
@@ -96,7 +96,7 @@ OxiDNS 适合部署在需要长期运行、可调试、可扩展的 DNS 环境�
 - 多上游并发查询、主备回退、协议混合接入
 - 可配置并发上游结果选择策略，在速度与负向答案可靠性之间取舍
 - 基于域名、客户端、响应结果的精细化策略路由
-- DNS 结果驱动的 `ipset` / `nftset` / MikroTik 地址列表同步
+- DNS 结果驱动的 `ipset` / `nftset` / MikroTik 地址列表与策略路由同步
 - 广告过滤、域名分流、本地覆盖、双栈偏好和 ECS 控制
 - 自建可控、可调试的 DNS 基础设施
 - 需要通过同一管理端口托管独立 WebUI 的轻量部署
@@ -193,7 +193,8 @@ irm https://oxidns.org/uninstall.ps1 | iex
 | OpenWrt / LuCI | OxiDNS 安装脚本，或 [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns) 的 `.ipk` / `.apk` 包 |
 | Alpine Linux x86_64 | `oxidns-x86_64-unknown-linux-musl.tar.gz` |
 | Alpine Linux ARM64 | `oxidns-aarch64-unknown-linux-musl.tar.gz` |
-| 32 位 ARM Linux，如部分树莓派 | `oxidns-arm-unknown-linux-musleabihf.tar.gz` |
+| Linux ARMv7 / armv7l | `oxidns-armv7-unknown-linux-musleabihf.tar.gz` |
+| 通用 32 位 ARM Linux | `oxidns-arm-unknown-linux-musleabihf.tar.gz` |
 | macOS Intel | `oxidns-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `oxidns-aarch64-apple-darwin.tar.gz` |
 | Windows x64 | `oxidns-x86_64-pc-windows-msvc.zip` |
@@ -240,7 +241,6 @@ cargo build --release --no-default-features --features standard        # 家用 
 - [OpenWrt LuCI 插件](https://oxidns.org/openwrt)
 - [插件总览](https://oxidns.org/plugin-reference/overview)
 - [管理 API](https://oxidns.org/api)
-- [MikroTik 策略路由](https://oxidns.org/mikrotik-policy-routing)
 - [常见场景](https://oxidns.org/scenarios)
 - [架构与设计](https://oxidns.org/architecture-and-design)
 - [性能与基准](https://oxidns.org/benchmarks)

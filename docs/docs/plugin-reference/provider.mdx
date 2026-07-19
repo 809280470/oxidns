@@ -9,7 +9,7 @@ provider 负责把规则集从“单条规则”提升为“可复用的数据�
 
 支持的数据 provider 既可以被 matcher 直接通过 `"$tag"` 引用，也可以继续被 `domain_set` / `ip_set` 组合，只要它们具备对应的域名或 IP 匹配能力。`domain_set` / `ip_set` 会只编译自己的本地规则，并在运行时继续查询被引用的 provider，不再复制下游 provider 的规则副本。
 
-运行中的 provider 都会注册一个管理接口 `POST /plugins/<provider_tag>/reload`，并可通过 `reload_provider` executor 使用启动时同一份配置刷新自身快照，而不会重建其它插件。
+运行中的 provider 都会注册一个管理接口 `POST /api/plugins/<provider_tag>/reload`，并可通过 `reload_provider` executor 使用启动时同一份配置刷新自身快照，而不会重建其它插件。WebUI 会在 provider 卡片和详情页提供同一能力的“重新加载数据”入口，并区分执行中、成功、失败和 busy 状态。
 
 运行时只会初始化真正被消费到的 provider。如果某个 provider 没有被任何 `server`、`executor`、`matcher` 直接或间接引用，它会在启动阶段被跳过，不会出现在 runtime registry 中，并会输出一条 warning 日志提示该 provider 未被使用。
 
@@ -247,6 +247,65 @@ provider 负责把规则集从“单条规则”提升为“可复用的数据�
   - 未设置或空数组时，加载整个 dat 文件的全部规则并集。
   - 例如 `category-games@cn` 表示只提取 `category-games` 中带 `cn` attribute 的规则。
 
+### 组合示例
+
+按 code 划分域名策略，并直接供不同 matcher 使用：
+
+```yaml
+plugins:
+  - tag: geosite_cn
+    type: geosite
+    args:
+      file: "/etc/oxidns/geosite.dat"
+      selectors: ["cn"]
+
+  # `geolocation-!cn` 是 geosite.dat 中的一个 code，不是通用的排除语法。
+  - tag: geosite_non_cn
+    type: geosite
+    args:
+      file: "/etc/oxidns/geosite.dat"
+      selectors: ["geolocation-!cn"]
+
+  - tag: match_cn_domain
+    type: qname
+    args: ["$geosite_cn"]
+
+  - tag: match_non_cn_question
+    type: question
+    args: ["$geosite_non_cn"]
+```
+
+按 attribute 过滤某个 code；实际可用的 code 和 attribute 取决于所使用的 dat 版本：
+
+```yaml
+- tag: geosite_games_cn
+  type: geosite
+  args:
+    file: "/etc/oxidns/geosite.dat"
+    selectors:
+      - "category-games@cn"
+
+- tag: match_games_cn
+  type: qname
+  args: ["$geosite_games_cn"]
+```
+
+把 geosite 与本地规则合并为一个可复用入口：
+
+```yaml
+- tag: domestic_domains
+  type: domain_set
+  args:
+    exps:
+      - "full:internal.example"
+    sets:
+      - "geosite_cn"
+
+- tag: match_domestic_domain
+  type: qname
+  args: ["$domestic_domains"]
+```
+
 ### 行为说明
 
 - `Plain` 会映射为 `keyword:` 规则。
@@ -256,6 +315,14 @@ provider 负责把规则集从“单条规则”提升为“可复用的数据�
 - 可被 `qname`、`cname`、`question` 直接引用，也可被 `domain_set.sets` 继续聚合。
 - 可通过 `reload_provider` 或 `POST /plugins/<tag>/reload` 独立刷新 dat 文件内容。
 - 如需在运行前把部分 selector 预导出成文本规则文件，可使用 `oxidns export-dat --kind geosite`。
+
+<Admonition type="note" title="Selector 注意事项">
+
+- selector 只做 code 的精确匹配；`geolocation-!cn` 中的 `!` 属于 code 文本，不表示“排除 cn”。
+- `code@attribute` 仅保留带有该 attribute 的规则；若同一 provider 同时写入 `code` 和 `code@attribute`，无 attribute 的 `code` 会加载该 code 的全部规则。
+- 指定的 selector 未命中 entry 或未产生规则时，启动或 provider reload 会失败。可先用 `oxidns export-dat --kind geosite --selector <selector>` 验证数据文件中是否存在它。
+
+</Admonition>
 
 ---
 
@@ -444,9 +511,55 @@ provider 负责把规则集从“单条规则”提升为“可复用的数据�
   - 多个 selector 取并集。
   - 未设置或空数组时，加载整个 dat 文件的全部 CIDR 并集。
 
+### 组合示例
+
+直接匹配客户端来源地址，或匹配 DNS 响应中的地址：
+
+```yaml
+plugins:
+  - tag: geoip_cn
+    type: geoip
+    args:
+      file: "/etc/oxidns/geoip.dat"
+      selectors: ["cn"]
+
+  - tag: match_client_cn
+    type: client_ip
+    args: ["$geoip_cn"]
+
+  - tag: match_answer_cn
+    type: resp_ip
+    args: ["$geoip_cn"]
+```
+
+把 GeoIP 与本地 CIDR 合并，供多个 matcher 复用：
+
+```yaml
+- tag: cn_or_private_network
+  type: ip_set
+  args:
+    ips:
+      - "10.0.0.0/8"
+      - "fd00::/8"
+    sets:
+      - "geoip_cn"
+
+- tag: match_cn_or_private_client
+  type: client_ip
+  args: ["$cn_or_private_network"]
+```
+
 ### 行为说明
 
 - 仅提供 IP 命中能力，可被 `client_ip`、`resp_ip`、`ptr_ip` 直接引用。
 - 也可被 `ip_set.sets` 组合，并在上层 provider 运行时继续参与匹配。
 - 可通过 `reload_provider` 或 `POST /plugins/<tag>/reload` 独立刷新 dat 文件内容。
 - 如需在运行前把部分 selector 预导出成文本规则文件，可使用 `oxidns export-dat --kind geoip`。
+
+<Admonition type="note" title="Selector 注意事项">
+
+- GeoIP selector 只支持 code，不支持 `@attribute`、通配符或排除表达式。
+- 指定 selector 未命中 entry 时，启动或 provider reload 会失败；可以先用 `oxidns export-dat --kind geoip --selector <selector>` 校验。
+- 省略 `selectors` 会载入整份 dat 文件，通常规则量很大；生产配置应优先选择实际需要的 code。
+
+</Admonition>

@@ -579,7 +579,7 @@ impl<'a> ChainBuilder<'a> {
             }
             PluginRef::QuickSetup { plugin_type, param } => {
                 let quick_tag = format!(
-                    "@qs:exec:{}:{}:{}",
+                    "qs.exec.{}.{}.{}",
                     self.sequence_tag, node_index, plugin_type
                 );
                 let holder = self
@@ -613,7 +613,7 @@ impl<'a> ChainBuilder<'a> {
             PluginRef::QuickSetup { plugin_type, param } => {
                 // Generate deterministic synthetic runtime tag for quick-setup matcher.
                 let quick_tag = format!(
-                    "@qs:match:{}:{}:{}:{}",
+                    "qs.match.{}.{}.{}.{}",
                     self.sequence_tag, node_index, match_index, plugin_type
                 );
                 let holder = self

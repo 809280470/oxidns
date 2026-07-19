@@ -85,7 +85,8 @@ See [Executor Plugins](executor.mdx) for full field reference. Grouped as: polic
 | [`script`](executor.mdx#script) | Runs an external command and injects a stable subset of `DnsContext` as arguments or environment variables. |
 | [`ipset`](executor.mdx#ipset) | Writes response IPs into Linux `ipset` via the embedded netlink backend (no `ipset` binary required). |
 | [`nftset`](executor.mdx#nftset) | Writes response IPs into nftables sets via the embedded netlink backend (no `nft` binary required). |
-| [`ros_address_list`](executor.mdx#ros_address_list) | Syncs response IPs to MikroTik RouterOS `address-list` with dynamic, persistent, and shutdown cleanup support. |
+| [`ros_address_list`](executor.mdx#ros_address_list) | Projects response IPs into a RouterOS `address-list` consumed by firewall, mangle, or policy-routing rules. |
+| [`ros_route`](executor.mdx#ros_route) | Projects response IPs as per-IP static routes in a RouterOS routing table with the configured gateway and distance. |
 
 ### Maintenance and scheduling
 
@@ -128,6 +129,7 @@ See [Matcher Plugins](matcher.mdx) for full field reference.
 | --- | --- |
 | [`mark`](matcher.mdx#mark) | Matches marks already written into the DNS context. |
 | [`env`](matcher.mdx#env) | Matches process environment variables. |
+| [`time`](matcher.mdx#time) | Matches by timezone, time window, weekday, and day of month. |
 | [`random`](matcher.mdx#random) | Matches probabilistically for rollout or sampling. |
 | [`rate_limiter`](matcher.mdx#rate_limiter) | Token-bucket rate limiting by client IP. |
 | [`string_exp`](matcher.mdx#string_exp) | General-purpose string expression matcher for cases where dedicated matchers are too rigid. |

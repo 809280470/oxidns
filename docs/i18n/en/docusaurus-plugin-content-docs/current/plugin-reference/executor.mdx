@@ -198,6 +198,7 @@ Sends DNS queries to upstreams.
 - Type: `integer`; Required: no; Default: `1`
 - Runtime range is clamped to `1..=32` and never exceeds the upstream count.
 - Purpose: Number of concurrent upstream fan-out requests.
+- This is the number of upstreams actually started for one request. OxiDNS does not sequentially retry unstarted upstreams after a CNAME-only response, so `concurrent: 1` retains single-attempt selection semantics.
 - Recommendation: use `2..=8` for routine racing; higher values are intended for short-term observation or explicit multi-protocol racing.
 
 #### `response_selection`
@@ -205,11 +206,26 @@ Sends DNS queries to upstreams.
 - Type: `string`; Required: no; Default: `balanced`
 - Values: `fastest`, `balanced`, `prefer_positive`, `consensus`
 - Purpose: Selects the winning response when concurrent upstreams return different results.
+- Scope: applies only when `upstreams` contains more than one target. A single configured upstream uses the single-upstream forwarder and bypasses response selection. With multiple upstreams and `concurrent: 1`, each request still starts only one randomly selected upstream; selection does not query additional upstreams.
+- Except in `fastest` mode, every response is classified against the original Question as:
+  - **Complete positive**: the requested type exists at the original QNAME or its CNAME-chain terminal.
+  - **Incomplete alias**: a CNAME chain exists, but neither the final requested type nor an SOA denial is present.
+  - **Definitive negative**: `NXDOMAIN`, or NODATA that establishes the requested type is absent.
+  - **Other**: for example `SERVFAIL`, `REFUSED`, a mismatched Question, unrelated Answers, a CNAME loop, or conflicting aliases.
+- If all started upstreams finish without an early winner, the common fallback order is `complete positive > incomplete alias > definitive negative > other`; the later completion wins among equal-ranked responses. Transport errors do not participate in this ranking and fail `forward` only when no upstream produced a DNS response.
 - Modes:
-  - `fastest`: the first successful DNS response wins; transport errors never win.
-  - `balanced`: default mode. `NOERROR` with answers wins immediately; `NXDOMAIN` or NODATA waits briefly for a positive answer.
-  - `prefer_positive`: positive answers win immediately; negative answers wait until all started concurrent upstreams finish.
-  - `consensus`: positive answers win immediately; negative answers require two upstream confirmations, falling back to `prefer_positive` when fan-out is too small.
+  - `fastest`: the first successfully returned DNS Message wins immediately, without query-aware classification. “Successful” means only that the upstream returned a DNS Message, so `NXDOMAIN`, `SERVFAIL`, `REFUSED`, or CNAME-only can win; transport errors cannot.
+  - `balanced`: default mode. A complete positive wins immediately. The first definitive negative starts a fixed 100ms grace window that still allows a complete positive to win. When the window expires, or all upstreams finish, the common fallback order is used. Incomplete aliases and other responses do not start the grace window by themselves.
+  - `prefer_positive`: a complete positive wins immediately. Otherwise, OxiDNS waits for every started upstream and then uses the common fallback order. Consequently, an incomplete alias outranks a single negative when no complete positive exists.
+  - `consensus`: one complete positive still wins immediately. `NXDOMAIN` and NODATA are counted separately; two negatives of the same kind can confirm and return a negative early, without requiring identical SOA data or identical wire messages. Fan-out below two falls back to `prefer_positive`. If every upstream finishes without negative consensus, the common fallback order still returns the best available response and may therefore return a single negative. This is a negative-confidence policy, not strict majority voting across all responses.
+
+#### CNAME response handling
+
+- For A/AAAA and other non-CNAME queries, a positive response requires the requested type at the original QNAME or the terminal name of its CNAME chain.
+- A CNAME-only response without the requested type or an SOA is an incomplete alias. It cannot win early or vote as a negative result, but is returned unchanged when no better response exists.
+- `CNAME + SOA` without the requested type is treated as NODATA. `NXDOMAIN` remains negative even when its answer section contains CNAME records.
+- `forward` does not perform hidden fallback or CNAME chasing. Raise `concurrent` when more upstreams must participate in the race.
+- The `fallback` executor checks only whether a branch produced a response; it does not understand response dispositions. An incomplete alias or a `SERVFAIL` Message therefore counts as a successful branch result. To make those outcomes explicitly trigger another upstream, compose a sequence with matchers such as `has_wanted_ans` or `rcode` instead of relying on hidden fallback.
 
 #### `upstreams`
 
@@ -225,7 +241,7 @@ Sends DNS queries to upstreams.
 - Purpose: Stop the executor chain after a successful upstream response.
 - Notes:
   - When disabled, `forward` still populates `response`, but later executors can continue processing it.
-  - When enabled, a successful upstream result immediately ends the remaining executor chain.
+  - When enabled, any DNS Message selected as the best available result ends the remaining executor chain, including an incomplete alias, `SERVFAIL`, or `REFUSED`.
 
 #### `upstreams[].addr`
 
@@ -369,8 +385,11 @@ Exported through the global `GET /api/metrics` endpoint:
 - `forward_success_total`
 - `forward_error_total`
 - `forward_timeout_total`
+- `forward_incomplete_alias_selected_total`
 - `forward_latency_count`
 - `forward_latency_sum_ms`
+
+`forward_incomplete_alias_selected_total` only covers selection-aware concurrent modes (`balanced`, `prefer_positive`, and `consensus`). Single-upstream and `fastest` paths do not scan responses solely for this metric.
 
 Per-upstream series are also exported with an `upstream` label (the upstream tag, or its resolved address when no tag is configured):
 
@@ -400,6 +419,8 @@ Per-upstream series are also exported with an `upstream` label (the upstream tag
 ### Purpose
 
 Provides TTL-aware response caching with negative cache support and persistence.
+
+For A/AAAA and other non-CNAME queries, cache admission requires the requested type at the original QNAME or the terminal name of its CNAME chain, and the echoed QNAME/QTYPE/QCLASS must match the cache key. A bare CNAME response is not stored under the address-query key. `CNAME + NODATA` with an SOA is negative-cached for the minimum of the SOA negative TTL, the lowest Answer TTL (including CNAME), and the configured cap.
 
 ### Example Configuration
 
@@ -531,7 +552,7 @@ Exported through the global `GET /api/metrics` endpoint. The cache plugin does n
 - `cache_miss_total`
 - `cache_expired_total`
 - `cache_insert_total`
-- `cache_skip_total{reason="truncated|no_ttl|low_positive_ttl"}`
+- `cache_skip_total{reason="truncated|no_ttl|incomplete_answer|low_positive_ttl"}`
 - `cache_lazy_refresh_total{result="started|success|failed"}`
 - `cache_entry_count`
 
@@ -781,6 +802,79 @@ Injects arbitrary DNS records from zone-style rule strings.
 - The parser is broader than the zone parser used by mosdns `arbitrary`, but matching remains an exact static lookup.
 
 </Admonition>
+
+---
+
+## `response`
+
+### Purpose
+
+Unconditionally builds and replaces the current DNS response. Use an outer `sequence` matcher to decide when it runs; the plugin is suited to fixed answers, SOA-backed NODATA, and responses that need explicit Answer, Authority, and Additional sections.
+
+### Example Configuration
+
+```yaml
+- tag: suppress_https
+  type: response
+  args:
+    rcode: NOERROR
+    # Invoke from a sequence rule matched on qtype HTTPS/SVCB.
+    answers: []
+    authorities:
+      - "{qname} 300 {qclass} SOA fake-ns.oxidns.fake.root. fake-mbox.oxidns.fake.root. 2021110400 1800 900 604800 300"
+    additionals: []
+    short_circuit: true
+```
+
+An answer with a related additional record:
+
+```yaml
+args:
+  rcode: NOERROR
+  answers:
+    - "{qname} 60 {qclass} CNAME target.example.com."
+  additionals:
+    - "target.example.com. 60 IN A 192.0.2.10"
+  authoritative: true
+```
+
+### Configuration Details
+
+#### `rcode`
+
+- Type: `string` or `number`; Required: no; Default: `NOERROR`
+- Accepts base DNS RCODEs `0..15` and case-insensitive mnemonic names such as `NXDOMAIN`.
+- Extended RCODEs that require EDNS are not supported.
+
+#### `answers` / `authorities` / `additionals`
+
+- Type: `array`; Required: no; Default: empty array
+- Every item must parse to exactly one zone-style RR in the form `<owner> <ttl> <class> <type> <rdata>`.
+- `{qname}` is valid only as the owner and resolves to the first request question name. `{qclass}` is valid only as the class and resolves to that question class.
+- Put SOA records in `authorities`. The SOA TTL and its RDATA minimum together determine negative-cache lifetime.
+
+#### `authoritative` / `authentic_data`
+
+- Type: `bool`; Required: no; Default: `false`
+- Control the AA and AD response flags. The server handles RA, while RD/CD and the Question section are inherited from the request.
+
+#### `short_circuit`
+
+- Type: `bool`; Required: no; Default: `true`
+- Stops the current executor chain after setting the response. Set it to `false` to continue.
+
+### Behavior
+
+- Every execution creates a fresh response from the request and replaces any existing response; records are neither qtype-filtered nor merged.
+- Records are parsed at startup. The request path only clones records and resolves placeholders.
+- A request with no Question fails only when a dynamic placeholder is used.
+- No quick setup or file loading is provided. Use `arbitrary` for static records matched by `qname + qtype + qclass`.
+
+### Typical Uses
+
+- Return SOA-backed NODATA for selected qtypes.
+- Return policy-controlled fixed A, AAAA, TXT, CNAME, or MX answers.
+- Build local test responses containing Answer, Authority, and Additional records.
 
 ---
 
@@ -1615,7 +1709,7 @@ Persists the entry request, the post-`next` response, and `sequence` execution-p
 - tag: query_recorder_main
   type: query_recorder
   args:
-    # SQLite path for this recorder. Different recorders should use different paths.
+    # SQLite path for this recorder. Multiple recorders may share one file.
     path: "./data/query-recorder-main.sqlite"
     # Hot-path enqueue buffer size
     queue_size: 8192
@@ -1689,7 +1783,10 @@ Persists the entry request, the post-`next` response, and `sequence` execution-p
   - `qr_<safe_tag>_<fnv64hex>_v1_meta`
 - `records` contains only the fixed schema fields for structured snapshots. `steps` stores `sequence` path events for path analysis and hit-rate reporting. `questions` is a derived index table from `questions_json` for faster qname/qtype queries. `meta` records completed derived-table migrations.
 - Every recorder owns its own bounded queue, SQLite connection, writer thread, tail buffer, and SSE broadcaster.
-- v1 assumes different recorders use different `path` values. There is no cross-recorder writer sharing or path coordination.
+- Recorders that share the same `path` coordinate readers, writers, and maintenance by normalized database path; tables and in-memory state remain isolated by tag.
+- Periodic retention cleanup deletes expired rows, reclaims every completely free page, and truncates the WAL last. The database file shrinks only when deletion produces complete free pages; small deletions may instead leave reusable space inside live pages.
+- If an existing database still uses `auto_vacuum=NONE`, its first periodic or manual cleanup performs one full `VACUUM` to migrate it to `INCREMENTAL`. This may temporarily pause recorder database reads and writes and require additional temporary disk space, but it does not block DNS request processing.
+- A maintenance failure does not stop the writer. Periodic cleanup retries on a later interval and structured logs report page counts, file sizes, and the failure stage.
 
 ### Data Shape
 
@@ -1736,7 +1833,8 @@ Persists the entry request, the post-`next` response, and `sequence` execution-p
   - Returns one full record plus `steps`.
 - `DELETE /plugins/<tag>/records`
   - Clears all history rows and `steps` for the current recorder, and clears the in-memory tail.
-  - The operation first flushes the background writer queue and returns `cleared_records` for the number of deleted main-table rows.
+  - The operation first flushes the background writer queue, then deletes records in small auto-committed batches. It truncates the WAL after every deletion and page-reclamation batch, avoiding one transaction spanning the full clear operation. It returns `cleared_records` for the number of deleted main-table rows.
+  - If history deletion succeeds but disk reclamation fails, the endpoint returns `query_recorder_clear_failed` with a message that history was already cleared; later maintenance can retry space reclamation.
 - `GET /plugins/<tag>/stats/plugins`
   - Returns hit stats grouped by `matcher / executor / builtin`.
   - Supports `since_ms`, `until_ms`, `kind=matcher|executor|builtin|all`, and the record filters.
@@ -2348,7 +2446,7 @@ Format:
 
 ### Purpose
 
-Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, persistent entries, startup-time file loading, and shutdown cleanup.
+Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, persistent entries, startup-time file loading, and shutdown cleanup. RouterOS firewall, mangle, or routing rules can consume the resulting address set.
 
 ### Example Configuration
 
@@ -2362,6 +2460,7 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
     username: "api-user"
     # API password
     password: "secret"
+    # Plaintext API is the default (usually 8728); configure tls to enable API-SSL (usually 8729)
     # RouterOS API connection timeout, in seconds
     connect_timeout: 5
     # RouterOS API command send timeout, in seconds
@@ -2370,19 +2469,23 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
     receive_timeout: 30
     # Use asynchronous writes to avoid blocking the DNS hot path
     async: true
+    # With async=false, stop waiting after this duration; work continues in the background
+    wait_timeout: 8s
+    # Distinct-key limit applied independently to ingress and retry queues
+    queue_capacity: 16384
     # Address list used for A records
     address_list4: "oxidns_ipv4"
     # Address list used for AAAA records
     address_list6: "oxidns_ipv6"
     # Prefix for comments on OxiDNS-managed entries
-    comment_prefix: "oxidns"
+    comment_prefix: "oxi"
     # Lower bound for dynamic-entry TTL
     min_ttl: 60
     # Upper bound for dynamic-entry TTL
     max_ttl: 3600
     # Force dynamic entries to 300 seconds; use 0 to omit RouterOS timeout
     fixed_ttl: 300
-    # Remove owned entries when the plugin shuts down
+    # Remove owned entries during normal shutdown or application reload
     cleanup_on_shutdown: true
     persistent:
       ips:
@@ -2395,6 +2498,20 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
       files:
         # Load more persistent items from files
         - "/etc/oxidns/persistent_ips.txt"
+```
+
+To enable API-SSL, change the endpoint to the actual TLS port (usually `8729`) and add `tls` explicitly:
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # Optional: override the certificate server name inferred from address
+    server_name: "router.example"
+    # Optional: PEM file containing a self-signed certificate or private CA
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # Optional, default false: skip certificate verification; cannot be used with ca
+    insecure: false
 ```
 
 ### Configuration Details
@@ -2413,6 +2530,14 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 
 - Type: `string`; Required: yes
 - Purpose: RouterOS password.
+
+#### `tls`
+
+- Type: `object`; Required: no; Default: none (plaintext API)
+- Purpose: Enables RouterOS API-SSL.
+- `tls.server_name`: optional string overriding the certificate server name inferred from `address`.
+- `tls.ca`: optional string containing the path to a PEM file for a self-signed certificate or private CA.
+- `tls.insecure`: optional boolean, default `false`; `true` disables certificate verification and cannot be combined with `tls.ca`.
 
 #### `connect_timeout`
 
@@ -2437,19 +2562,29 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 - Type: `bool`; Required: no; Default: `true`
 - Purpose: Controls whether address writes use asynchronous mode. When enabled, the DNS response path only submits tasks, and a background manager completes the RouterOS interaction.
 
+#### `wait_timeout`
+
+- Type: `duration`; Required: no; Default: `8s`
+- Purpose: Limits how long `async: false` waits for one manager attempt. A timeout preserves the DNS response and does not cancel accepted work or background retries. It is independent from the RouterOS API `receive_timeout`.
+
+#### `queue_capacity`
+
+- Type: `usize`; Required: no; Default: `16384`
+- Purpose: Limits distinct IPs in the ingress queue and retry backlog independently. Existing keys still coalesce; a new key is dropped at capacity without changing the DNS response. Must be greater than `0`.
+
 #### `address_list4`
 
-- Type: `string`; Required: no
+- Type: `string`; Required: no; Default: none
 - Purpose: IPv4 address-list name.
 
 #### `address_list6`
 
-- Type: `string`; Required: no
+- Type: `string`; Required: no; Default: none
 - Purpose: IPv6 address-list name.
 
 #### `comment_prefix`
 
-- Type: `string`; Required: no
+- Type: `string`; Required: no; Default: `oxi`
 - Purpose: Prefix for generated RouterOS comments.
 
 #### `persistent`
@@ -2486,22 +2621,27 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 #### `cleanup_on_shutdown`
 
 - Type: `bool`; Required: no; Default: `true`
-- Purpose: Controls whether entries managed by the plugin are removed when the plugin exits.
+- Purpose: Controls whether managed entries are removed during normal shutdown and application-level reload. All cleanup shares a 30-second budget; timeout is reported and shutdown continues.
+- Operational note: Set this to `false` when production restarts, reloads, or rolling deployments require policy continuity.
 
 ### Behavior
 
 - The plugin itself does not modify DNS responses.
-- Startup does not wait for RouterOS address-list scans to finish. Initial connectivity checks and persistent-entry reconciliation run in the background manager; failures are logged without blocking DNS startup or dynamic observations.
+- Startup does not wait for RouterOS address-list scans to finish. Persistent recovery runs in the background manager and retries with backoff without blocking DNS startup or dynamic observations.
 - It only passes through during the forward phase.
 - During the return phase:
-  - Extracts A/AAAA records from `NOERROR` responses.
+  - For A/AAAA queries only, extracts every enabled-family A/AAAA record from the Answer section of `NOERROR` responses without rebuilding CNAME chains.
   - Deduplicates them and keeps the largest TTL.
   - Submits them to the background manager according to async or sync mode.
 - The manager is responsible for:
-  - Background initial connectivity verification
   - Dynamic entry refresh
   - Persistent entry consistency maintenance
   - Cleanup on shutdown
+- Startup always performs one persistent recovery scan, even with an empty desired set, so stale persistent rows from an older configuration can be removed. Failures retry until one scan succeeds.
+- The 180-second periodic reconcile runs only when `persistent` is configured and uses the in-memory set loaded during initialization; it never rereads files.
+- Dynamic entries are DNS observations rather than desired state, so they are excluded from startup and periodic full-table reconcile. Operator edits are not proactively corrected; only a later DNS observation that triggers a write may overwrite them.
+- Finite dynamic entries become eligible for refresh by a later DNS observation at 75% of their effective TTL. The plugin does not run a separate dynamic-refresh timer, and timeless entries are not refreshed automatically.
+- Before deleting an address-list row, the plugin rechecks its internal ID, target list/address key, and complete ownership comment. RouterOS `timeout` is lease data rather than a deletion-authorization condition. RouterOS still exposes final removal by internal ID and has no atomic compare-and-delete primitive.
 
 ### Typical Uses
 
@@ -2514,8 +2654,70 @@ Writes response IPs into MikroTik RouterOS address lists, with dynamic entries, 
 - Prefer dedicated OxiDNS `address-list` targets and avoid large shared lists to reduce RouterOS management-plane scan cost.
 - `comment_prefix` and the plugin `tag` must not contain `;` or `=`.
 - Synchronous mode does not change the DNS response itself. Even if the RouterOS write fails, the DNS result is still preserved.
+- Dynamic entries with `fixed_ttl: 0` do not expire naturally and have no record-count limit. Operators must plan RouterOS capacity and explicit cleanup.
+- An application-level reload gives this plugin direct shutdown/restart semantics: the old instance fully shuts down before the new instance is initialized and started, and pending observations from the old instance are not transferred. With `cleanup_on_shutdown: true`, owned entries are removed and a policy gap may exist while they are rebuilt; set it to `false` to retain RouterOS entries across reload. Different processes must not write the same plugin tag, comment prefix, and target list concurrently; rolling deployments need distinct ownership namespaces or an old writer that has already stopped.
 
 </Admonition>
+
+## `ros_route`
+
+Writes A/AAAA addresses from successful DNS answers as per-IP static routes in a RouterOS policy-routing table, applying the configured gateway and distance to each address. It is a continuation executor and should appear before the executor that produces the final answer.
+
+```yaml
+- tag: ros_route_policy
+  type: ros_route
+  args:
+    address: "192.168.88.1:8728"
+    username: "api-user"
+    password: "secret"
+    # Plaintext API is the default; configure tls to enable API-SSL
+    routing_table: "via_proxy"
+    gateway4: "192.168.88.2@main"
+    gateway6: "fe80::2%ether1"
+    async: true
+    wait_timeout: 8s
+    queue_capacity: 16384
+    fixed_ttl: 0
+    conntrack_guard: true
+    cleanup_on_shutdown: true
+    persistent:
+      ips: ["198.51.100.0/24"]
+```
+
+To enable API-SSL, use the complete nested TLS configuration:
+
+```yaml
+args:
+  address: "router.example:8729"
+  tls:
+    # Optional: override the certificate server name inferred from address
+    server_name: "router.example"
+    # Optional: PEM file containing a self-signed certificate or private CA
+    ca: "/etc/oxidns/routeros-ca.pem"
+    # Optional, default false: skip certificate verification; cannot be used with ca
+    insecure: false
+```
+
+- `routing_table` and `gateway4`/`gateway6` select the target. The RouterOS table, routing rule, and default route must already exist.
+- `min_ttl`/`max_ttl` default to `60`/`3600` seconds. `fixed_ttl` overrides DNS TTL; `fixed_ttl: 0` disables time-based expiry, so the route remains until operator deletion, shutdown cleanup, or a later configuration action.
+- `ros_route` and `ros_address_list` process successful A/AAAA queries only and collect every enabled-family A/AAAA record from the Answer section. They do not rebuild CNAME chains or cap address TTLs by CNAME TTLs. Every IP forms an independent lease; a later answer missing an old IP, NODATA, or NXDOMAIN does not immediately withdraw an existing item.
+- `persistent` is a DNS-independent IP/CIDR set. Files are read only during plugin initialization; reload the plugin or application to apply file changes.
+- RouterOS failures do not block DNS startup. `async` defaults to `true`; `async: false` waits up to `wait_timeout` (default `8s`), after which work continues in the background and the DNS response remains unchanged. `queue_capacity` defaults to `16384` for each of the ingress and retry stages.
+- `conntrack_guard` defaults to disabled and only protects expired dynamic `/32` and `/128` host routes. A tracked connection to the exact target IP defers deletion for 30 seconds; query failures fail closed. Persistent configuration removal, shutdown cleanup, and internal maintenance bypass the guard. CIDR connection protection is not supported.
+- Dynamic leases have no record-count limit. In particular, `fixed_ttl: 0` routes do not expire naturally; operators must plan RouterOS route-table and OxiDNS memory capacity and reclaim them through operator deletion, configuration changes, or shutdown cleanup.
+- Startup performs one full recovery: persistent routes converge to configuration, unexpired dynamic leases are recovered from comments, and expired routes flow through sweep and conntrack guard. Failed startup scans retry with backoff until successful.
+- The 180-second periodic reconcile handles `persistent` routes only and performs no RouterOS query when the persistent set is empty. Dynamic routes are DNS observations rather than desired state, so operator edits are not periodically corrected.
+- `persistent.files` is read only during initialization or reload; periodic reconcile always uses the in-memory set.
+- `comment_prefix` defaults to `oxi` and combines with the plugin `tag` to form the RouterOS ownership namespace; neither value may contain `;` or `=`.
+- RouterOS comments store only item kind, expiry, and last-observed time, not domain references. Restart recovery restores unexpired leases; the current TTL policy may shorten an old deadline but never extends it without a new DNS observation.
+- `tls` enables API-SSL (usually port `8729`): `tls.server_name` overrides the certificate server name, `tls.ca` selects a self-signed/private CA file, and `tls.insecure` defaults to `false`; setting it to `true` disables certificate verification and cannot be combined with `tls.ca`. Omitting `tls` uses plaintext API (usually `8728`).
+- With `cleanup_on_shutdown: true`, dynamic and persistent routes owned by this plugin tag are removed within one 30-second total budget; `false` leaves them for recovery on the next start. Set it to `false` when production restarts or rolling deployments require policy continuity.
+- An application-level reload gives this plugin direct shutdown/restart semantics: the old instance fully shuts down before the new instance is initialized and started, and pending observations from the old instance are not transferred. With `cleanup_on_shutdown: true`, owned routes are removed and a policy gap may exist while they are rebuilt; set it to `false` to retain RouterOS routes across reload. Different processes must not write the same plugin tag, comment prefix, and routing table concurrently; rolling deployments need distinct ownership namespaces or an old writer that has already stopped.
+- Before deletion, only the internal ID, route key, and plugin ownership namespace are rechecked; gateway, distance, disabled state, and lease-comment payload are not compared as a full mutable snapshot. RouterOS still exposes final removal by internal ID and has no atomic compare-and-delete primitive.
+- The plugin no longer creates temporary validation routes. Invalid gateway or routing-table settings surface on the first real write and enter background retry.
+- When a later DNS response observes the same IP, its dynamic lease comment is rewritten only after 75% of the TTL has elapsed or five minutes have passed since the previous successful write, whichever comes first. The plugin does not run a separate dynamic-lease refresh timer.
+
+---
 
 ## `upgrade`
 

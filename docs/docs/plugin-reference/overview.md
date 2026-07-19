@@ -85,7 +85,8 @@ server -> sequence
 | [`script`](executor.mdx#script) | 执行外部命令，并把 `DnsContext` 中的稳定字段注入为参数或环境变量。 |
 | [`ipset`](executor.mdx#ipset) | 把响应中的 IP 写入 Linux `ipset`（内置 netlink 后端，无需 `ipset` 命令）。 |
 | [`nftset`](executor.mdx#nftset) | 把响应 IP 写入 Linux `nftables set`（内置 netlink 后端，无需 `nft` 命令）。 |
-| [`ros_address_list`](executor.mdx#ros_address_list) | 把应答 IP 同步到 RouterOS `address-list`，支持动态项、常驻项和关闭清理。 |
+| [`ros_address_list`](executor.mdx#ros_address_list) | 把应答 IP 投影到 RouterOS `address-list`，由防火墙、mangle 或策略路由规则消费该集合。 |
+| [`ros_route`](executor.mdx#ros_route) | 把应答 IP 投影为 RouterOS routing table 中的逐 IP 静态路由，并应用配置的网关和 distance。 |
 
 ### 维护与调度
 
@@ -128,6 +129,7 @@ server -> sequence
 | --- | --- |
 | [`mark`](matcher.mdx#mark) | 匹配上下文中的 mark 集合。 |
 | [`env`](matcher.mdx#env) | 匹配进程环境变量。 |
+| [`time`](matcher.mdx#time) | 按时区、时间段、星期和每月日期匹配。 |
 | [`random`](matcher.mdx#random) | 按概率命中，适合灰度和采样。 |
 | [`rate_limiter`](matcher.mdx#rate_limiter) | 基于客户端 IP 的令牌桶限流。 |
 | [`string_exp`](matcher.mdx#string_exp) | 通用字符串表达式匹配器，补足专用 matcher 不够灵活的场景。 |

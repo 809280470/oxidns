@@ -18,7 +18,7 @@ use crate::core::rule_matcher::DomainRuleMatcher;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result as DnsResult};
 use crate::plugin::provider::Provider;
-use crate::plugin::provider::v2ray_dat::{
+use crate::plugin::provider::v2ray::{
     GeoSiteList, geosite_code, geosite_domain_expression, geosite_domain_matches_selectors,
     matched_geosite_selectors, parse_geosite_selectors,
 };

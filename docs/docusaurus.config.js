@@ -43,6 +43,7 @@ const config = {
   projectName: 'oxidns',
 
   onBrokenLinks: 'throw',
+  onBrokenAnchors: 'throw',
 
   i18n: {
     defaultLocale: 'zh-Hans',

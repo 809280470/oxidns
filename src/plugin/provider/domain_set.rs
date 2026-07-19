@@ -218,14 +218,10 @@ impl PluginFactory for DomainSetFactory {
 }
 
 fn append_rules_from_file(rules: &mut Vec<String>, path: &str) -> DnsResult<()> {
-    crate::plugin::provider::provider_utils::for_each_nonempty_rule_line(
-        path,
-        "domain rules",
-        |raw, _| {
-            rules.push(raw.to_string());
-            Ok(())
-        },
-    )
+    crate::infra::io::lines::for_each_nonempty_rule_line(path, "domain rules", |raw, _| {
+        rules.push(raw.to_string());
+        Ok(())
+    })
 }
 
 fn load_domain_rules(matcher: &mut DomainRuleMatcher, rules: &[String]) -> DnsResult<()> {
@@ -246,7 +242,7 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::plugin::provider::provider_utils::for_each_nonempty_rule_text;
+    use crate::infra::io::lines::for_each_nonempty_rule_text;
     use crate::proto::Name;
 
     fn load_rules_text(
@@ -336,6 +332,10 @@ mod tests {
     impl Provider for StaticDomainProvider {
         fn as_any(&self) -> &dyn Any {
             self
+        }
+
+        async fn reload(&self) -> DnsResult<()> {
+            Ok(())
         }
 
         fn contains_name(&self, name: &Name) -> bool {

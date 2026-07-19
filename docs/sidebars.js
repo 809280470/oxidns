@@ -26,7 +26,7 @@ const sidebars = {
     {
       type: 'category',
       label: '管理与集成',
-      items: ['webui', 'api', 'mikrotik-policy-routing'],
+      items: ['webui', 'api'],
     },
     {
       type: 'category',

@@ -20,7 +20,7 @@ use crate::config::types::PluginConfig;
 use crate::core::context::DnsContext;
 use crate::infra::error::{DnsError, Result as DnsResult};
 use crate::plugin::dependency::DependencySpec;
-use crate::plugin::matcher::matcher_utils::validate_non_empty_rules;
+use crate::plugin::matcher::rules::validate_non_empty_rules;
 use crate::plugin::matcher::{Matcher, MatcherRef, parse_matcher_expr};
 use crate::plugin::{
     Plugin, PluginFactory, PluginHolder, PluginRef, UninitializedPlugin,
@@ -150,7 +150,7 @@ impl Plugin for AnyMatchMatcher {
                 }
 
                 PluginRef::QuickSetup { plugin_type, param } => {
-                    let quick_tag = format!("@qs:match:{}:{}:{}", self.tag, idx, plugin_type);
+                    let quick_tag = format!("qs.match.{}.{}.{}", self.tag, idx, plugin_type);
 
                     match context
                         .init_quick_setup(&plugin_type, &quick_tag, param)

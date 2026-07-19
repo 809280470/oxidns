@@ -7,6 +7,12 @@ import Admonition from "@theme/Admonition";
 
 匹配器插件返回 `true` 或 `false`，主要供 `sequence` 的 `matches` 使用。
 
+## 运行时开启与关闭
+
+`plugins:` 中具有稳定 tag 的 matcher 可以通过管理 API 在当前 runtime 内开启、关闭和查询状态。WebUI 将关闭操作呈现为需要确认的“临时旁路”，旁路后 matcher 不再执行内部逻辑，基础结果固定为 `false`；外层取反仍按原规则应用，因此 `!$matcher` 会得到 `true`。恢复匹配可以一键完成。
+
+该状态不会写入配置，全量 reload 或进程重启后恢复开启。quick-setup matcher 没有稳定的公开 tag，因此不提供运行时开关；需要控制时应先把表达式提取为独立 matcher。接口详情见 [管理 API](../api.mdx#matcher)。
+
 ## 匹配表达式规则
 
 在 `sequence` 中使用 matcher 时，推荐优先使用 quick setup 形式，配置会更直观：
@@ -618,6 +624,67 @@ args:
 ### 典型用途
 
 - 同一配置在不同部署环境下启用不同分支。
+
+---
+
+## `time`
+
+### 作用
+
+按当前墙上时间匹配日内时间段、星期和每月日期。
+
+### 配置示例
+
+```yaml
+- tag: work_hours
+  type: time
+  args:
+    timezone: Asia/Shanghai
+    periods:
+      - start: "09:00"
+        end: "18:00"
+        weekdays: [mon, tue, wed, thu, fri]
+      - start: "22:00"
+        end: "02:00"
+        weekdays: [sat, sun]
+      - monthdays: [1, 15]
+```
+
+### 配置项
+
+#### `timezone`
+
+- 类型：`string`；必填：否；默认值：系统时区
+- 使用 IANA 时区名称，例如 `Asia/Shanghai`、`UTC`。
+- 未配置时会解析系统时区；无法解析时插件初始化失败，不会静默退回 UTC。
+
+#### `periods`
+
+- 类型：`array`；必填：是；数量：`1..=64`
+- 每项可配置 `start`、`end`、`weekdays` 与 `monthdays`。
+- 多项之间为 OR；同一项内所有已配置条件为 AND。
+- `start` 与 `end` 均为 `HH:MM`，必须同时填写或同时省略；同时省略表示全天，但此时必须配置星期或月日条件。
+- 区间使用 `[start, end)`；相同起止时间无效。`end` 早于 `start` 时表示跨午夜，星期和月日条件归属于开始日。
+- `weekdays` 支持大小写不敏感的 `mon` 至 `sun`，也支持 ISO 周序数字 `1..=7`（`1=周一`，`7=周日`）；`monthdays` 支持 `1..=31`。不存在该日期的月份不会命中。
+
+### quick setup
+
+```yaml
+- matches: "time 09:00-18:00"
+```
+
+quick setup 仅支持系统时区下的单个每日窗口；星期、月日和显式时区请使用完整配置。
+
+### 行为说明
+
+- matcher 在执行时读取真实墙上时间；系统校时会立即影响后续判断。
+- 夏令时跳过的本地时间不会出现；重复小时中的两个实际时刻都会按相同钟面规则判断。
+- 独立 Linux 或精简容器中配置 IANA 时区时，应确保系统提供 `tzdata`。
+
+### 典型用途
+
+- 工作日办公时段走特定上游。
+- 夜间或周末切换缓存、分流或家长控制策略。
 
 ---
 

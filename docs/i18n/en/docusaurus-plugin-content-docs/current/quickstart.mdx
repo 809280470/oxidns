@@ -73,14 +73,14 @@ On OpenWrt, running the installer again reinstalls the selected `luci-app-oxidns
   <TabItem value="unix" label="Linux / macOS" default>
 
 ```bash
-curl -fsSL https://oxidns.org/install.sh | sudo env OXIDNS_VERSION=v1.0.1 sh
+curl -fsSL https://oxidns.org/install.sh | sudo env OXIDNS_VERSION=vX.Y.Z sh
 ```
 
   </TabItem>
   <TabItem value="windows" label="Windows">
 
 ```powershell
-$env:OXIDNS_VERSION = "v1.0.1"; irm https://oxidns.org/install.ps1 | iex
+$env:OXIDNS_VERSION = "vX.Y.Z"; irm https://oxidns.org/install.ps1 | iex
 ```
 
   </TabItem>
@@ -286,6 +286,7 @@ Non-Windows targets use `.tar.gz`:
 - `oxidns-aarch64-unknown-linux-musl.tar.gz`
 - `oxidns-i686-unknown-linux-musl.tar.gz`
 - `oxidns-arm-unknown-linux-musleabihf.tar.gz`
+- `oxidns-armv7-unknown-linux-musleabihf.tar.gz`
 - `oxidns-x86_64-apple-darwin.tar.gz`
 - `oxidns-aarch64-apple-darwin.tar.gz`
 - `oxidns-x86_64-unknown-freebsd.tar.gz`
@@ -317,7 +318,8 @@ When the correct asset is unclear, use this mapping:
 | Alpine Linux x86_64 | `oxidns-x86_64-unknown-linux-musl.tar.gz` | Prefer musl on Alpine |
 | Alpine Linux ARM64 | `oxidns-aarch64-unknown-linux-musl.tar.gz` | Static-friendly build |
 | Confirmed glibc Linux requiring a dynamic build | `oxidns-x86_64-unknown-linux-gnu.tar.gz` / `oxidns-aarch64-unknown-linux-gnu.tar.gz` | Only choose this when the target environment is clearly compatible |
-| 32-bit ARM Linux | `oxidns-arm-unknown-linux-musleabihf.tar.gz` | Fits some Raspberry Pi and older ARM boards |
+| Linux ARMv7 / armv7l | `oxidns-armv7-unknown-linux-musleabihf.tar.gz` | Fits ARMv7 devices |
+| Generic 32-bit ARM Linux | `oxidns-arm-unknown-linux-musleabihf.tar.gz` | Fits older ARM boards |
 | macOS Intel | `oxidns-x86_64-apple-darwin.tar.gz` | Intel Macs |
 | macOS Apple Silicon | `oxidns-aarch64-apple-darwin.tar.gz` | M1 / M2 / M3 / M4 Macs |
 | Windows x64 | `oxidns-x86_64-pc-windows-msvc.zip` | Most PCs |
@@ -336,7 +338,7 @@ Common output mapping:
 
 - `Linux` + `x86_64`: default to `x86_64-unknown-linux-musl`; use `x86_64-unknown-linux-gnu` only when a glibc dynamic build is explicitly required
 - `Linux` + `aarch64`: default to `aarch64-unknown-linux-musl`; use `aarch64-unknown-linux-gnu` only when a glibc dynamic build is explicitly required
-- `Linux` + `armv7l`: use `arm-unknown-linux-musleabihf`
+- `Linux` + `armv7l`: use `armv7-unknown-linux-musleabihf`
 - `Darwin` + `x86_64`: use `x86_64-apple-darwin`
 - `Darwin` + `arm64`: use `aarch64-apple-darwin`
 
@@ -473,11 +475,52 @@ The Docker workflow builds:
 - `linux/amd64`
 - `linux/arm64`
 
-Pull and run:
+Before starting, install Docker Engine and the Docker Compose plugin (which provides `docker compose`), then verify that both commands below work. See the [official Docker installation guide](https://docs.docker.com/engine/install/):
 
 ```bash
+docker version
+docker compose version
+```
+
+### Prepare the Configuration File
+
+Create an empty deployment directory, then export the default configuration that matches the current image version:
+
+```bash
+mkdir -p oxidns
+cd oxidns
+
 docker pull svenshi/oxidns:latest
 
+docker run --rm \
+  --entrypoint /bin/cat \
+  svenshi/oxidns:latest \
+  /etc/oxidns/config.yaml > config.yaml
+
+test -s config.yaml
+```
+
+Use the export command only to create the configuration for a first-time deployment. Keep and reuse the existing `config.yaml` when upgrading or restarting a deployment; do not overwrite it with the image default.
+
+Create `config.yaml` as a regular file before starting the container. If the bind-mount source does not exist, Docker may create a directory with that name and then fail because it cannot mount the directory at `/etc/oxidns/config.yaml`.
+
+<Admonition type="note" title="DNS ports in the configuration">
+
+The image configuration listens on container port `53`. The development `config.yaml` at the repository root listens on `5335` by default, so do not use it unchanged with the `53:53` mappings below. To use the repository configuration, either change the UDP and TCP server listeners to `:53` or adjust the container-side port mappings accordingly.
+
+</Admonition>
+
+<Admonition type="warning" title="Protect the management API">
+
+The examples below publish the management API and WebUI on host port `9199`, while the exported default configuration does not enable authentication. Before allowing access from other devices, enable `api.http.auth` in `config.yaml` and restrict sources with a firewall. For local-only access, change the mapping to `127.0.0.1:9199:9199/tcp`.
+
+</Admonition>
+
+### Start With docker run
+
+Confirm that the current directory contains the generated `config.yaml`, then run:
+
+```bash
 docker run -d \
   --name oxidns \
   --restart unless-stopped \
@@ -488,13 +531,13 @@ docker run -d \
   svenshi/oxidns:latest
 ```
 
-<Admonition type="note" title="Port binding">
+<Admonition type="note" title="Port mapping">
 
-On Linux, port 53 is privileged. Regular users usually get the needed permission through the Docker daemon. Portable non-root installs should use `:5353`.
+If host port 53 is already used by systemd-resolved, dnsmasq, or another DNS service, change the host side to `5353:53`, for example `-p 5353:53/udp -p 5353:53/tcp`. Keep the container side on port 53.
 
 </Admonition>
 
-When the default-branch image is published, the `latest` tag is also available.
+The examples use the rolling `latest` tag. For production deployments, pin an explicit release tag to avoid an unexpected upgrade when the image is pulled again.
 
 The image entrypoint effectively runs:
 
@@ -508,9 +551,23 @@ The container exposes:
 - `53/tcp`
 - `9199/tcp`
 
+Check the container, API, WebUI, and DNS:
+
+```bash
+docker ps --filter name=oxidns
+docker logs --tail 50 oxidns
+curl -fsS http://127.0.0.1:9199/api/health
+
+# If dig is installed
+dig @127.0.0.1 example.com
+dig @127.0.0.1 example.com +tcp
+```
+
+Open the WebUI at `http://SERVER_IP:9199/`. If Basic Auth is enabled, enter the matching username and password on the WebUI settings page.
+
 ### Docker Compose Example
 
-For Compose-based port mapping and config management, use this `docker-compose.yml`:
+For Compose-based port mapping and config management, first follow "Prepare the Configuration File" so that `config.yaml` exists in the current directory, then create this `docker-compose.yml`:
 
 ```yaml
 services:
@@ -536,6 +593,12 @@ Follow logs with:
 
 ```bash
 docker compose logs -f oxidns
+```
+
+Run the health check in another terminal:
+
+```bash
+curl -fsS http://127.0.0.1:9199/api/health
 ```
 
 ## 7. Selection Guide

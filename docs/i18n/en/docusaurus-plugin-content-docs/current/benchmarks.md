@@ -1,9 +1,15 @@
 ---
-title: Performance and Benchmarks
+title: Performance Method and Historical Benchmarks
 sidebar_position: 8
 ---
 
-This page provides OxiDNS performance priorities and public benchmark snapshots. The data is intended to show the performance profile under different levels of policy complexity, concurrency, and transport-path pressure, not to claim an absolute winner.
+This page provides OxiDNS performance priorities, reproduction entry points, and public historical benchmark snapshots. The data is intended to show the performance profile under different levels of policy complexity, concurrency, and transport-path pressure, not to claim an absolute winner.
+
+## Data Scope
+
+The newest published OxiDNS-versus-mosdns snapshot on this page is from `v0.3.0`. It is retained to document the method and that release's performance profile. It **does not represent the current OxiDNS version** and must not be used directly for current capacity planning or performance commitments.
+
+To evaluate current code, rerun the repository compare pack on fixed hardware with recorded tool versions, configuration, query set, and network conditions. Record the tested commit, binary hash, and full command line. Without a new measurement, cite the historical release explicitly instead of describing these numbers as current OxiDNS performance.
 
 ## What OxiDNS Cares About
 
@@ -22,6 +28,18 @@ OxiDNS is not only interested in peak numbers for the simplest possible case. Th
 * `run_dnsperf_latency_compare.sh` is better for low-concurrency latency, with `clients == outstanding`
 * These snapshots are better read as version-specific distributions of strengths against mosdns
 * Because the 2026-04-13 compare pack updated the scenario catalog, query sets, and some workload definitions, the absolute numbers in `v0.1.0` and `v0.3.0` should not be treated as a direct regression chart across versions
+
+The source tree provides these Criterion microbenchmarks:
+
+```bash
+cargo bench --bench message_codec
+cargo bench --bench response_classification
+cargo bench --bench domain_rule_matcher
+cargo bench --bench ip_rule_matcher
+cargo bench --bench plugin_local_answers
+```
+
+`response_classification` covers direct A, 1/4/16-hop CNAME chains, CNAME-only, CNAME+NODATA, and NXDOMAIN. Microbenchmarks isolate implementation costs; they do not replace end-to-end testing of the complete DNS request path.
 
 Legend:
 

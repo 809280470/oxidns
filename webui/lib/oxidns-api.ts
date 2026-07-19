@@ -92,6 +92,27 @@ export interface ControlResponse {
   reload: ReloadSnapshot;
 }
 
+export interface MatcherStatusResponse {
+  ok: boolean;
+  matcher: string;
+  enabled: boolean;
+}
+
+export interface ProviderReloadResponse {
+  ok: boolean;
+  action: "reload_provider";
+  provider: string;
+  status: "reloaded";
+}
+
+export class ProviderReloadBusyError extends Error {}
+
+export type ProcessMemoryKind =
+  | "rss"
+  | "private_working_set"
+  | "private_commit"
+  | "working_set";
+
 export interface SystemResponse {
   ok: boolean;
   version: string;
@@ -104,6 +125,7 @@ export interface SystemResponse {
   reload: ReloadSnapshot;
   process_cpu_percent?: number;
   process_memory_mb?: number;
+  process_memory_kind?: ProcessMemoryKind;
   system_memory_total_mb?: number;
 }
 
@@ -493,6 +515,56 @@ export async function requestRestart(): Promise<void> {
     headers: apiHeaders(),
   });
   await readJsonResponse<unknown>(response);
+}
+
+export async function fetchMatcherStatus(
+  tag: string,
+): Promise<MatcherStatusResponse> {
+  const response = await fetch(
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/status`),
+    {
+      method: "GET",
+      headers: apiHeaders(),
+    },
+  );
+  return readJsonResponse<MatcherStatusResponse>(response);
+}
+
+export async function setMatcherEnabled(
+  tag: string,
+  enabled: boolean,
+): Promise<MatcherStatusResponse> {
+  const action = enabled ? "enable" : "disable";
+  const response = await fetch(
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/${action}`),
+    {
+      method: "POST",
+      headers: apiHeaders(),
+    },
+  );
+  return readJsonResponse<MatcherStatusResponse>(response);
+}
+
+export async function reloadProvider(
+  tag: string,
+): Promise<ProviderReloadResponse> {
+  const response = await fetch(
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/reload`),
+    {
+      method: "POST",
+      headers: apiHeaders(),
+    },
+  );
+  try {
+    return await readJsonResponse<ProviderReloadResponse>(response);
+  } catch (error) {
+    if (response.status === 409) {
+      throw new ProviderReloadBusyError(
+        error instanceof Error ? error.message : "Provider reload is busy",
+      );
+    }
+    throw error;
+  }
 }
 
 export async function fetchCacheEntries(

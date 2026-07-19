@@ -76,12 +76,12 @@ It is better suited for users who want explicit control over DNS behavior, rathe
 | --- | --- |
 | Protocols | UDP, TCP, DoT, DoQ, DoH |
 | Policy model | `sequence`, `matcher`, `executor`, `provider` |
-| Executors | `forward`, `cache`, `fallback`, `hosts`, `arbitrary`, `redirect`, `ecs_handler`, `ttl`, `black_hole`, `ip_selector`, `download`, `upgrade`, `reload`, `reload_provider`, `script`, `http_request`, `learn_domain`, `query_summary`, `query_recorder`, `metrics_collector` |
-| Matchers | `qname`, `question`, `qtype`, `qclass`, `client_ip`, `resp_ip`, `rcode`, `rate_limiter`, and more |
+| Executors | `forward`, `cache`, `fallback`, `hosts`, `arbitrary`, `response`, `redirect`, `ecs_handler`, `ttl`, `black_hole`, `ip_selector`, `download`, `upgrade`, `reload`, `reload_provider`, `script`, `http_request`, `learn_domain`, `query_summary`, `query_recorder`, `metrics_collector` |
+| Matchers | `qname`, `question`, `qtype`, `qclass`, `client_ip`, `resp_ip`, `rcode`, `time`, `rate_limiter`, and more |
 | Data sets | `domain_set`, `dynamic_domain_set`, `ip_set`, `geoip`, `geosite`, `adguard_rule` |
 | Outbound networking | `network.outbound` centralizes nameservers and SOCKS5 settings for HTTP downloads, upgrade checks, webhooks, and upstreams |
-| System integrations | `ipset`, `nftset`, `ros_address_list`, `reverse_lookup` |
-| Debugging and operations | Health checks, config validation, hot reload, query records, Prometheus plugin metrics, real-time logs |
+| System integrations | `ipset`, `nftset`, `ros_address_list`, `ros_route`, `reverse_lookup` |
+| Debugging and operations | Health checks, config validation, hot reload, temporary matcher bypasses, targeted provider reloads, query records, Prometheus plugin metrics, real-time logs |
 | Deployment | Multi-platform builds, Debian packages, OpenWrt LuCI app, standalone WebUI hosting, service installation |
 
 ---
@@ -96,7 +96,7 @@ Typical use cases include:
 - Multi-upstream racing, fallback chains, and mixed protocol environments
 - Configurable concurrent upstream response selection to balance latency and negative-answer confidence
 - Fine-grained DNS policy routing based on domains, clients, and response results
-- DNS-result-driven `ipset` / `nftset` / MikroTik address list synchronization
+- DNS-result-driven `ipset` / `nftset` / MikroTik address-list and policy-route synchronization
 - Ad filtering, domain routing, local overrides, dual-stack preferences, and ECS control
 - Self-hosted DNS infrastructure that needs explicit control and debugging
 - Lightweight deployments that serve a separately built WebUI on the same management port
@@ -193,7 +193,8 @@ If you want to download a GitHub release directly, use this platform guide:
 | OpenWrt / LuCI | OxiDNS installer script, or `.ipk` / `.apk` packages from [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns) |
 | Alpine Linux x86_64 | `oxidns-x86_64-unknown-linux-musl.tar.gz` |
 | Alpine Linux ARM64 | `oxidns-aarch64-unknown-linux-musl.tar.gz` |
-| 32-bit ARM Linux, including some Raspberry Pi installs | `oxidns-arm-unknown-linux-musleabihf.tar.gz` |
+| Linux ARMv7 / armv7l | `oxidns-armv7-unknown-linux-musleabihf.tar.gz` |
+| Generic 32-bit ARM Linux | `oxidns-arm-unknown-linux-musleabihf.tar.gz` |
 | macOS Intel | `oxidns-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `oxidns-aarch64-apple-darwin.tar.gz` |
 | Windows x64 | `oxidns-x86_64-pc-windows-msvc.zip` |
@@ -240,7 +241,6 @@ See [Custom Build](https://oxidns.org/en/custom-build) for details.
 - [OpenWrt LuCI App](https://oxidns.org/en/openwrt)
 - [Plugin Overview](https://oxidns.org/en/plugin-reference/overview)
 - [Management API](https://oxidns.org/en/api)
-- [MikroTik Policy Routing](https://oxidns.org/en/mikrotik-policy-routing)
 - [Common Scenarios](https://oxidns.org/en/scenarios)
 - [Architecture and Design](https://oxidns.org/en/architecture-and-design)
 - [Performance and Benchmarks](https://oxidns.org/en/benchmarks)
