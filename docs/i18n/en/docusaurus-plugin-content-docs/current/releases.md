@@ -10,29 +10,35 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-07
 
 <div className="release-stack">
-   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-10" defaultOpen>
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-19" defaultOpen>
        **Release Scope**
 
-       - Minor Release. v1.5.0 makes DNS response handling query-aware: `forward` and `cache` follow the original QNAME's CNAME chain before accepting a requested type, preventing incomplete alias responses from winning incorrectly or entering A/AAAA cache keys.
-       - The release also includes ARMv7 delivery support, OpenWrt LuCI lifecycle support, an Alpine Docker image, WebUI editor improvements, API path canonicalization, and safer plugin-tag validation.
+       - Minor Release. v1.5.0 centers on RouterOS policy synchronization and live operations: it adds the `ros_route` static policy-route plugin, comprehensively rebuilds `ros_address_list`, and adds management API plus WebUI runtime controls for matchers and providers.
+       - It also adds a configurable `response` executor, timezone-aware `time` matching, query-recorder space reclamation, stronger CNAME response selection, advanced WebUI configuration, and broader OpenWrt, ARMv7, and container delivery support.
 
        **Changes**
 
-       - `fix(dns)`: add a shared response classifier for complete positives, definitive negatives, incomplete aliases, and other responses. Requested RRs must belong to the original QNAME or its CNAME-chain terminal instead of merely appearing somewhere in Answer, with one Answer scan per CNAME hop.
-       - `fix(forward)`: `balanced`, `prefer_positive`, and `consensus` prefer complete CNAME-chain answers. Bare CNAME responses cannot win early or vote as negatives, but are preserved when no better response exists. `CNAME + SOA` is recognized as NODATA; selected dispositions are reused, while single-upstream and `fastest` paths avoid metric-only response scans.
-       - `fix(cache)`: bare CNAME responses no longer populate A/AAAA and similar address-query keys. Admission and dump/load validate QNAME/QTYPE/QCLASS, while alias-NODATA lifetime is capped by the lowest SOA, Answer (including CNAME), and configured TTL. Admission, lazy refresh, and persistence reuse one classification, and a new `incomplete_answer` cache skip reason is exported.
-       - `feat(release)`: add ARMv7 targets and normalize published target selection; switch Docker images to Alpine; add the full OpenWrt LuCI application lifecycle.
-       - `fix(config/api)`: unsafe or reserved quick-setup plugin tags are rejected. API plugin routes canonically URL-encode special characters to prevent path ambiguity.
-       - `fix(webui)`: migrate the YAML configuration editor to CodeMirror and improve editing behavior; keep frontend plugin-tag route handling aligned with backend encoding.
-       - `deps/ci`: update dependencies and GitHub Actions caching, including a nightly Clippy compatibility fix for proto chunks.
+       - `feat(routeros)`: add `ros_route` to synchronize observed DNS A/AAAA addresses into per-IP static routes in a selected RouterOS routing table, with IPv4/IPv6 gateways, distance, TTL leases, persistent IP/CIDR entries, optional conntrack-delayed removal, startup recovery, and bounded shutdown cleanup.
+       - `refactor(routeros)`: share TLS/API-SSL transport, bounded parallel batching, key-coalescing queues, leases, reconciliation, retry, and lifecycle primitives across `ros_address_list` and `ros_route`. RouterOS outages no longer block DNS startup; synchronous mode is limited by `wait_timeout` and never changes the DNS response on failure; deletion revalidates internal ID, target key, and ownership comment to avoid touching foreign entries.
+       - `feat(runtime_control)`: all matchers gain live status, enable, and disable controls; providers gain serialized reload with conflicting concurrent requests rejected. The management API, logs, and WebUI plugin detail panels expose these controls, while builds without the API feature keep them disabled.
+       - `feat(response/matcher)`: add a `response` executor that builds Answer, Authority, and Additional sections from zone-record templates with RCODE, flags, and `{qname}`/`{qclass}` placeholders. The `time` matcher gains IANA timezones, multiple periods, overnight windows, weekdays, and month-day constraints.
+       - `refactor(query_recorder)`: coordinate readers, writers, and maintenance sharing one SQLite database. Retention cleanup and manual history clearing now delete in batches, truncate WAL, migrate legacy databases to incremental auto-vacuum, reclaim disk space, and keep the in-memory tail consistent with stored results.
+       - `fix(dns/forward/cache)`: add a shared query-aware response classifier. Concurrent upstream selection distinguishes complete positives, definitive negatives, and incomplete aliases; bare CNAME responses no longer win early, vote as negatives, or populate address caches. Cache dump/load, lazy refresh, TTL, and persisted-age behavior are hardened while repeated CNAME scans are reduced.
+       - `feat(webui)`: add collapsible advanced configuration fields while preserving explicit defaults, `false`, `0`, and empty objects. Replace Monaco with a locally hosted CodeMirror YAML editor with stronger validation, completion, array, and time-period serialization. Improve DNS traffic, process memory, and unavailable-metrics dashboard states.
+       - `feat(release/operations)`: add an ARMv7 release target; let the installer deploy `luci-app-oxidns` and its Chinese package on OpenWrt; move the container to an Alpine build stage plus BusyBox musl runtime; split upgrade discovery, digest verification, archive handling, and binary/WebUI installation while correcting full/slim target selection.
+       - `fix(config/api/health)`: reject path-unsafe plugin tags and the reserved quick-setup namespace, consistently URL-encode plugin API routes, and report health only after plugin initialization. Synchronize new `response` and RouterOS configuration, features, and build-info capabilities.
+       - `deps/ci/docs`: update dependencies and GitHub Actions, including the `oxidns-proto` nightly-Clippy fix. Clarify server, plugin, infra, upgrade, and provider/V2Ray module boundaries and update bilingual API, plugin, OpenWrt, installation, and operations documentation.
 
        **Compatibility and Upgrade Notes**
 
        - The root crate version is `1.5.0`; `oxidns-proto` is updated to `0.1.4`; the release tag should be `v1.5.0`.
-       - No required YAML fields are added. `forward.concurrent` still means the number of upstreams started for the current request: `concurrent: 1` does not retry unstarted upstreams. An incomplete CNAME response can still be returned when no better result exists, but is never cached as an address answer.
-       - **Compatibility note**: unsafe plugin tags and reserved quick-setup tags now fail configuration validation. Run `oxidns check` before upgrading and rename affected plugin tags if needed.
-       - Deployments using cache dumps can upgrade directly. Legacy CNAME-only address entries are discarded while loading or validating cache entries so they cannot continue serving incomplete address answers.
-       - Container and ARM deployments should validate the new Alpine or ARMv7 release artifacts before replacing a production binary.
+       - Most v1.4.0 configurations upgrade directly; all newly introduced capabilities are optional. Run `oxidns check` before upgrading. Unsafe plugin tags and reserved quick-setup tags now fail validation and must be renamed together with all references.
+       - **RouterOS ownership migration**: the default `ros_address_list.comment_prefix` changes from `fdns` to `oxi`. To continue recognizing, refreshing, or cleaning entries created by older releases, explicitly keep `comment_prefix: fdns` in the existing plugin configuration; handle the old namespace before switching to `oxi`.
+       - `ros_address_list` adds optional `tls`, `wait_timeout`, and `queue_capacity`; existing address-list, persistent, and TTL settings remain valid. `cleanup_on_shutdown` still defaults to `true`, and application reload shuts down the old instance first. Deployments requiring policy continuity should evaluate `false` and must not run two processes with the same tag, comment prefix, and target list.
+       - `ros_route` is new and requires a pre-created RouterOS routing table/rule plus at least one gateway. `fixed_ttl: 0` creates dynamic routes that never expire naturally, and dynamic leases have no entry-count cap; assess RouterOS routing-table and OxiDNS memory capacity first. Custom builds can select `plugin-ros-address-list` or `plugin-ros-route`; `plugin-mikrotik` remains the aggregate feature.
+       - Legacy query-recorder databases migrate to incremental auto-vacuum on the first retention cleanup or manual history clear. The first migration/reclaim of a large database may create noticeable disk I/O, so schedule it outside peak traffic and keep free space available.
+       - `forward.concurrent: 1` still does not retry upstreams that were not started. An incomplete CNAME response can still be returned when no better result exists, but is not cached as an address answer. Legacy CNAME-only address entries in cache dumps are discarded during load or hit validation.
+       - The container now uses a musl/BusyBox runtime while retaining CA and timezone data. Container, OpenWrt, and ARMv7 deployments should verify startup arguments, mounts, timezone behavior, and upgrade/rollback procedures before production replacement.
    </ReleaseCard>
 </div>
 
