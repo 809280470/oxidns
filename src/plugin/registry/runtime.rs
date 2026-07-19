@@ -84,7 +84,12 @@ impl PluginRuntimeManager {
         outbound::clear_global();
         outbound::install_global(&config.network.outbound)?;
 
-        if let Err(err) = candidate.clone().init_plugins(config.plugins).await {
+        let matcher_runtime_controls_enabled = cfg!(feature = "api") && config.api.http.is_some();
+        if let Err(err) = candidate
+            .clone()
+            .init_plugins_with_runtime_controls(config.plugins, matcher_runtime_controls_enabled)
+            .await
+        {
             candidate.destroy().await;
             outbound::clear_global();
             return Err(err);

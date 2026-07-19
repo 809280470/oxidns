@@ -180,6 +180,15 @@ impl PluginRegistry {
     /// * `Ok(())` - All plugins initialized successfully
     /// * `Err(DnsError)` - Error message if initialization fails
     pub(crate) async fn init_plugins(self: Arc<Self>, configs: Vec<PluginConfig>) -> Result<()> {
+        self.init_plugins_with_runtime_controls(configs, cfg!(feature = "api"))
+            .await
+    }
+
+    pub(crate) async fn init_plugins_with_runtime_controls(
+        self: Arc<Self>,
+        configs: Vec<PluginConfig>,
+        matcher_runtime_controls_enabled: bool,
+    ) -> Result<()> {
         use crate::plugin::dependency;
 
         let mut seen_tags = HashMap::new();
@@ -311,7 +320,12 @@ impl PluginRegistry {
                 .cloned()
                 .unwrap_or_default();
             let plugin_info = self
-                .create_plugin_info_and_init(plugin_config, factory.as_ref(), &create_context)
+                .create_plugin_info_and_init(
+                    plugin_config,
+                    factory.as_ref(),
+                    &create_context,
+                    matcher_runtime_controls_enabled,
+                )
                 .await?;
             // DashMap allows insertion even with Arc<Self>
             if self
@@ -340,6 +354,7 @@ impl PluginRegistry {
         config: &PluginConfig,
         factory: &dyn PluginFactory,
         context: &PluginCreateContext,
+        matcher_runtime_controls_enabled: bool,
     ) -> Result<PluginInfo> {
         // Factory creates uninitialized plugin
         let init_context = PluginInitContext::new(self.clone(), config.tag.clone(), context);
@@ -354,14 +369,19 @@ impl PluginRegistry {
             PluginHolder::Matcher(matcher) => {
                 #[cfg(feature = "api")]
                 {
-                    let (matcher, control) = attach_runtime_control(matcher);
-                    (
-                        PluginHolder::Matcher(matcher),
-                        Some(PluginRuntimeControl::Matcher(control)),
-                    )
+                    if matcher_runtime_controls_enabled {
+                        let (matcher, control) = attach_runtime_control(matcher);
+                        (
+                            PluginHolder::Matcher(matcher),
+                            Some(PluginRuntimeControl::Matcher(control)),
+                        )
+                    } else {
+                        (PluginHolder::Matcher(matcher), None)
+                    }
                 }
                 #[cfg(not(feature = "api"))]
                 {
+                    let _ = matcher_runtime_controls_enabled;
                     (PluginHolder::Matcher(matcher), None)
                 }
             }

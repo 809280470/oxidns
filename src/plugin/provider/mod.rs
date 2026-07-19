@@ -213,7 +213,7 @@ mod tests {
 
         registry
             .clone()
-            .init_plugins(configs)
+            .init_plugins(configs.clone())
             .await
             .expect("plugin init should succeed");
         plugin::set_current_runtime_for_test(registry.clone()).await;
@@ -299,6 +299,45 @@ mod tests {
         )
         .expect("response should be valid json");
         assert_eq!(payload["enabled"], false);
+
+        let next_reload_count = Arc::new(AtomicUsize::new(0));
+        let mut next_registry = PluginRegistry::new();
+        next_registry.register_factory("qname", DependencyKind::Matcher, Box::new(QnameFactory {}));
+        next_registry.register_factory(
+            "reloadable_provider",
+            DependencyKind::Provider,
+            Box::new(ReloadableProviderFactory {
+                reload_count: next_reload_count.clone(),
+            }),
+        );
+        let next_registry = Arc::new(next_registry);
+        next_registry
+            .clone()
+            .init_plugins(configs)
+            .await
+            .expect("replacement plugin init should succeed");
+        plugin::set_current_runtime_for_test(next_registry).await;
+
+        let uri: Uri = format!("http://{listen}/api/plugins/reloadable/reload")
+            .parse()
+            .expect("uri should parse");
+        let response = client
+            .request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .body(Empty::new())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request on existing connection should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            reload_count.load(Ordering::Relaxed),
+            1,
+            "stale route must not reload the destroyed provider"
+        );
+        assert_eq!(next_reload_count.load(Ordering::Relaxed), 1);
 
         hub.stop().await;
         plugin::reset_runtime_for_test().await;

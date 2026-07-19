@@ -126,6 +126,7 @@ interface AppState {
   outboundMetrics: OutboundMetricsMap;
   trafficMetrics: DnsTrafficMetrics;
   dependencyGraph: DependencyGraphReport | null;
+  runningDependencyGraph: DependencyGraphReport | null;
   matcherControls: Record<string, MatcherControlState>;
   providerReloads: Record<string, ProviderReloadState>;
   configDiagnostics: string[];
@@ -238,6 +239,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     sampleWindowSeconds: null,
   },
   dependencyGraph: null,
+  runningDependencyGraph: null,
   matcherControls: {},
   providerReloads: {},
   configDiagnostics: [],
@@ -306,6 +308,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       configVersion: null,
       runningVersion: null,
       dependencyGraph: null,
+      runningDependencyGraph: null,
       matcherControls: {},
       providerReloads: {},
       configHistory: [],
@@ -324,7 +327,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   exitOfflineMode: () => set({ isOfflineMode: false, offlineFileName: null }),
 
   loadConfig: async () => {
-    set({ isConfigLoading: true, configError: null });
+    set({
+      isConfigLoading: true,
+      configError: null,
+      runningDependencyGraph: null,
+    });
     try {
       const response = await fetchConfigFile();
       applyConfigFileResponse(response, set, get());
@@ -342,6 +349,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         runningVersion: response.version,
       });
       await get().validateCurrentConfig();
+      set({ runningDependencyGraph: get().dependencyGraph });
       await get().refreshRuntimeState();
       await get().refreshMatcherStates();
     } catch (error) {
@@ -376,6 +384,15 @@ export const useAppStore = create<AppState>((set, get) => ({
         : nextSystem
           ? (nextSystem.build ?? null)
           : get().buildInfo;
+    const current = get();
+    const nextRunningVersion =
+      nextReload?.running_version ?? current.runningVersion;
+    const runningDependencyGraph =
+      nextRunningVersion === current.runningVersion
+        ? current.runningDependencyGraph
+        : nextRunningVersion === current.configVersion
+          ? current.dependencyGraph
+          : null;
     set({
       health: health.status === "fulfilled" ? health.value : get().health,
       buildInfo: nextBuildInfo,
@@ -389,6 +406,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       ...(nextReload?.running_version
         ? { runningVersion: nextReload.running_version }
         : {}),
+      runningDependencyGraph,
     });
   },
 
@@ -621,7 +639,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           // authoritative version it reports; fall back to the applied one.
           ...(failed
             ? {}
-            : { runningVersion: snapshot.running_version ?? version }),
+            : {
+                runningVersion: snapshot.running_version ?? version,
+                runningDependencyGraph: get().dependencyGraph,
+              }),
         });
       }
       await get().refreshRuntimeState();

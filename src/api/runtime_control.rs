@@ -12,10 +12,9 @@ use serde::Serialize;
 
 use crate::api::{ApiHandler, ApiRegister, json_error, json_ok};
 use crate::infra::error::Result as DnsResult;
-use crate::plugin::PluginRuntime;
-use crate::plugin::matcher::MatcherRuntimeControl;
 use crate::plugin::provider::{ProviderReloadError, ProviderRuntimeControl};
 use crate::plugin::runtime_control::PluginRuntimeControl;
+use crate::plugin::{PluginRuntime, current_runtime};
 
 #[derive(Debug, Serialize)]
 struct MatcherStatusResponse {
@@ -27,15 +26,29 @@ struct MatcherStatusResponse {
 #[derive(Debug)]
 struct MatcherStatusHandler {
     tag: String,
-    control: Arc<MatcherRuntimeControl>,
     desired: Option<bool>,
+}
+
+fn live_runtime_control(tag: &str) -> Option<PluginRuntimeControl> {
+    current_runtime()?.get_plugin(tag)?.runtime_control()
+}
+
+fn runtime_control_unavailable(tag: &str, kind: &str) -> crate::api::ApiResponse {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "plugin_runtime_control_unavailable",
+        format!("{} runtime control '{}' is not available", kind, tag),
+    )
 }
 
 #[async_trait]
 impl ApiHandler for MatcherStatusHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
+        let Some(PluginRuntimeControl::Matcher(control)) = live_runtime_control(&self.tag) else {
+            return runtime_control_unavailable(&self.tag, "matcher");
+        };
         if let Some(enabled) = self.desired {
-            self.control.set_enabled(enabled);
+            control.set_enabled(enabled);
             tracing::info!(
                 matcher = %self.tag,
                 enabled,
@@ -47,7 +60,7 @@ impl ApiHandler for MatcherStatusHandler {
             &MatcherStatusResponse {
                 ok: true,
                 matcher: self.tag.clone(),
-                enabled: self.control.enabled(),
+                enabled: control.enabled(),
             },
         )
     }
@@ -64,33 +77,42 @@ struct ProviderReloadResponse {
 #[derive(Debug)]
 struct ProviderReloadHandler {
     tag: String,
-    control: Arc<ProviderRuntimeControl>,
 }
 
 #[async_trait]
 impl ApiHandler for ProviderReloadHandler {
     async fn handle(&self, _request: Request<Bytes>) -> crate::api::ApiResponse {
-        match self.control.reload().await {
-            Ok(()) => json_ok(
-                StatusCode::OK,
-                &ProviderReloadResponse {
-                    ok: true,
-                    action: "reload_provider",
-                    provider: self.tag.clone(),
-                    status: "reloaded",
-                },
-            ),
-            Err(error @ ProviderReloadError::Busy { .. }) => json_error(
-                StatusCode::CONFLICT,
-                "provider_reload_busy",
-                error.to_string(),
-            ),
-            Err(ProviderReloadError::Failed(error)) => json_error(
-                StatusCode::BAD_REQUEST,
-                "provider_reload_failed",
-                error.to_string(),
-            ),
-        }
+        let Some(PluginRuntimeControl::Provider(control)) = live_runtime_control(&self.tag) else {
+            return runtime_control_unavailable(&self.tag, "provider");
+        };
+        reload_provider_response(&self.tag, &control).await
+    }
+}
+
+async fn reload_provider_response(
+    tag: &str,
+    control: &ProviderRuntimeControl,
+) -> crate::api::ApiResponse {
+    match control.reload().await {
+        Ok(()) => json_ok(
+            StatusCode::OK,
+            &ProviderReloadResponse {
+                ok: true,
+                action: "reload_provider",
+                provider: tag.to_string(),
+                status: "reloaded",
+            },
+        ),
+        Err(error @ ProviderReloadError::Busy { .. }) => json_error(
+            StatusCode::CONFLICT,
+            "provider_reload_busy",
+            error.to_string(),
+        ),
+        Err(ProviderReloadError::Failed(error)) => json_error(
+            StatusCode::BAD_REQUEST,
+            "provider_reload_failed",
+            error.to_string(),
+        ),
     }
 }
 
@@ -101,12 +123,11 @@ pub(crate) fn register_plugin_runtime_control_routes(
     for (tag, control) in runtime.runtime_controls() {
         let plugin = register.plugin(&tag)?;
         match control {
-            PluginRuntimeControl::Matcher(control) => {
+            PluginRuntimeControl::Matcher(_) => {
                 plugin.get(
                     "/status",
                     Arc::new(MatcherStatusHandler {
                         tag: tag.clone(),
-                        control: control.clone(),
                         desired: None,
                     }),
                 )?;
@@ -114,7 +135,6 @@ pub(crate) fn register_plugin_runtime_control_routes(
                     "/enable",
                     Arc::new(MatcherStatusHandler {
                         tag: tag.clone(),
-                        control: control.clone(),
                         desired: Some(true),
                     }),
                 )?;
@@ -122,13 +142,12 @@ pub(crate) fn register_plugin_runtime_control_routes(
                     "/disable",
                     Arc::new(MatcherStatusHandler {
                         tag,
-                        control,
                         desired: Some(false),
                     }),
                 )?;
             }
-            PluginRuntimeControl::Provider(control) => {
-                plugin.post("/reload", Arc::new(ProviderReloadHandler { tag, control }))?;
+            PluginRuntimeControl::Provider(_) => {
+                plugin.post("/reload", Arc::new(ProviderReloadHandler { tag }))?;
             }
         }
     }
@@ -183,12 +202,7 @@ mod tests {
         let first = tokio::spawn(async move { first_control.reload().await });
         provider.started.notified().await;
 
-        let response = ProviderReloadHandler {
-            tag: "blocking".to_string(),
-            control,
-        }
-        .handle(Request::new(Bytes::new()))
-        .await;
+        let response = reload_provider_response("blocking", &control).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = response
             .into_body()

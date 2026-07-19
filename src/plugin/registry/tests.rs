@@ -44,6 +44,28 @@ fn test_get_nonexistent_plugin() {
     assert!(registry.get_plugin("nonexistent").is_none());
 }
 
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn matcher_runtime_control_is_not_attached_when_api_is_not_running() {
+    let mut registry = PluginRegistry::new();
+    registry.register_factory("qname", DependencyKind::Matcher, Box::new(QnameFactory {}));
+    let registry = Arc::new(registry);
+    let configs = vec![PluginConfig {
+        tag: "match_qname".to_string(),
+        plugin_type: "qname".to_string(),
+        args: Some(serde_yaml_ng::from_str("- example.com").unwrap()),
+    }];
+
+    registry
+        .clone()
+        .init_plugins_with_runtime_controls(configs, false)
+        .await
+        .expect("plugin init should succeed");
+
+    assert!(registry.runtime_controls().is_empty());
+    registry.destroy().await;
+}
+
 #[tokio::test]
 async fn test_init_runtime_failure_leaves_runtime_stopped() {
     let manager = PluginRuntimeManager::new();

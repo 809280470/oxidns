@@ -49,14 +49,21 @@ export function ProviderRuntimeControl({
   const reloadProvider = useAppStore((state) => state.reloadProvider);
   const clearResult = useAppStore((state) => state.clearProviderReloadResult);
   const isOfflineMode = useAppStore((state) => state.isOfflineMode);
-  const dependencyGraph = useAppStore((state) => state.dependencyGraph);
+  const runningDependencyGraph = useAppStore(
+    (state) => state.runningDependencyGraph,
+  );
 
   const pending = Boolean(reloadState?.pending);
   const outcome = reloadState?.outcome ?? "idle";
-  const liveStatus = providerHasLiveDependents(plugin.name, dependencyGraph);
+  const liveStatus = providerHasLiveDependents(
+    plugin.name,
+    runningDependencyGraph,
+  );
   const skipped = liveStatus === false;
   const unavailable =
-    isOfflineMode || appliedStatus === "not-applied" || skipped;
+    isOfflineMode ||
+    appliedStatus === "not-applied" ||
+    liveStatus !== true;
 
   useEffect(() => {
     if (outcome !== "success") return;
