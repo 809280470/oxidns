@@ -334,6 +334,10 @@ mod tests {
             self
         }
 
+        async fn reload(&self) -> DnsResult<()> {
+            Ok(())
+        }
+
         fn contains_name(&self, name: &Name) -> bool {
             name.as_str().eq_ignore_ascii_case(&self.domain)
         }

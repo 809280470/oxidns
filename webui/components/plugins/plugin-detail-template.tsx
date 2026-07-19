@@ -41,6 +41,8 @@ import { PluginConfigModeEditor } from "./plugin-config-mode-editor";
 import { PluginMetricsPanel } from "./plugin-metrics-panel";
 import { PluginDeleteButton } from "./plugin-delete-button";
 import type { PluginReferenceImpact } from "@/lib/plugin-reference-operations";
+import { MatcherRuntimeControl } from "./matcher-runtime-control";
+import { ProviderRuntimeControl } from "./provider-runtime-control";
 
 export function PluginDetailTemplate({
   plugin,
@@ -303,6 +305,13 @@ export function PluginDetailTemplate({
               ))}
             </div>
           )}
+
+          {plugin.type === "matcher" ? (
+            <MatcherRuntimeControl plugin={plugin} mode="detail" />
+          ) : null}
+          {plugin.type === "provider" ? (
+            <ProviderRuntimeControl plugin={plugin} mode="detail" />
+          ) : null}
 
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <Button

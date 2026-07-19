@@ -73,6 +73,7 @@ Paths in this guide are relative to `webui/` unless stated otherwise.
 - Keep typography compact: page headings around `text-lg`, operational labels at `text-sm`/`text-xs`, plugin tags and config keys in mono where useful. Do not use oversized hero typography inside the console.
 - Ensure responsive behavior for desktop and narrow screens with stable grids (`sm`, `lg`, `xl`) and fixed-width side panels only when there is enough viewport room. Avoid layouts where labels, buttons, or badges can overlap.
 - Use semantic status color sparingly: primary for active/healthy emphasis, destructive for dangerous actions, yellow/amber only for unsaved or warning states, muted foreground for secondary metadata.
+- Use the shared `warning` color token and warning component variants for temporary operator interventions such as matcher bypasses; these states require attention but are not runtime errors.
 - Do not add gradient blobs, decorative illustrations, or broad one-color themes. The interface should feel like a precise control surface for OxiDNS.
 
 ## Testing & Documentation

@@ -34,6 +34,7 @@ export default function ConsoleLayout({
   const setHistoryOpen = useAppStore((s) => s.setHistoryOpen);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const refreshMetrics = useAppStore((s) => s.refreshMetrics);
+  const refreshMatcherStates = useAppStore((s) => s.refreshMatcherStates);
   const isOfflineMode = useAppStore((s) => s.isOfflineMode);
   const exitOfflineMode = useAppStore((s) => s.exitOfflineMode);
   const isConnected = useAuthStore((s) => s.isConnected);
@@ -118,6 +119,17 @@ export default function ConsoleLayout({
     }, 3_000);
     return () => clearInterval(id);
   }, [isConnected, refreshMetrics]);
+
+  // Matcher runtime state can change after an out-of-band reload or restart,
+  // so keep the cached control state aligned with the running backend.
+  useEffect(() => {
+    if (!isConnected) return;
+    void refreshMatcherStates();
+    const id = setInterval(() => {
+      void refreshMatcherStates();
+    }, 3_000);
+    return () => clearInterval(id);
+  }, [isConnected, refreshMatcherStates]);
 
   useEffect(() => {
     const el = document.documentElement;

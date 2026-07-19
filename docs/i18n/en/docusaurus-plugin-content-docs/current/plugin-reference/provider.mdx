@@ -9,7 +9,7 @@ Providers turn rule sets from one-off literals into reusable data assets. In lar
 
 Providers with domain or IP match capability can be referenced directly by matchers through `"$tag"` and can also be composed by `domain_set` or `ip_set`. Those composite providers compile only their own local rules and then consult referenced providers at runtime instead of copying downstream rule data into a merged matcher.
 
-Every live provider also registers `POST /plugins/<provider_tag>/reload`, and the `reload_provider` executor can refresh that provider's snapshot in place with the same startup configuration without rebuilding unrelated plugins.
+Every live provider also registers `POST /api/plugins/<provider_tag>/reload`, and the `reload_provider` executor can refresh that provider's snapshot in place with the same startup configuration without rebuilding unrelated plugins. The WebUI exposes the same capability as **Reload data** on provider cards and detail views, with distinct pending, success, failure, and busy feedback.
 
 At runtime, OxiDNS only initializes providers that are actually consumed. If a provider is not referenced directly or indirectly by any `server`, `executor`, or `matcher`, it is skipped during startup, does not appear in the runtime registry, and emits a warning log so the unused configuration is visible.
 
