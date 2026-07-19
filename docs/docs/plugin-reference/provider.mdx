@@ -9,7 +9,7 @@ provider 负责把规则集从“单条规则”提升为“可复用的数据�
 
 支持的数据 provider 既可以被 matcher 直接通过 `"$tag"` 引用，也可以继续被 `domain_set` / `ip_set` 组合，只要它们具备对应的域名或 IP 匹配能力。`domain_set` / `ip_set` 会只编译自己的本地规则，并在运行时继续查询被引用的 provider，不再复制下游 provider 的规则副本。
 
-运行中的 provider 都会注册一个管理接口 `POST /plugins/<provider_tag>/reload`，并可通过 `reload_provider` executor 使用启动时同一份配置刷新自身快照，而不会重建其它插件。
+运行中的 provider 都会注册一个管理接口 `POST /api/plugins/<provider_tag>/reload`，并可通过 `reload_provider` executor 使用启动时同一份配置刷新自身快照，而不会重建其它插件。WebUI 会在 provider 卡片和详情页提供同一能力的“重新加载数据”入口，并区分执行中、成功、失败和 busy 状态。
 
 运行时只会初始化真正被消费到的 provider。如果某个 provider 没有被任何 `server`、`executor`、`matcher` 直接或间接引用，它会在启动阶段被跳过，不会出现在 runtime registry 中，并会输出一条 warning 日志提示该 provider 未被使用。
 

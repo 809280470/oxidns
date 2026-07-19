@@ -9,7 +9,7 @@ import Admonition from "@theme/Admonition";
 
 ## 运行时开启与关闭
 
-`plugins:` 中具有稳定 tag 的 matcher 可以通过管理 API 或 WebUI 在当前 runtime 内开启、关闭和查询状态。关闭后 matcher 不再执行内部逻辑，基础结果固定为 `false`；外层取反仍按原规则应用，因此 `!$matcher` 会得到 `true`。
+`plugins:` 中具有稳定 tag 的 matcher 可以通过管理 API 在当前 runtime 内开启、关闭和查询状态。WebUI 将关闭操作呈现为需要确认的“临时旁路”，旁路后 matcher 不再执行内部逻辑，基础结果固定为 `false`；外层取反仍按原规则应用，因此 `!$matcher` 会得到 `true`。恢复匹配可以一键完成。
 
 该状态不会写入配置，全量 reload 或进程重启后恢复开启。quick-setup matcher 没有稳定的公开 tag，因此不提供运行时开关；需要控制时应先把表达式提取为独立 matcher。接口详情见 [管理 API](../api.mdx#matcher)。
 

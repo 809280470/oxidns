@@ -561,6 +561,8 @@ All three endpoints return the same status shape:
 
 The switch belongs only to the current runtime and is not written to YAML. An application reload or process restart restores the matcher to enabled. Quick-setup matchers inside `sequence` or `any_match` use internal `qs.match...` tags and do not register these endpoints. Extract a quick-setup expression into a standalone matcher under `plugins:` and reference it with `$tag` when runtime control is required.
 
+The WebUI presents disabling as a temporary bypass and explains the different effects on positive and negated references before applying it. Restoring matching does not require editing or reapplying YAML.
+
 ### provider
 
 #### `POST /api/plugins/<provider_tag>/reload`
@@ -591,6 +593,8 @@ Good fit:
 * When the change also updates `config.yaml`, provider topology, the plugin list, or other non-provider structures, `POST /api/reload` is still required.
 
 </Admonition>
+
+The WebUI exposes **Reload data** on every applied provider card and detail view. It does not show a configuration-change confirmation; while the command is running, duplicate requests for the same provider are disabled and the success, failure, or busy result is surfaced inline.
 
 #### `GET /api/plugins/<cache_tag>/dump`
 

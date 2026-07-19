@@ -559,6 +559,8 @@ POST /api/plugins/<matcher_tag>/disable
 
 开关只属于当前 runtime，不写入 YAML；应用级 reload 或进程重启后恢复为开启。`sequence` 和 `any_match` 内的 quick-setup matcher 使用内部 `qs.match...` tag，不注册控制接口。如需运行时控制，应先将其提取为 `plugins:` 中的独立 matcher 并通过 `$tag` 引用。
 
+WebUI 将关闭操作呈现为“临时旁路”，并在执行前明确提示正向引用与取反引用的不同影响；恢复匹配不需要修改或重新应用 YAML。
+
 ### provider
 
 #### `POST /api/plugins/<provider_tag>/reload`
@@ -587,6 +589,8 @@ POST /api/plugins/<matcher_tag>/disable
 注意：
 
 * 如果变更涉及 `config.yaml`、provider 依赖拓扑、插件列表或其它非 provider 结构，仍然需要使用 `POST /api/reload`。
+
+WebUI 在所有已应用的 provider 卡片和详情页中提供“重新加载数据”操作。该操作不会弹出配置变更确认；执行期间会阻止同一 provider 的重复请求，并展示成功、失败或 busy 结果。
 
 #### `GET /api/plugins/<cache_tag>/dump`
 

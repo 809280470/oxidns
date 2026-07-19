@@ -23,6 +23,7 @@ import {
   fetchSystem,
   requestReload,
   requestRestart,
+  reloadProvider as requestProviderReload,
   saveConfigFile,
   setMatcherEnabled as requestMatcherEnabled,
   validateConfigText,
@@ -32,6 +33,7 @@ import {
   type ControlResponse,
   type DependencyGraphReport,
   type HealthResponse,
+  ProviderReloadBusyError,
   type ReloadSnapshot,
   type SystemResponse,
 } from "./oxidns-api";
@@ -79,6 +81,10 @@ import {
   reconcileMatcherControls,
   type MatcherControlState,
 } from "./matcher-control";
+import {
+  reconcileProviderReloads,
+  type ProviderReloadState,
+} from "./provider-reload";
 
 type StoreSet = (
   partial: Partial<AppState> | ((state: AppState) => Partial<AppState>),
@@ -121,6 +127,7 @@ interface AppState {
   trafficMetrics: DnsTrafficMetrics;
   dependencyGraph: DependencyGraphReport | null;
   matcherControls: Record<string, MatcherControlState>;
+  providerReloads: Record<string, ProviderReloadState>;
   configDiagnostics: string[];
   configHistory: ConfigSnapshot[];
   selectedPlugin: PluginInstance | null;
@@ -170,6 +177,8 @@ interface AppState {
   clearConfigHistory: () => void;
   togglePluginPin: (id: string) => void;
   setMatcherEnabled: (id: string, enabled: boolean) => Promise<void>;
+  reloadProvider: (id: string) => Promise<void>;
+  clearProviderReloadResult: (id: string) => void;
   reorderPlugins: (orderedVisibleIds: string[]) => Promise<void>;
   updatePluginConfig: (id: string, config: Record<string, unknown>) => void;
   previewPluginDelete: (id: string) => Promise<PluginDeletePreview>;
@@ -230,6 +239,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   dependencyGraph: null,
   matcherControls: {},
+  providerReloads: {},
   configDiagnostics: [],
   configHistory: [],
   selectedPlugin: null,
@@ -275,6 +285,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       yamlConfig: config,
       plugins,
       matcherControls: reconcileMatcherControls(plugins, get().matcherControls),
+      providerReloads: reconcileProviderReloads(plugins, get().providerReloads),
       selectedPlugin: syncSelectedPlugin(get().selectedPlugin, plugins),
       configError: parsed.diagnostics[0] ?? null,
       configDiagnostics: parsed.diagnostics,
@@ -296,6 +307,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       runningVersion: null,
       dependencyGraph: null,
       matcherControls: {},
+      providerReloads: {},
       configHistory: [],
       reloadStatus: null,
       health: null,
@@ -773,6 +785,90 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  reloadProvider: async (id) => {
+    const plugin = get().plugins.find((candidate) => candidate.id === id);
+    if (!plugin || plugin.type !== "provider") return;
+    const current = get().providerReloads[plugin.name];
+    if (current?.pending) return;
+
+    set((state) => ({
+      providerReloads: {
+        ...state.providerReloads,
+        [plugin.name]: {
+          pending: true,
+          outcome: "idle",
+        },
+      },
+    }));
+
+    try {
+      await requestProviderReload(plugin.name);
+      set((state) => {
+        if (
+          !state.plugins.some(
+            (candidate) =>
+              candidate.type === "provider" && candidate.name === plugin.name,
+          )
+        )
+          return {};
+        return {
+          providerReloads: {
+            ...state.providerReloads,
+            [plugin.name]: {
+              pending: false,
+              outcome: "success",
+            },
+          },
+        };
+      });
+    } catch (error) {
+      const message =
+        error instanceof ProviderReloadBusyError
+          ? tClient(WEBUI.plugins.providerReloadBusy)
+          : error instanceof Error
+            ? error.message
+            : tClient(WEBUI.plugins.providerReloadFailed);
+      set((state) => {
+        if (
+          !state.plugins.some(
+            (candidate) =>
+              candidate.type === "provider" && candidate.name === plugin.name,
+          )
+        )
+          return {};
+        return {
+          providerReloads: {
+            ...state.providerReloads,
+            [plugin.name]: {
+              pending: false,
+              outcome: "error",
+              error: message,
+            },
+          },
+        };
+      });
+      throw error;
+    }
+  },
+
+  clearProviderReloadResult: (id) => {
+    const plugin = get().plugins.find((candidate) => candidate.id === id);
+    if (!plugin || plugin.type !== "provider") return;
+    set((state) => {
+      const current = state.providerReloads[plugin.name];
+      if (!current || current.pending || current.outcome === "idle") return {};
+      return {
+        providerReloads: {
+          ...state.providerReloads,
+          [plugin.name]: {
+            pending: false,
+            outcome: "idle",
+          },
+        },
+      };
+    });
+  },
+
   // Reorder plugins in the config file to match a drag-and-drop arrangement.
   // `orderedVisibleIds` is the new order of the *currently visible* cards
   // (a single type tab, or all of them). Plugins outside that visible subset
@@ -1056,6 +1152,17 @@ function applyConfigFileResponse(
           },
         ]),
     ),
+    providerReloads: Object.fromEntries(
+      plugins
+        .filter((plugin) => plugin.type === "provider")
+        .map((plugin) => [
+          plugin.name,
+          {
+            pending: false,
+            outcome: "idle" as const,
+          },
+        ]),
+    ),
     selectedPlugin: syncSelectedPlugin(state.selectedPlugin, plugins),
     configError: parsed.diagnostics[0] ?? null,
     configDiagnostics: parsed.diagnostics,
@@ -1090,6 +1197,7 @@ function syncPluginsToConfig(
   return {
     plugins,
     matcherControls: reconcileMatcherControls(plugins, state.matcherControls),
+    providerReloads: reconcileProviderReloads(plugins, state.providerReloads),
     configModel,
     configText,
     yamlConfig: configText,
@@ -1114,6 +1222,7 @@ function applyConfigModelToState(
   return {
     plugins,
     matcherControls: reconcileMatcherControls(plugins, state.matcherControls),
+    providerReloads: reconcileProviderReloads(plugins, state.providerReloads),
     configModel,
     configText,
     yamlConfig: configText,

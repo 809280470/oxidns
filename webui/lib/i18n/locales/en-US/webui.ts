@@ -171,13 +171,42 @@ export const enUSWebui = {
     timeRangeIncomplete: "Start and end time must be set together",
     timeRangeEqual: "Start and end time must be different",
     timeRangeInvalid: "Time must use the HH:MM format",
-    matcherRuntimeControl: "Runtime matching",
-    matcherEnable: "Enable matcher",
-    matcherDisable: "Disable matcher",
+    matcherRuntimeControl: "Runtime control",
+    matcherRuntimeNormal: "Participating normally",
+    matcherRuntimeNormalDescription:
+      "This matcher is participating in rule evaluation as configured.",
+    matcherBypassed: "Temporarily bypassed",
+    matcherBypassedDescription:
+      "This matcher currently returns false without running its internal predicate.",
+    matcherBypassAction: "Temporarily bypass",
+    matcherRestoreAction: "Restore matching",
+    matcherBypassConfirmTitle: "Temporarily bypass {tag}?",
+    matcherBypassConfirmDescription:
+      "This only affects the current runtime and does not modify the configuration.",
+    matcherBypassPositiveImpact:
+      "Conditions referencing {reference} will no longer match.",
+    matcherBypassNegatedImpact:
+      "Conditions referencing {reference} will match.",
+    matcherBypassResetHint:
+      "An application reload or process restart restores normal matching.",
+    matcherBypassConfirmAction: "Confirm temporary bypass",
     matcherControlLoading: "Loading matcher runtime state",
     matcherControlUnavailable:
       "The matcher runtime API is unavailable; apply the config or check the backend version",
     matcherControlFailed: "Failed to update matcher runtime state",
+    providerRuntimeControl: "Runtime control",
+    providerReloadDescription:
+      "Reread this provider's data using its startup configuration without rebuilding other plugins.",
+    providerReloadReady: "Ready to reload",
+    providerReloadAction: "Reload data",
+    providerReloadPending: "Reloading data",
+    providerReloadSuccess: "Reloaded successfully",
+    providerReloadFailed: "Reload failed",
+    providerReloadBusy: "This provider is already reloading; try again shortly",
+    providerReloadNotApplied: "Apply the current configuration first",
+    providerReloadUnavailable: "Unavailable in offline mode",
+    providerReloadTopologyHint:
+      "This does not apply YAML, tag, or dependency-topology changes; those changes still require an application reload.",
   },
   pluginTypes: {
     server: "Server",

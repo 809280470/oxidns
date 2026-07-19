@@ -98,6 +98,15 @@ export interface MatcherStatusResponse {
   enabled: boolean;
 }
 
+export interface ProviderReloadResponse {
+  ok: boolean;
+  action: "reload_provider";
+  provider: string;
+  status: "reloaded";
+}
+
+export class ProviderReloadBusyError extends Error {}
+
 export type ProcessMemoryKind =
   | "rss"
   | "private_working_set"
@@ -534,6 +543,28 @@ export async function setMatcherEnabled(
     },
   );
   return readJsonResponse<MatcherStatusResponse>(response);
+}
+
+export async function reloadProvider(
+  tag: string,
+): Promise<ProviderReloadResponse> {
+  const response = await fetch(
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/reload`),
+    {
+      method: "POST",
+      headers: apiHeaders(),
+    },
+  );
+  try {
+    return await readJsonResponse<ProviderReloadResponse>(response);
+  } catch (error) {
+    if (response.status === 409) {
+      throw new ProviderReloadBusyError(
+        error instanceof Error ? error.message : "Provider reload is busy",
+      );
+    }
+    throw error;
+  }
 }
 
 export async function fetchCacheEntries(

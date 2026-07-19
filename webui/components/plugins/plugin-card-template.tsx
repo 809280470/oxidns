@@ -20,7 +20,8 @@ import type { PluginCardTemplateProps } from "./types";
 import { pluginTypeColors, pluginTypeIcons } from "./display";
 import { getPluginCatalogItem, renderPluginKindIcon } from "./catalog";
 import { PluginDeleteButton } from "./plugin-delete-button";
-import { MatcherRuntimeSwitch } from "./matcher-runtime-switch";
+import { MatcherRuntimeControl } from "./matcher-runtime-control";
+import { ProviderRuntimeControl } from "./provider-runtime-control";
 
 export function PluginCardTemplate({
   plugin,
@@ -32,6 +33,9 @@ export function PluginCardTemplate({
   const { locale, t } = useI18n();
   const { setSelectedPlugin, setDetailOpen, togglePluginPin } = useAppStore();
   const series = useAppStore((s) => s.pluginMetrics[plugin.name]);
+  const matcherControl = useAppStore((s) =>
+    plugin.type === "matcher" ? s.matcherControls[plugin.name] : undefined,
+  );
   const buildInfo = useAppStore((s) => s.buildInfo);
   const cardMetrics = selectCardMetrics(series, plugin.pluginKind, 4, locale);
   const showFallbackContent = cardMetrics.length === 0 && Boolean(children);
@@ -41,6 +45,9 @@ export function PluginCardTemplate({
     plugin.type,
     plugin.pluginKind,
   );
+  const matcherBypassed =
+    matcherControl?.availability === "ready" &&
+    matcherControl.enabled === false;
   const resolvedIcon =
     icon ??
     (definition
@@ -59,6 +66,8 @@ export function PluginCardTemplate({
       className={cn(
         "group flex h-full min-h-[9.25rem] cursor-pointer flex-col transition-all hover:border-primary/50 hover:shadow-md",
         plugin.pinned && "border-primary/30",
+        matcherBypassed &&
+          "border-warning/40 bg-warning/5 hover:border-warning/60",
         !supported && "border-dashed opacity-70",
       )}
       aria-disabled={!supported}
@@ -109,7 +118,12 @@ export function PluginCardTemplate({
               </div>
             </div>
           )}
-          <MatcherRuntimeSwitch plugin={plugin} />
+          {plugin.type === "matcher" ? (
+            <MatcherRuntimeControl plugin={plugin} />
+          ) : null}
+          {plugin.type === "provider" ? (
+            <ProviderRuntimeControl plugin={plugin} />
+          ) : null}
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
