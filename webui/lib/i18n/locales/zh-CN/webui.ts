@@ -972,6 +972,7 @@ export const zhCNWebui = {
     checkUpdates: "检查更新",
     upgrading: "升级中…",
     upgradeNow: "立即升级",
+    forceUpgradeNow: "强制升级",
     upgradeProgressTitle: "正在升级 OxiDNS",
     upgradeProgressDesc:
       "后端正在应用新版本，完成后会自动重新连接。请不要刷新或关闭页面。",
@@ -1013,6 +1014,8 @@ export const zhCNWebui = {
       "无论是否保存，Token 都会随检查/升级请求发送到当前后端；建议使用 fine-grained token，并仅授予目标仓库读取权限。",
     allowPrerelease: "允许预发布版本",
     allowPrereleaseDesc: "包含 alpha/beta/rc 等预发布标签",
+    forceUpgrade: "强制升级",
+    forceUpgradeDesc: "忽略版本比较并重新安装所选发布版本",
     autoCheck: "自动检查更新",
     autoCheckDesc: "连接后台时按上次检查时间判断，成功后 24 小时内不重复查询",
     cliCommand: "等效 CLI 命令",

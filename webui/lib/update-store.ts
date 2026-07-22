@@ -36,6 +36,7 @@ export interface UpgradeConfig {
   githubToken: string;
   persistGithubToken: boolean;
   allowPrerelease: boolean;
+  force: boolean;
   autoCheck: boolean;
 }
 
@@ -47,6 +48,7 @@ export const DEFAULT_UPGRADE_CONFIG: UpgradeConfig = {
   githubToken: "",
   persistGithubToken: false,
   allowPrerelease: false,
+  force: false,
   autoCheck: true,
 };
 
@@ -147,6 +149,7 @@ function pickPersistedUpgradeConfig(
     ...(config.allowPrerelease !== undefined
       ? { allowPrerelease: config.allowPrerelease }
       : {}),
+    ...(config.force !== undefined ? { force: config.force } : {}),
     ...(config.autoCheck !== undefined ? { autoCheck: config.autoCheck } : {}),
   };
 }
@@ -335,6 +338,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
         socks5: upgradeConfig.socks5 || undefined,
         githubToken: upgradeConfig.githubToken.trim() || undefined,
         allowPrerelease: upgradeConfig.allowPrerelease,
+        force: upgradeConfig.force,
       });
       const installedVersion = await pollUpgradeCompletion({
         baseline,

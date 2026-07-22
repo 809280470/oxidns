@@ -98,4 +98,15 @@ describe("update-check persistence", () => {
 
     expect(apiMocks.fetchUpgradeCheck).toHaveBeenCalledTimes(2);
   });
+
+  it("persists the force-upgrade preference", async () => {
+    const firstModule = await import("./update-store");
+    firstModule.useUpdateStore.getState().setUpgradeConfig({ force: true });
+
+    vi.resetModules();
+    const secondModule = await import("./update-store");
+    expect(secondModule.useUpdateStore.getState().upgradeConfig.force).toBe(
+      true,
+    );
+  });
 });

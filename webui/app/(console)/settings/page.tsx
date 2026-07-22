@@ -504,6 +504,9 @@ export default function SettingsPage() {
     if (upgradeConfig.allowPrerelease) {
       parts.push("--allow-prerelease");
     }
+    if (upgradeConfig.force) {
+      parts.push("--force");
+    }
     return parts.join(" ");
   };
 
@@ -1960,21 +1963,27 @@ export default function SettingsPage() {
                           ? t(WEBUI.settings.checkingUpdates)
                           : t(WEBUI.settings.checkUpdates)}
                       </Button>
-                      {updateInfo?.updateAvailable && (
-                        <Button
-                          onClick={() => void triggerUpgrade()}
-                          disabled={isApplying || isRestarting}
-                        >
-                          {isApplying ? (
-                            <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
-                          ) : (
-                            <ArrowUpCircle className="h-4 w-4 mr-1.5" />
-                          )}
-                          {isApplying
-                            ? t(WEBUI.settings.upgrading)
-                            : t(WEBUI.settings.upgradeNow)}
-                        </Button>
-                      )}
+                      {updateInfo &&
+                        (updateInfo.updateAvailable || upgradeConfig.force) && (
+                          <Button
+                            variant={
+                              upgradeConfig.force ? "warning" : "default"
+                            }
+                            onClick={() => void triggerUpgrade()}
+                            disabled={isApplying || isRestarting}
+                          >
+                            {isApplying ? (
+                              <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
+                            ) : (
+                              <ArrowUpCircle className="h-4 w-4 mr-1.5" />
+                            )}
+                            {isApplying
+                              ? t(WEBUI.settings.upgrading)
+                              : upgradeConfig.force
+                                ? t(WEBUI.settings.forceUpgradeNow)
+                                : t(WEBUI.settings.upgradeNow)}
+                          </Button>
+                        )}
                     </div>
                   )}
 
@@ -2159,6 +2168,23 @@ export default function SettingsPage() {
                           checked={upgradeConfig.allowPrerelease}
                           onCheckedChange={(v) =>
                             setUpgradeConfig({ allowPrerelease: v })
+                          }
+                        />
+                      </div>
+                      <div className="flex items-center justify-between gap-4">
+                        <div>
+                          <p className="text-sm font-medium">
+                            {t(WEBUI.settings.forceUpgrade)}
+                          </p>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            {t(WEBUI.settings.forceUpgradeDesc)}
+                          </p>
+                        </div>
+                        <Switch
+                          aria-label={t(WEBUI.settings.forceUpgrade)}
+                          checked={upgradeConfig.force}
+                          onCheckedChange={(v) =>
+                            setUpgradeConfig({ force: v })
                           }
                         />
                       </div>

@@ -1018,6 +1018,7 @@ export const enUSWebui = {
     checkUpdates: "Check for Updates",
     upgrading: "Upgrading…",
     upgradeNow: "Upgrade Now",
+    forceUpgradeNow: "Force Upgrade",
     upgradeProgressTitle: "Upgrading OxiDNS",
     upgradeProgressDesc:
       "The backend is applying the new release and will reconnect automatically. Do not refresh or close this page.",
@@ -1062,6 +1063,9 @@ export const enUSWebui = {
     allowPrerelease: "Allow Pre-release Versions",
     allowPrereleaseDesc:
       "Includes pre-release tags such as alpha, beta, and rc",
+    forceUpgrade: "Force upgrade",
+    forceUpgradeDesc:
+      "Ignore version comparison and reinstall the selected release.",
     autoCheck: "Auto-check for Updates",
     autoCheckDesc:
       "Check on connection only when due; successful checks are reused for 24 hours",
