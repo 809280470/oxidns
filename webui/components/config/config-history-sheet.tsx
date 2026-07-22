@@ -43,7 +43,7 @@ export function ConfigHistorySheet({
   open,
   onOpenChange,
 }: ConfigHistorySheetProps) {
-  const { t } = useI18n();
+  const { t, formatDateTime } = useI18n();
   const configHistory = useAppStore((s) => s.configHistory);
   const configText = useAppStore((s) => s.configText);
   const configVersion = useAppStore((s) => s.configVersion);
@@ -95,7 +95,7 @@ export function ConfigHistorySheet({
                     <div className="min-w-0 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="text-sm font-medium">
-                          {new Date(entry.createdAt).toLocaleString()}
+                          {formatDateTime(entry.createdAt)}
                         </span>
                         {isRunning && (
                           <Badge

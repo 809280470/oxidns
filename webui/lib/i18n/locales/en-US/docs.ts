@@ -373,28 +373,52 @@ export const enUSDocs = {
       "- Type: `integer`; Required: No; Default: Implementation determined\n- Function: Define the IPv4/IPv6 prefix length separately under compatible writing methods.",
   },
   ros_route: {
-    address: "- Type: `string`; Required: yes\n- RouterOS API endpoint, usually `host:port`.",
+    address:
+      "- Type: `string`; Required: yes\n- RouterOS API endpoint, usually `host:port`.",
     username: "- Type: `string`; Required: yes\n- RouterOS API login username.",
     password: "- Type: `string`; Required: yes\n- RouterOS API login password.",
-    connect_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API connection timeout in seconds; must be greater than `0`.",
-    send_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API command-send timeout in seconds; must be greater than `0`.",
-    receive_timeout: "- Type: `u64`; Default: `5`\n- RouterOS API per-response-chunk timeout in seconds; must be greater than `0`.",
-    async: "- Type: `bool`; Default: `true`\n- `true` queues background synchronization; `false` waits for one attempt for the current observation without changing the DNS response.",
-    wait_timeout: "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout.",
-    queue_capacity: "- Type: `usize`; Default: `16384`\n- Independently limits distinct route keys in ingress and retry stages.",
-    routing_table: "- Type: `string`; Required: yes\n- Target policy-routing table; the plugin does not create tables or routing rules.",
-    gateway4: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv4 route next hop.",
-    gateway6: "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
+    tls: "- Type: `object`; Default: disabled\n- Enables RouterOS API-SSL, typically on port 8729.",
+    "tls.server_name":
+      "- Type: `string`; Default: derived from the connection address\n- Server name used for the TLS handshake.",
+    "tls.ca":
+      "- Type: `string`; Default: system trust store\n- Path to a custom CA certificate file.",
+    "tls.insecure":
+      "- Type: `bool`; Default: `false`\n- Skips TLS certificate verification; use only in controlled test environments.",
+    connect_timeout:
+      "- Type: `u64`; Default: `5`\n- RouterOS API connection timeout in seconds; must be greater than `0`.",
+    send_timeout:
+      "- Type: `u64`; Default: `5`\n- RouterOS API command-send timeout in seconds; must be greater than `0`.",
+    receive_timeout:
+      "- Type: `u64`; Default: `5`\n- RouterOS API per-response-chunk timeout in seconds; must be greater than `0`.",
+    async:
+      "- Type: `bool`; Default: `true`\n- `true` queues background synchronization; `false` waits for one attempt for the current observation without changing the DNS response.",
+    wait_timeout:
+      "- Type: `duration`; Default: `8s`\n- With `async: false`, limits waiting while accepted work continues after timeout.",
+    queue_capacity:
+      "- Type: `usize`; Default: `16384`\n- Independently limits distinct route keys in ingress and retry stages.",
+    routing_table:
+      "- Type: `string`; Required: yes\n- Target policy-routing table; the plugin does not create tables or routing rules.",
+    gateway4:
+      "- Type: `string`; Required: one of gateway4/gateway6\n- IPv4 route next hop.",
+    gateway6:
+      "- Type: `string`; Required: one of gateway4/gateway6\n- IPv6 route next hop.",
     distance: "- Type: `u8`; Default: `100`\n- RouterOS static-route distance.",
-    comment_prefix: "- Type: `string`; Default: `oxi`\n- Route-comment ownership prefix; it and the plugin tag cannot contain `;` or `=`.",
-    "persistent.ips": "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes. Persistent routes are desired state recovered at startup and reconciled every 180 seconds.",
-    "persistent.files": "- Type: `array<string>`\n- Read only during plugin initialization or reload; periodic reconcile uses the in-memory set and never rereads files.",
-    min_ttl: "- Type: `u32`; Default: `60`\n- Minimum clamp for dynamic DNS-route TTLs.",
-    max_ttl: "- Type: `u32`; Default: `3600`\n- Maximum clamp for dynamic DNS-route TTLs.",
-    fixed_ttl: "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry. Missing IPs in later answers are not withdrawn. Dynamic routes refresh only after a later DNS observation reaches the threshold and are excluded from periodic reconcile.",
+    comment_prefix:
+      "- Type: `string`; Default: `oxi`\n- Route-comment ownership prefix; it and the plugin tag cannot contain `;` or `=`.",
+    "persistent.ips":
+      "- Type: `array<string>`\n- DNS-independent persistent IP/CIDR routes. Persistent routes are desired state recovered at startup and reconciled every 180 seconds.",
+    "persistent.files":
+      "- Type: `array<string>`\n- Read only during plugin initialization or reload; periodic reconcile uses the in-memory set and never rereads files.",
+    min_ttl:
+      "- Type: `u32`; Default: `60`\n- Minimum clamp for dynamic DNS-route TTLs.",
+    max_ttl:
+      "- Type: `u32`; Default: `3600`\n- Maximum clamp for dynamic DNS-route TTLs.",
+    fixed_ttl:
+      "- Type: `u32`; Default: none\n- Overrides dynamic DNS-route TTL; `0` disables time-based expiry. Missing IPs in later answers are not withdrawn. Dynamic routes refresh only after a later DNS observation reaches the threshold and are excluded from periodic reconcile.",
     conntrack_guard:
       "- Type: `bool`; Default: `false`\n- Checks exact destination IPs before deleting expired dynamic `/32` and `/128` routes. Active connections or query failures defer deletion for 30 seconds. Persistent and shutdown cleanup bypass the guard.",
-    cleanup_on_shutdown: "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin during normal shutdown and application-level reload, with a 30-second total cleanup budget. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance. Set it to `false` when policy continuity is required.",
+    cleanup_on_shutdown:
+      "- Type: `bool`; Default: `true`\n- Remove dynamic and persistent routes owned by this plugin during normal shutdown and application-level reload, with a 30-second total cleanup budget. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance. Set it to `false` when policy continuity is required.",
   },
   ros_address_list: {
     address:
@@ -403,6 +427,13 @@ export const enUSDocs = {
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the RouterOS API login username. This account needs to have permission to read and maintain the target `address-list`.\n- Configuration suggestions: It is recommended to create a dedicated account for this plug-in to isolate the scope of permissions and audit records.",
     password:
       "- Type: `string`; Required: Yes; Default: None\n- Function: Specify the RouterOS API login password. Plugin initialization, reconnection, and background synchronization all rely on this credential.\n- Note: Direct exposure of real passwords in public repositories or shared samples should be avoided.",
+    tls: "- Type: `object`; Default: disabled\n- Enables RouterOS API-SSL, typically on port 8729.",
+    "tls.server_name":
+      "- Type: `string`; Default: derived from the connection address\n- Specifies the server name used for the TLS handshake.",
+    "tls.ca":
+      "- Type: `string`; Default: system trust store\n- Specifies a custom CA certificate file.",
+    "tls.insecure":
+      "- Type: `bool`; Default: `false`\n- Skips TLS certificate verification; use only in controlled test environments.",
     connect_timeout:
       "- Type: `u64`; Required: No; Default: `5`\n- Function: Specify the maximum wait time, in seconds, for establishing a RouterOS API connection.\n- Note: Must be greater than `0`. Increase it if the management network or RouterOS API occasionally responds slowly.",
     send_timeout:

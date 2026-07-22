@@ -25,7 +25,7 @@ export function PluginMetricsPanel({ tag }: { tag: string }) {
           {t(WEBUI.plugins.metricsTitle)}
         </CardTitle>
         <Badge variant="outline" className="font-mono text-[11px]">
-          {rows.length} metrics
+          {t(WEBUI.plugins.metricCount, { count: rows.length })}
         </Badge>
       </CardHeader>
       <CardContent className="space-y-2 p-4 pt-0">

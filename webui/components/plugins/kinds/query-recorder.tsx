@@ -227,7 +227,7 @@ function QueryRecordsPanel({ tag }: { tag: string }) {
 }
 
 function QueryRecordsPanelInner({ tag }: { tag: string }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [records, setRecords] = useState<QueryRecordRow[]>([]);
   const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [matcherStats, setMatcherStats] = useState<
@@ -834,7 +834,7 @@ function QueryRecordsPanelInner({ tag }: { tag: string }) {
                       {record.client_ip}
                     </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">
-                      {formatTime(record.created_at_ms)}
+                      {formatTime(record.created_at_ms, locale)}
                     </TableCell>
                     <TableCell>{queryStatusBadge(record)}</TableCell>
                     <TableCell className="font-mono">
@@ -970,7 +970,7 @@ function MatcherStatsCard({
           <Table className="min-w-[680px]">
             <TableHeader>
               <TableRow className="bg-muted/30 hover:bg-muted/30">
-                <TableHead>Matcher</TableHead>
+                <TableHead>{t(WEBUI.queryRecorder.matcherColumn)}</TableHead>
                 <TableHead>{t(WEBUI.queryRecorder.checkedColumn)}</TableHead>
                 <TableHead>{t(WEBUI.queryRecorder.hitColumn)}</TableHead>
                 <TableHead>{t(WEBUI.queryRecorder.hitRateColumn)}</TableHead>
@@ -1370,7 +1370,7 @@ function TopBucketsCard({
               })}
             </span>
             <span className="rounded-full border bg-muted/30 px-2 py-0.5">
-              Top {chartData.length}
+              {t(WEBUI.queryRecorder.topCount, { count: chartData.length })}
             </span>
           </div>
         </div>
@@ -1977,7 +1977,7 @@ function TimeseriesCard({
   filters: QueryRecordFilters;
   defaultBucket: QueryRecorderTimeseriesBucket;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [data, setData] = useState<QueryRecorderTimeseriesResponse | null>(
     null,
   );
@@ -2038,9 +2038,9 @@ function TimeseriesCard({
     const items = data?.points ?? [];
     return items.map((point) => ({
       ...point,
-      label: formatBucketLabel(point.bucket_ms, bucket),
+      label: formatBucketLabel(point.bucket_ms, bucket, locale),
     }));
-  }, [data, bucket]);
+  }, [data, bucket, locale]);
 
   return (
     <Card className="mt-3">
@@ -2213,7 +2213,7 @@ function RecordDetailDialog({
   record: QueryRecordDetail | null;
   onClose: () => void;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const dependencyGraph = useAppStore((state) => state.dependencyGraph);
   const plugins = useAppStore((state) => state.plugins);
 
@@ -2222,7 +2222,9 @@ function RecordDetailDialog({
       open={Boolean(record)}
       onOpenChange={(open) => !open && onClose()}
       title={t(WEBUI.queryRecorder.detailTitle, { id: record?.id ?? "" })}
-      subtitle={record ? formatFullTime(record.created_at_ms) : undefined}
+      subtitle={
+        record ? formatFullTime(record.created_at_ms, locale) : undefined
+      }
       status={record ? queryStatusBadge(record) : undefined}
       summaryItems={
         record
@@ -2545,28 +2547,38 @@ function flag(value: unknown) {
   return value ? "1" : "0";
 }
 
-function formatTime(ms: number) {
-  return new Date(ms).toLocaleTimeString([], {
+function formatTime(ms: number, locale: ReturnType<typeof useI18n>["locale"]) {
+  return new Date(ms).toLocaleTimeString(locale, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
   });
 }
 
-function formatFullTime(ms: number) {
-  return new Date(ms).toLocaleString();
+function formatFullTime(
+  ms: number,
+  locale: ReturnType<typeof useI18n>["locale"],
+) {
+  return new Date(ms).toLocaleString(locale);
 }
 
-function formatBucketLabel(ms: number, bucket: QueryRecorderTimeseriesBucket) {
+function formatBucketLabel(
+  ms: number,
+  bucket: QueryRecorderTimeseriesBucket,
+  locale: ReturnType<typeof useI18n>["locale"],
+) {
   const date = new Date(ms);
   if (bucket === "hour") {
-    return date.toLocaleString([], {
+    return date.toLocaleString(locale, {
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
     });
   }
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return date.toLocaleTimeString(locale, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function truncateMiddle(value: string, max: number) {
