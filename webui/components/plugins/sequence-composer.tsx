@@ -496,7 +496,7 @@ function SequenceExpandedCanvas({
             <GitBranch className="h-4 w-4 text-primary" />
             <span>{t(WEBUI.sequence.canvasTitle)}</span>
             <Badge variant="secondary" className="font-mono">
-              {rules.length} rules
+              {t(WEBUI.sequence.ruleCountValue, { count: rules.length })}
             </Badge>
           </div>
           <div className="mt-0.5 text-xs text-muted-foreground">

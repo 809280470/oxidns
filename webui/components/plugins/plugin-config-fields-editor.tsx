@@ -1617,7 +1617,7 @@ function RecordFieldEditor({
               onChange={(event) =>
                 updateItem(item.id, { key: event.target.value })
               }
-              placeholder={field.keyPlaceholder ?? "key"}
+              placeholder={field.keyPlaceholder ?? t(WEBUI.common.key)}
               className="font-mono text-sm"
               disabled={readOnly}
             />
@@ -1626,7 +1626,9 @@ function RecordFieldEditor({
               onChange={(event) =>
                 updateItem(item.id, { value: event.target.value })
               }
-              placeholder={field.valuePlaceholder ?? "value"}
+              placeholder={
+                field.valuePlaceholder ?? t(WEBUI.plugins.valueLabel)
+              }
               className="font-mono text-sm"
               disabled={readOnly}
             />
@@ -1936,6 +1938,8 @@ function ArrayItemInput({
   onChange: (patch: Partial<ArrayItemValue>) => void;
   readOnly: boolean;
 }) {
+  const { t } = useI18n();
+
   if (item.syntax === "plugin") {
     const referenceTypes = item.referenceTypes ?? inferReferenceTypes(field);
     const canInvert = referenceTypes.includes("matcher");
@@ -1977,7 +1981,9 @@ function ArrayItemInput({
     <Input
       value={item.value}
       onChange={(event) => onChange({ value: event.target.value })}
-      placeholder={field.placeholder?.split("\n")[0] ?? "value"}
+      placeholder={
+        field.placeholder?.split("\n")[0] ?? t(WEBUI.plugins.valueLabel)
+      }
       className="font-mono text-sm"
       disabled={readOnly}
     />

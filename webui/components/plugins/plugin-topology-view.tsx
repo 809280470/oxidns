@@ -572,7 +572,7 @@ function RootSelector({
 // ─── Legend panel ─────────────────────────────────────────────────────────────
 
 function TopologyLegend() {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   return (
     <div className="rounded-lg border bg-card/90 p-2.5 text-[11px] shadow-sm backdrop-blur-sm">
       <div className="mb-1.5 font-semibold text-muted-foreground">
@@ -585,17 +585,19 @@ function TopologyLegend() {
       <div className="grid grid-cols-2 gap-x-3 gap-y-1">
         {(
           [
-            { kind: "server", label: "Server" },
-            { kind: "executor", label: "Executor" },
-            { kind: "matcher", label: "Matcher" },
-            { kind: "provider", label: "Provider" },
+            { kind: "server" },
+            { kind: "executor" },
+            { kind: "matcher" },
+            { kind: "provider" },
           ] as const
-        ).map(({ kind, label }) => (
+        ).map(({ kind }) => (
           <div key={kind} className="flex items-center gap-1.5">
             <div
               className={cn("h-2.5 w-2.5 rounded-sm", kindAccentBgClass(kind))}
             />
-            <span className="text-foreground">{label}</span>
+            <span className="text-foreground">
+              {pluginTypeLabel(kind, locale)}
+            </span>
           </div>
         ))}
       </div>
@@ -791,7 +793,7 @@ function SequenceFlowNode({
               <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                 {rule.matches.length === 0 ? (
                   <span className="rounded bg-muted/60 px-1.5 py-0.5 text-[10px] italic text-muted-foreground">
-                    always
+                    {t(WEBUI.topology.always)}
                   </span>
                 ) : (
                   rule.matches.map((expression) => {

@@ -331,7 +331,7 @@ function OutboundRuntimeMetricsPanel({
 }
 
 export default function SettingsPage() {
-  const { t } = useI18n();
+  const { t, formatDateTime } = useI18n();
   const serverConfig = useAuthStore((s) => s.serverConfig);
   const setServerConfig = useAuthStore((s) => s.setServerConfig);
   const connect = useAuthStore((s) => s.connect);
@@ -611,6 +611,7 @@ export default function SettingsPage() {
     const outboundConfig = buildNetworkOutboundConfig(
       outboundDefault,
       outboundProfiles,
+      t,
     );
     if (outboundConfig) {
       nextNetwork.outbound = outboundConfig;
@@ -1874,7 +1875,9 @@ export default function SettingsPage() {
                         label={t(WEBUI.settings.lastCheckedLabel)}
                         value={
                           lastCheckedAt
-                            ? new Date(lastCheckedAt).toLocaleTimeString()
+                            ? formatDateTime(lastCheckedAt, {
+                                timeStyle: "medium",
+                              })
                             : "-"
                         }
                       />
@@ -2318,6 +2321,7 @@ function parseOutboundProfiles(
 function buildNetworkOutboundConfig(
   defaultProfile: string,
   profiles: OutboundProfileForm[],
+  t: ReturnType<typeof useI18n>["t"],
 ): Record<string, unknown> | undefined {
   if (profiles.length === 0) return undefined;
   const namedProfiles = profiles.map((profile) => ({
@@ -2327,10 +2331,14 @@ function buildNetworkOutboundConfig(
   const seenProfileNames = new Set<string>();
   for (const profile of namedProfiles) {
     if (!profile.name) {
-      throw new Error("outbound profile name cannot be empty");
+      throw new Error(t(WEBUI.settings.outboundProfileNameRequired));
     }
     if (seenProfileNames.has(profile.name)) {
-      throw new Error(`duplicate outbound profile name '${profile.name}'`);
+      throw new Error(
+        t(WEBUI.settings.outboundProfileNameDuplicate, {
+          name: profile.name,
+        }),
+      );
     }
     seenProfileNames.add(profile.name);
   }
