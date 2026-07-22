@@ -1,12 +1,26 @@
 import type { PluginInstance } from "./types";
 
 export type MatcherControlAvailability = "loading" | "ready" | "unavailable";
+export type MatcherRuntimeMode = "normal" | "force_miss" | "force_hit";
+export type ForcedMatcherRuntimeMode = Exclude<MatcherRuntimeMode, "normal">;
+
+export type MatcherModeChangePlan =
+  | { kind: "apply"; mode: "normal" }
+  | { kind: "confirm"; mode: ForcedMatcherRuntimeMode };
 
 export interface MatcherControlState {
   availability: MatcherControlAvailability;
   pending: boolean;
-  enabled: boolean | null;
+  mode: MatcherRuntimeMode | null;
   error?: string;
+}
+
+export function planMatcherModeChange(
+  mode: MatcherRuntimeMode,
+): MatcherModeChangePlan {
+  return mode === "normal"
+    ? { kind: "apply", mode }
+    : { kind: "confirm", mode };
 }
 
 export function reconcileMatcherControls(
@@ -21,7 +35,7 @@ export function reconcileMatcherControls(
         current[plugin.name] ?? {
           availability: "unavailable" as const,
           pending: false,
-          enabled: null,
+          mode: null,
         },
       ]),
   );

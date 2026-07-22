@@ -46,8 +46,8 @@ pub mod string_exp;
 pub mod time;
 pub mod true_matcher;
 
-#[cfg(feature = "api")]
-pub(crate) use control::{MatcherRuntimeControl, attach_runtime_control};
+#[cfg(any(feature = "api", test))]
+pub(crate) use control::{MatcherRuntimeControl, MatcherRuntimeMode};
 
 #[allow(dead_code)]
 pub trait Matcher: Plugin {
@@ -61,11 +61,69 @@ pub struct MatcherRef {
     matcher: Arc<dyn Matcher>,
     /// Whether matcher result should be logically negated (`!matcher`).
     reverse: bool,
+    /// Optional runtime override shared by all references to a configured tag.
+    #[cfg(any(feature = "api", test))]
+    runtime_control: Option<Arc<MatcherRuntimeControl>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum MatcherEvaluation {
+    Matched,
+    NotMatched,
+    #[cfg(any(feature = "api", test))]
+    ForceHit,
+    #[cfg(any(feature = "api", test))]
+    ForceMiss,
+}
+
+impl MatcherEvaluation {
+    #[inline]
+    pub(crate) fn is_match(self) -> bool {
+        match self {
+            Self::Matched => true,
+            Self::NotMatched => false,
+            #[cfg(any(feature = "api", test))]
+            Self::ForceHit => true,
+            #[cfg(any(feature = "api", test))]
+            Self::ForceMiss => false,
+        }
+    }
+
+    #[cfg(feature = "_sequence-step-recording")]
+    #[inline]
+    pub(crate) fn outcome(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::NotMatched => "not_matched",
+            #[cfg(any(feature = "api", test))]
+            Self::ForceHit => "force_hit",
+            #[cfg(any(feature = "api", test))]
+            Self::ForceMiss => "force_miss",
+        }
+    }
 }
 
 impl MatcherRef {
     pub fn new(matcher: Arc<dyn Matcher>, reverse: bool) -> Self {
-        Self { matcher, reverse }
+        Self {
+            matcher,
+            reverse,
+            #[cfg(any(feature = "api", test))]
+            runtime_control: None,
+        }
+    }
+
+    #[cfg(any(feature = "api", test))]
+    pub(crate) fn with_runtime_control(
+        matcher: Arc<dyn Matcher>,
+        reverse: bool,
+        runtime_control: Arc<MatcherRuntimeControl>,
+    ) -> Self {
+        Self {
+            matcher,
+            reverse,
+            runtime_control: Some(runtime_control),
+        }
     }
 
     pub fn tag(&self) -> &str {
@@ -73,8 +131,25 @@ impl MatcherRef {
     }
 
     pub fn is_match(&self, context: &mut DnsContext) -> bool {
+        self.evaluate(context).is_match()
+    }
+
+    pub(crate) fn evaluate(&self, context: &mut DnsContext) -> MatcherEvaluation {
+        #[cfg(any(feature = "api", test))]
+        if let Some(control) = &self.runtime_control {
+            match control.mode() {
+                MatcherRuntimeMode::ForceMiss => return MatcherEvaluation::ForceMiss,
+                MatcherRuntimeMode::ForceHit => return MatcherEvaluation::ForceHit,
+                MatcherRuntimeMode::Normal => {}
+            }
+        }
+
         let matched = self.matcher.is_match(context);
-        if self.reverse { !matched } else { matched }
+        if matched != self.reverse {
+            MatcherEvaluation::Matched
+        } else {
+            MatcherEvaluation::NotMatched
+        }
     }
 }
 

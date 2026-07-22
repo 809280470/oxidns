@@ -22,6 +22,8 @@ import {
   GitBranch,
   Play,
   RotateCcw,
+  CheckCircle2,
+  XCircle,
   X,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -49,7 +51,12 @@ import {
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 
-type MatchStatus = "matched" | "not_matched" | "unchecked";
+type MatchStatus =
+  | "matched"
+  | "not_matched"
+  | "force_hit"
+  | "force_miss"
+  | "unchecked";
 type ActionStatus =
   | "not_executed"
   | "entered"
@@ -241,6 +248,12 @@ export function QueryRecordFlowCanvas({
         </span>
         <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-rose-700 dark:text-rose-300">
           {t(WEBUI.queryRecordFlow.notMatched)}
+        </span>
+        <span className="rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-destructive">
+          {t(WEBUI.queryRecordFlow.forceHit)}
+        </span>
+        <span className="rounded-full border border-warning/40 bg-warning/10 px-2 py-0.5 text-warning-foreground">
+          {t(WEBUI.queryRecordFlow.forceMiss)}
         </span>
         <span className="rounded-full border bg-muted/30 px-2 py-0.5">
           {t(WEBUI.queryRecordFlow.unchecked)}
@@ -574,7 +587,8 @@ function SequenceRuleRow({
     runtime,
   );
   const missed = matchStatuses.some(
-    (status) => status.status === "not_matched",
+    (status) =>
+      status.status === "not_matched" || status.status === "force_miss",
   );
   const ran = actionStatus.status !== "not_executed";
 
@@ -980,11 +994,12 @@ function getMatchStatus(
     : [];
   const last = events[events.length - 1];
   const status: MatchStatus =
-    last?.outcome === "matched"
-      ? "matched"
-      : last?.outcome === "not_matched"
-        ? "not_matched"
-        : "unchecked";
+    last?.outcome === "matched" ||
+    last?.outcome === "not_matched" ||
+    last?.outcome === "force_hit" ||
+    last?.outcome === "force_miss"
+      ? last.outcome
+      : "unchecked";
   return { status, events, runtimeTag };
 }
 
@@ -1153,6 +1168,12 @@ function InvertMark() {
 function matchStatusIcon(status: MatchStatus) {
   if (status === "matched") return <Check className="h-3 w-3 shrink-0" />;
   if (status === "not_matched") return <X className="h-3 w-3 shrink-0" />;
+  if (status === "force_hit") {
+    return <CheckCircle2 className="h-3 w-3 shrink-0" />;
+  }
+  if (status === "force_miss") {
+    return <XCircle className="h-3 w-3 shrink-0" />;
+  }
   return <Circle className="h-3 w-3 shrink-0" />;
 }
 
@@ -1165,6 +1186,8 @@ function actionStatusIcon(status: ActionStatus) {
 function matchStatusLabel(status: MatchStatus, t: TFn) {
   if (status === "matched") return t(WEBUI.queryRecordFlow.matched);
   if (status === "not_matched") return t(WEBUI.queryRecordFlow.notMatched);
+  if (status === "force_hit") return t(WEBUI.queryRecordFlow.forceHit);
+  if (status === "force_miss") return t(WEBUI.queryRecordFlow.forceMiss);
   return t(WEBUI.queryRecordFlow.unchecked);
 }
 
@@ -1191,6 +1214,12 @@ function matchStatusClass(status: MatchStatus) {
   }
   if (status === "not_matched") {
     return "border-rose-500/30 bg-rose-500/10 text-rose-700 hover:border-rose-500/60 dark:text-rose-300";
+  }
+  if (status === "force_hit") {
+    return "border-destructive/40 bg-destructive/10 text-destructive hover:border-destructive/70";
+  }
+  if (status === "force_miss") {
+    return "border-warning/40 bg-warning/10 text-warning-foreground hover:border-warning/70";
   }
   return "border-border bg-muted/30 text-muted-foreground hover:border-primary/40";
 }

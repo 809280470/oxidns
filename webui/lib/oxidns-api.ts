@@ -2,6 +2,7 @@
 
 import { useAuthStore } from "./auth-store";
 import { WEBUI, tClient } from "./i18n";
+import type { MatcherRuntimeMode } from "./matcher-control";
 
 export interface ConfigFileResponse {
   ok: boolean;
@@ -95,7 +96,7 @@ export interface ControlResponse {
 export interface MatcherStatusResponse {
   ok: boolean;
   matcher: string;
-  enabled: boolean;
+  mode: MatcherRuntimeMode;
 }
 
 export interface ProviderReloadResponse {
@@ -530,16 +531,16 @@ export async function fetchMatcherStatus(
   return readJsonResponse<MatcherStatusResponse>(response);
 }
 
-export async function setMatcherEnabled(
+export async function setMatcherMode(
   tag: string,
-  enabled: boolean,
+  mode: MatcherRuntimeMode,
 ): Promise<MatcherStatusResponse> {
-  const action = enabled ? "enable" : "disable";
   const response = await fetch(
-    apiUrl(`/plugins/${encodeURIComponent(tag)}/${action}`),
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/mode`),
     {
       method: "POST",
-      headers: apiHeaders(),
+      headers: { ...apiHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
     },
   );
   return readJsonResponse<MatcherStatusResponse>(response);

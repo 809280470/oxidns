@@ -7,11 +7,21 @@ import Admonition from "@theme/Admonition";
 
 Matcher plugins return `true` or `false`. They are mainly used by `sequence.matches`.
 
-## Runtime Enable and Disable
+## Runtime Modes
 
-Matchers declared in `plugins:` with stable tags can be enabled, disabled, and inspected through the management API for the current runtime. The WebUI presents disabling as a confirmed temporary bypass. A bypassed matcher skips its internal predicate and produces a base result of `false`; outer negation still applies, so `!$matcher` evaluates to `true`. Normal matching can be restored with one action.
+Matchers declared in `plugins:` with stable tags can be inspected and switched among three modes for the current runtime:
 
-This state is not written to the configuration, and a full reload or process restart restores the matcher to enabled. Quick-setup matchers do not have stable public tags and therefore do not expose runtime switches; extract the expression into a standalone matcher when control is required. See the [Management API](../api.mdx#matcher) for endpoint details.
+| Mode | `$matcher` | `!$matcher` |
+| --- | --- | --- |
+| `normal` | Use the matcher result | Negate the matcher result |
+| `force_miss` | Miss | Miss |
+| `force_hit` | Hit | Hit |
+
+Both forced modes override the final result of a direct reference, skip the internal predicate, and bypass outer negation. The WebUI requires confirmation for both forced actions; restoring `normal` does not require confirmation.
+
+A forced mode applies only to direct references to that tag. For example, forcing one child of `any_match` to miss makes only that child contribute `false`; other children still participate normally. Control the `any_match` tag itself when the entire composition must be overridden.
+
+This state is not written to the configuration, and a full reload or process restart restores `normal`. Quick-setup matchers do not have stable public tags and therefore do not expose runtime modes; extract the expression into a standalone matcher when control is required. See the [Management API](../api.mdx#matcher) for endpoint details.
 
 ## Matcher Expression Rules
 
