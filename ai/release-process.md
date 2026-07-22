@@ -103,11 +103,24 @@ step 1. The upgrade notes must mention:
 
 ## 4. Prepare GitHub Release Notes
 
-Prepare the Markdown body that will be pasted into the GitHub Release after the
-tag workflow publishes artifacts. Keep it shorter than the full documentation
-release notes, but make it complete enough for operators deciding whether to
-upgrade. After versions, docs, GitHub Release text, and validation are all
-complete, provide the final Chinese Markdown body to the maintainer for review.
+Update `.github/release-notes.md` for the intended tag. This fixed file is
+overwritten during every release preparation, while Git history retains the
+previous versions. The reviewed release description therefore becomes part of
+the tagged source instead of a manual post-publication edit. The first line
+must be `# OxiDNS vX.Y.Z`; the tag workflow rejects a missing, empty, or
+mismatched file.
+
+Keep this file shorter than the full documentation release notes, but make it
+complete enough for operators deciding whether to upgrade. The tag workflow
+uses it in two places:
+
+- `softprops/action-gh-release` prepends it to GitHub's generated release notes,
+  which remain at the end for merged pull requests, contributors, and the full
+  changelog link.
+- The Telegram notification uses the same file verbatim, followed by the
+  GitHub Release URL. If the resulting message exceeds Telegram's 4096
+  character limit, the workflow truncates the curated text while preserving a
+  truncation notice and the full Release link.
 
 Use this standard Chinese template. A small number of emoji is allowed when it
 improves scanability:
@@ -150,10 +163,9 @@ Generation rules:
 - Do not paste the full website release card verbatim; GitHub Release text
   should be concise and action-oriented.
 
-The workflow creates the GitHub Release with generated release notes. Treat
-that generated text as an initial body: apply the reviewed Chinese release body
-before announcement, or edit the published release immediately after the
-workflow completes.
+Do not include a hand-written `What's Changed`, contributor list, or full
+changelog link in this file; GitHub appends those generated sections during the
+workflow.
 
 ## 5. Confirm The Release Artifact Contract
 
@@ -200,6 +212,11 @@ oxidns-standard-<target>.tar.gz
 - Docker images are built from the published full musl archives for amd64 and
   arm64, then combined into multi-architecture manifests for Docker Hub and
   GHCR.
+- The Telegram release notification is sent to the `Announcements` forum topic
+  using `.github/release-notes.md`, then pinned there.
+  Configure `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and the topic's numeric
+  `TELEGRAM_ANNOUNCEMENTS_THREAD_ID` as repository Actions secrets. The bot
+  must be an administrator with permission to post and pin messages.
 - The reusable custom-build workflow must keep target-to-runner, build-tool,
   archive naming, and WebUI packaging rules aligned with `release.yml`.
 
@@ -235,6 +252,9 @@ Also verify before tagging:
 - `Cargo.toml` package version equals the intended `vX.Y.Z` tag without the
   leading `v`.
 - `Cargo.lock` contains the intended root and changed workspace crate versions.
+- `.github/release-notes.md` starts with the matching version heading and
+  contains only the curated notes. Keep it concise enough to avoid unnecessary
+  truncation in the Telegram announcement.
 - `oxidns build-info` reports the expected bundle/features for any locally
   built release candidate.
 - `oxidns check` accepts the packaged full and minimal example configs under
@@ -251,7 +271,7 @@ complete, hand the final state to the maintainer with:
 
 - A concise summary of the release-prep changes.
 - The validation commands that were actually run.
-- The final Chinese GitHub Release Markdown body.
+- The reviewed `.github/release-notes.md` content.
 - Suggested manual commit and tag commands.
 
 Suggested commit message:
@@ -269,7 +289,7 @@ git tag vX.Y.Z
 
 The GitHub release workflow is triggered by pushing tags matching `v*`.
 The maintainer should only push the tag after reviewing the release-prep commit
-and GitHub Release text.
+and versioned release-notes file.
 
 Before pushing, verify the tag points at the reviewed release commit:
 
@@ -309,7 +329,8 @@ Verify that:
   on the release asset digest for SHA256 verification.
 - Docker Hub and GHCR expose the expected version and architecture manifests.
 - The published crate version and repository/tag metadata are correct.
-- The final Chinese release body and both documentation release cards agree.
+- The curated prefix of the final GitHub Release, its versioned release-notes
+  file, the Telegram announcement, and both documentation release cards agree.
 
 Keep a short publication record with the tag commit, workflow URL, validation
 commands, and any platform not manually smoke-tested.

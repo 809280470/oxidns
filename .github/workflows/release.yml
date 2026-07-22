@@ -392,6 +392,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [release, slim-release]
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
       - name: Download all release artifacts
         uses: actions/download-artifact@v8
         with:
@@ -403,6 +406,24 @@ jobs:
         run: |
           find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.deb" \) | sort
 
+      - name: Validate release notes
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          RELEASE_NOTES_PATH=".github/release-notes.md"
+          if [[ ! -s "$RELEASE_NOTES_PATH" ]]; then
+            echo "::error::Missing release notes: ${RELEASE_NOTES_PATH}"
+            exit 1
+          fi
+
+          EXPECTED_TITLE="# OxiDNS ${VERSION}"
+          ACTUAL_TITLE=$(head -n 1 "$RELEASE_NOTES_PATH")
+          if [[ "$ACTUAL_TITLE" != "$EXPECTED_TITLE" ]]; then
+            echo "::error::Expected '${EXPECTED_TITLE}' as the first line of ${RELEASE_NOTES_PATH}"
+            exit 1
+          fi
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
@@ -410,6 +431,7 @@ jobs:
             artifacts/*.zip
             artifacts/*.tar.gz
             artifacts/*.deb
+          body_path: .github/release-notes.md
           generate_release_notes: true
           draft: false
 
@@ -417,16 +439,42 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ANNOUNCEMENTS_THREAD_ID: ${{ secrets.TELEGRAM_ANNOUNCEMENTS_THREAD_ID }}
           VERSION: ${{ github.ref_name }}
           RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
         run: |
           set -euo pipefail
-          MESSAGE=$(printf '🎉 OxiDNS %s 已发布\n\n👉 查看更新：%s' "$VERSION" "$RELEASE_URL")
-          curl -sS --fail-with-body \
+          : "${TELEGRAM_BOT_TOKEN:?missing TELEGRAM_BOT_TOKEN}"
+          : "${TELEGRAM_CHAT_ID:?missing TELEGRAM_CHAT_ID}"
+          : "${TELEGRAM_ANNOUNCEMENTS_THREAD_ID:?missing TELEGRAM_ANNOUNCEMENTS_THREAD_ID}"
+
+          RELEASE_NOTES_PATH=".github/release-notes.md"
+          RELEASE_NOTES=$(cat "$RELEASE_NOTES_PATH")
+          RELEASE_LINK=$(printf '\n\n👉 GitHub Release：%s' "$RELEASE_URL")
+          MESSAGE="${RELEASE_NOTES}${RELEASE_LINK}"
+          MESSAGE_LENGTH=$(printf '%s' "$MESSAGE" | wc -m)
+          if (( MESSAGE_LENGTH > 4096 )); then
+            TRUNCATION_NOTICE=$'\n\n…（发布说明过长，已裁剪；完整内容请查看 GitHub Release。）'
+            RESERVED_LENGTH=$(printf '%s' "${TRUNCATION_NOTICE}${RELEASE_LINK}" | wc -m)
+            MAX_RELEASE_NOTES_LENGTH=$((4096 - RESERVED_LENGTH))
+            RELEASE_NOTES="${RELEASE_NOTES:0:MAX_RELEASE_NOTES_LENGTH}"
+            MESSAGE="${RELEASE_NOTES}${TRUNCATION_NOTICE}${RELEASE_LINK}"
+          fi
+
+          SEND_RESPONSE=$(curl -sS --fail-with-body \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "message_thread_id=${TELEGRAM_ANNOUNCEMENTS_THREAD_ID}" \
             --data-urlencode "text=${MESSAGE}" \
-            --data-urlencode "disable_web_page_preview=false"
+            --data-urlencode "disable_web_page_preview=false")
+          MESSAGE_ID=$(jq -er '.result.message_id' <<<"$SEND_RESPONSE")
+
+          PIN_RESPONSE=$(curl -sS --fail-with-body \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/pinChatMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "message_id=${MESSAGE_ID}" \
+            --data-urlencode "disable_notification=true")
+          jq -e '.ok == true and .result == true' >/dev/null <<<"$PIN_RESPONSE"
 
   publish-crate:
     name: Publish to crates.io
