@@ -16,8 +16,15 @@ import {
   type ProcessInstanceBaseline,
 } from "./process-instance";
 import { useAppStore } from "./store";
+import { useAuthStore } from "./auth-store";
+import {
+  isAutomaticUpdateCheckDue,
+  updateCheckOptionsFingerprint,
+  updateCheckRequestKey,
+} from "./update-check-policy";
 
 const STORAGE_KEY = "oxidns:upgrade-config";
+const UPDATE_CHECK_STORAGE_KEY = "oxidns:update-check";
 
 export type UpgradeBundle = "auto" | "full" | "minimal" | "standard";
 
@@ -55,6 +62,13 @@ export interface UpdateInfo {
   releaseUrl: string;
 }
 
+interface PersistedUpdateCheck {
+  requestKey: string;
+  checkedAt: number;
+  succeeded: boolean;
+  updateInfo: UpdateInfo | null;
+}
+
 export type UpgradeApplyPhase =
   | "requesting"
   | "applying"
@@ -75,6 +89,7 @@ interface UpdateState {
 
   setUpgradeConfig: (config: Partial<UpgradeConfig>) => void;
   checkForUpdates: (currentVersion: string) => Promise<void>;
+  checkForUpdatesIfDue: (currentVersion: string) => Promise<void>;
   triggerUpgrade: () => Promise<void>;
   resetApplyState: () => void;
 }
@@ -136,16 +151,85 @@ function pickPersistedUpgradeConfig(
   };
 }
 
+function loadPersistedUpdateCheck(): PersistedUpdateCheck | null {
+  try {
+    const stored = localStorage.getItem(UPDATE_CHECK_STORAGE_KEY);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored) as Partial<PersistedUpdateCheck>;
+    if (
+      typeof parsed.requestKey !== "string" ||
+      typeof parsed.checkedAt !== "number" ||
+      !Number.isFinite(parsed.checkedAt) ||
+      typeof parsed.succeeded !== "boolean"
+    ) {
+      return null;
+    }
+    return {
+      requestKey: parsed.requestKey,
+      checkedAt: parsed.checkedAt,
+      succeeded: parsed.succeeded,
+      updateInfo: isUpdateInfo(parsed.updateInfo) ? parsed.updateInfo : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function savePersistedUpdateCheck(check: PersistedUpdateCheck): void {
+  try {
+    localStorage.setItem(UPDATE_CHECK_STORAGE_KEY, JSON.stringify(check));
+  } catch {
+    // ignore
+  }
+}
+
+function isUpdateInfo(value: unknown): value is UpdateInfo {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<UpdateInfo>;
+  return (
+    typeof candidate.currentVersion === "string" &&
+    typeof candidate.latestVersion === "string" &&
+    typeof candidate.updateAvailable === "boolean" &&
+    typeof candidate.assetName === "string" &&
+    typeof candidate.releaseUrl === "string"
+  );
+}
+
+function createUpdateCheckRequestKey(
+  currentVersion: string,
+  config: UpgradeConfig,
+): string {
+  const backend = useAuthStore
+    .getState()
+    .serverConfig.url.trim()
+    .replace(/\/+$/, "");
+  return updateCheckRequestKey({
+    backend,
+    currentVersion,
+    repository: config.repository,
+    bundle: config.bundle,
+    allowPrerelease: config.allowPrerelease,
+    requestOptionsFingerprint: updateCheckOptionsFingerprint([
+      config.outbound,
+      config.socks5,
+      config.githubToken,
+    ]),
+  });
+}
+
+const initialUpdateCheck =
+  typeof window !== "undefined" ? loadPersistedUpdateCheck() : null;
+
 export const useUpdateStore = create<UpdateState>((set, get) => ({
   upgradeConfig:
     typeof window !== "undefined"
       ? loadUpgradeConfig()
       : { ...DEFAULT_UPGRADE_CONFIG },
-  updateInfo: null,
+  updateInfo: initialUpdateCheck?.updateInfo ?? null,
   isChecking: false,
   isApplying: false,
   applyPhase: null,
-  lastCheckedAt: null,
+  lastCheckedAt: initialUpdateCheck?.checkedAt ?? null,
   lastAppliedVersion: null,
   checkError: null,
   applyError: null,
@@ -157,7 +241,15 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
   },
 
   checkForUpdates: async (currentVersion: string) => {
+    if (get().isChecking) return;
     const { upgradeConfig } = get();
+    const requestKey = createUpdateCheckRequestKey(
+      currentVersion,
+      upgradeConfig,
+    );
+    if (loadPersistedUpdateCheck()?.requestKey !== requestKey) {
+      set({ updateInfo: null });
+    }
     set({ isChecking: true, checkError: null });
     try {
       const result = await fetchUpgradeCheck({
@@ -168,27 +260,54 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
         githubToken: upgradeConfig.githubToken.trim() || undefined,
         allowPrerelease: upgradeConfig.allowPrerelease,
       });
+      const updateInfo = {
+        currentVersion,
+        latestVersion: result.latest_version,
+        updateAvailable: result.update_available,
+        assetName: result.asset_name,
+        releaseUrl: result.release_url,
+      };
+      const checkedAt = Date.now();
       set({
-        updateInfo: {
-          currentVersion,
-          latestVersion: result.latest_version,
-          updateAvailable: result.update_available,
-          assetName: result.asset_name,
-          releaseUrl: result.release_url,
-        },
-        lastCheckedAt: Date.now(),
+        updateInfo,
+        lastCheckedAt: checkedAt,
         isChecking: false,
       });
+      savePersistedUpdateCheck({
+        requestKey,
+        checkedAt,
+        succeeded: true,
+        updateInfo,
+      });
     } catch (error) {
+      const checkedAt = Date.now();
       set({
         checkError:
           error instanceof Error
             ? error.message
             : tClient(WEBUI.storeErrors.updateCheckFailed),
         isChecking: false,
-        lastCheckedAt: Date.now(),
+        lastCheckedAt: checkedAt,
+      });
+      savePersistedUpdateCheck({
+        requestKey,
+        checkedAt,
+        succeeded: false,
+        updateInfo: get().updateInfo,
       });
     }
+  },
+
+  checkForUpdatesIfDue: async (currentVersion: string) => {
+    const state = get();
+    if (state.isChecking) return;
+    const requestKey = createUpdateCheckRequestKey(
+      currentVersion,
+      state.upgradeConfig,
+    );
+    const previous = loadPersistedUpdateCheck();
+    if (!isAutomaticUpdateCheckDue(previous, requestKey)) return;
+    await get().checkForUpdates(currentVersion);
   },
 
   triggerUpgrade: async () => {

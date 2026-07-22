@@ -1008,7 +1008,7 @@ export const zhCNWebui = {
     allowPrerelease: "允许预发布版本",
     allowPrereleaseDesc: "包含 alpha/beta/rc 等预发布标签",
     autoCheck: "自动检查更新",
-    autoCheckDesc: "每次连接后台时自动查询最新版本",
+    autoCheckDesc: "连接后台时按上次检查时间判断，成功后 24 小时内不重复查询",
     cliCommand: "等效 CLI 命令",
     cliCommandDesc:
       "在服务器上以 root 或有权限的用户执行，将自动下载并替换当前二进制文件；为避免泄露，命令中仅显示 Token 占位符",

@@ -1057,7 +1057,7 @@ export const enUSWebui = {
       "Includes pre-release tags such as alpha, beta, and rc",
     autoCheck: "Auto-check for Updates",
     autoCheckDesc:
-      "Automatically check for the latest version on each backend connection",
+      "Check on connection only when due; successful checks are reused for 24 hours",
     cliCommand: "Equivalent CLI Command",
     cliCommandDesc:
       "Run on the server as root or a privileged user. Automatically downloads and replaces the current binary. To avoid leaks, the command shows only a token placeholder.",

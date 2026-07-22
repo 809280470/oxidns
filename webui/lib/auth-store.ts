@@ -17,6 +17,8 @@ export interface AuthState {
   isConnected: boolean;
   isConnecting: boolean;
   isHydrated: boolean;
+  /** Increments after every successful backend connection. */
+  connectionEpoch: number;
   hasAttemptedAutoConnect: boolean;
   connectionError: string | null;
   needsCredentials: boolean;
@@ -43,6 +45,7 @@ export const useAuthStore = create<AuthState>()(
       isConnected: false,
       isConnecting: false,
       isHydrated: false,
+      connectionEpoch: 0,
       hasAttemptedAutoConnect: false,
       connectionError: null,
       needsCredentials: false,
@@ -129,13 +132,14 @@ export const useAuthStore = create<AuthState>()(
               }),
             );
           }
-          set({
+          set((state) => ({
             serverConfig,
             isConnected: true,
             isAuthenticated: true,
             isConnecting: false,
             needsCredentials: false,
-          });
+            connectionEpoch: state.connectionEpoch + 1,
+          }));
           return true;
         } catch (error) {
           set({

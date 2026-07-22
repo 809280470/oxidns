@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { AppHeader } from "@/components/shell/app-header";
 import { SystemMetrics } from "@/components/dashboard/system-metrics";
 import { SortablePluginGrid } from "@/components/plugins/sortable-plugin-grid";
@@ -11,6 +11,12 @@ import { Button } from "@/components/ui/button";
 import { ArrowRight } from "lucide-react";
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
+import { useAuthStore } from "@/lib/auth-store";
+import { useVisiblePolling } from "@/hooks/use-visible-polling";
+import {
+  DASHBOARD_HEALTH_POLL_INTERVAL_MS,
+  DASHBOARD_SYSTEM_POLL_INTERVAL_MS,
+} from "@/lib/polling-policy";
 
 // Dashboard card order is a frontend-only preference: it lives in
 // localStorage and never touches the config file (unlike the plugin center,
@@ -49,7 +55,10 @@ function applyOrder(
 export default function DashboardPage() {
   const { t } = useI18n();
   const plugins = useAppStore((s) => s.plugins);
-  const refreshRuntimeState = useAppStore((s) => s.refreshRuntimeState);
+  const refreshHealthState = useAppStore((s) => s.refreshHealthState);
+  const refreshSystemState = useAppStore((s) => s.refreshSystemState);
+  const isConnected = useAuthStore((s) => s.isConnected);
+  const connectionEpoch = useAuthStore((s) => s.connectionEpoch);
   // Hydrate from localStorage lazily. On the server this is []; the first
   // client render also produces an empty pinned grid (plugins load after
   // mount), so applying a different order here cannot cause a hydration
@@ -58,12 +67,18 @@ export default function DashboardPage() {
     typeof window === "undefined" ? [] : loadDashboardOrder(),
   );
 
-  useEffect(() => {
-    const id = setInterval(() => {
-      void refreshRuntimeState();
-    }, 3_000);
-    return () => clearInterval(id);
-  }, [refreshRuntimeState]);
+  useVisiblePolling(
+    refreshSystemState,
+    DASHBOARD_SYSTEM_POLL_INTERVAL_MS,
+    isConnected,
+    connectionEpoch,
+  );
+  useVisiblePolling(
+    refreshHealthState,
+    DASHBOARD_HEALTH_POLL_INTERVAL_MS,
+    isConnected,
+    connectionEpoch,
+  );
 
   const pinnedPlugins = useMemo(
     () =>

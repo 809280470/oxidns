@@ -12,6 +12,8 @@ export interface DnsTrafficMetrics {
   sampleWindowSeconds: number | null;
 }
 
+export const MAX_DNS_TRAFFIC_SAMPLE_WINDOW_MS = 30_000;
+
 /** Sum inbound requests across every configured DNS server plugin. */
 export function sumServerRequestTotal(metrics: PluginMetricsMap): number {
   let total = 0;
@@ -37,9 +39,13 @@ export function calculateDnsTrafficMetrics(
   previous: RequestCounterSample | null,
   current: RequestCounterSample,
 ): DnsTrafficMetrics {
+  const sampleWindowMs = previous
+    ? current.sampledAtMs - previous.sampledAtMs
+    : 0;
   if (
     !previous ||
-    current.sampledAtMs <= previous.sampledAtMs ||
+    sampleWindowMs <= 0 ||
+    sampleWindowMs > MAX_DNS_TRAFFIC_SAMPLE_WINDOW_MS ||
     current.requestTotal < previous.requestTotal
   ) {
     return {
@@ -50,8 +56,7 @@ export function calculateDnsTrafficMetrics(
     };
   }
 
-  const sampleWindowSeconds =
-    (current.sampledAtMs - previous.sampledAtMs) / 1_000;
+  const sampleWindowSeconds = sampleWindowMs / 1_000;
   return {
     status: "available",
     qps: (current.requestTotal - previous.requestTotal) / sampleWindowSeconds,

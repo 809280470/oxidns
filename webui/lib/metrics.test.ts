@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  MAX_DNS_TRAFFIC_SAMPLE_WINDOW_MS,
   calculateDnsTrafficMetrics,
   sumServerRequestTotal,
 } from "./dashboard-traffic";
@@ -156,6 +157,23 @@ describe("dashboard DNS traffic metrics", () => {
       status: "available",
       qps: null,
       requestTotal: 4,
+      sampleWindowSeconds: null,
+    });
+  });
+
+  it("re-establishes the QPS baseline after a long polling gap", () => {
+    expect(
+      calculateDnsTrafficMetrics(
+        { requestTotal: 100, sampledAtMs: 1_000 },
+        {
+          requestTotal: 1_000,
+          sampledAtMs: 1_000 + MAX_DNS_TRAFFIC_SAMPLE_WINDOW_MS + 1,
+        },
+      ),
+    ).toEqual({
+      status: "available",
+      qps: null,
+      requestTotal: 1_000,
       sampleWindowSeconds: null,
     });
   });
