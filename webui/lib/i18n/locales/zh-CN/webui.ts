@@ -787,6 +787,12 @@ export const zhCNWebui = {
     pause: "暂停",
     waiting: "等待日志…",
     connectingBackend: "正在连接后端…",
+    timeFormat: "时间格式",
+    timeFormatDescription:
+      "支持 YYYY、MM、DD、HH、mm、ss、SSS；默认仅显示时间。",
+    timeFormatPreview: "预览：{value}",
+    showElapsed: "显示应用运行时间",
+    showElapsedDescription: "显示距应用启动的时间，自适应单位并保留毫秒精度。",
   },
   restartOverlay: {
     title: "正在重启 OxiDNS 服务",

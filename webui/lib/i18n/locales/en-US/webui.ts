@@ -821,6 +821,13 @@ export const enUSWebui = {
     pause: "Pause",
     waiting: "Waiting for logs…",
     connectingBackend: "Connecting to backend…",
+    timeFormat: "Time format",
+    timeFormatDescription:
+      "Supports YYYY, MM, DD, HH, mm, ss, and SSS. Time only by default.",
+    timeFormatPreview: "Preview: {value}",
+    showElapsed: "Show process elapsed time",
+    showElapsedDescription:
+      "Show time since startup with adaptive units and millisecond precision.",
   },
   restartOverlay: {
     title: "Restarting OxiDNS service",

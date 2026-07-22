@@ -268,6 +268,11 @@ export const WEBUI = {
     pause: "webui.logs.pause",
     waiting: "webui.logs.waiting",
     connectingBackend: "webui.logs.connectingBackend",
+    timeFormat: "webui.logs.timeFormat",
+    timeFormatDescription: "webui.logs.timeFormatDescription",
+    timeFormatPreview: "webui.logs.timeFormatPreview",
+    showElapsed: "webui.logs.showElapsed",
+    showElapsedDescription: "webui.logs.showElapsedDescription",
   },
   restartOverlay: {
     title: "webui.restartOverlay.title",
