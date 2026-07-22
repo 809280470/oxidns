@@ -348,6 +348,14 @@ jobs:
             --no-default-features \
             --features "${{ matrix.bundle }}"
 
+      - name: Run UPX
+        continue-on-error: true
+        uses: crazy-max/ghaction-upx@v4
+        with:
+          version: v5.0.2
+          files: target/${{ matrix.target }}/release/oxidns
+          args: -q --best --lzma
+
       - name: Package slim release
         shell: bash
         run: |
