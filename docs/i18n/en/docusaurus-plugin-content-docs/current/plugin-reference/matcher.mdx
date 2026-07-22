@@ -14,12 +14,12 @@ Matchers declared in `plugins:` with stable tags can be inspected and switched a
 | Mode | `$matcher` | `!$matcher` |
 | --- | --- | --- |
 | `normal` | Use the matcher result | Negate the matcher result |
-| `force_miss` | Miss | Miss |
-| `force_hit` | Hit | Hit |
+| `always_false` | Miss | Match |
+| `always_true` | Match | Miss |
 
-Both forced modes override the final result of a direct reference, skip the internal predicate, and bypass outer negation. The WebUI requires confirmation for both forced actions; restoring `normal` does not require confirmation.
+Both fixed modes skip the internal predicate and fix its base Boolean value, but every reference still applies its own outer negation. The WebUI requires confirmation for both fixed actions; restoring `normal` does not require confirmation.
 
-A forced mode applies only to direct references to that tag. For example, forcing one child of `any_match` to miss makes only that child contribute `false`; other children still participate normally. Control the `any_match` tag itself when the entire composition must be overridden.
+The runtime mode is shared by matcher tag, while reference semantics remain local to each reference. If the same tag appears as `$matcher` and `!$matcher` in one or more sequences, both references share the fixed base value but their final results remain opposites. Child references in `any_match` follow the same rule; control the `any_match` tag itself when the entire composition must be fixed.
 
 This state is not written to the configuration, and a full reload or process restart restores `normal`. Quick-setup matchers do not have stable public tags and therefore do not expose runtime modes; extract the expression into a standalone matcher when control is required. See the [Management API](../api.mdx#matcher) for endpoint details.
 

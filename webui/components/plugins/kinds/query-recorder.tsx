@@ -2510,7 +2510,9 @@ function recordMatchesFilters(
       !steps?.some(
         (step) =>
           step.kind === "matcher" &&
-          (step.outcome === "matched" || step.outcome === "force_hit") &&
+          (step.outcome === "matched" ||
+            step.outcome === "always_true_matched" ||
+            step.outcome === "always_false_matched") &&
           step.tag === filters.matcherTag,
       )
     ) {

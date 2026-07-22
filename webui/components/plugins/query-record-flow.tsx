@@ -22,8 +22,8 @@ import {
   GitBranch,
   Play,
   RotateCcw,
-  CheckCircle2,
-  XCircle,
+  ToggleLeft,
+  ToggleRight,
   X,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -54,8 +54,10 @@ import { useI18n } from "@/lib/i18n/provider";
 type MatchStatus =
   | "matched"
   | "not_matched"
-  | "force_hit"
-  | "force_miss"
+  | "always_true_matched"
+  | "always_true_not_matched"
+  | "always_false_matched"
+  | "always_false_not_matched"
   | "unchecked";
 type ActionStatus =
   | "not_executed"
@@ -250,10 +252,16 @@ export function QueryRecordFlowCanvas({
           {t(WEBUI.queryRecordFlow.notMatched)}
         </span>
         <span className="rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-destructive">
-          {t(WEBUI.queryRecordFlow.forceHit)}
+          {t(WEBUI.queryRecordFlow.alwaysTrueMatched)}
+        </span>
+        <span className="rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-destructive">
+          {t(WEBUI.queryRecordFlow.alwaysTrueNotMatched)}
         </span>
         <span className="rounded-full border border-warning/40 bg-warning/10 px-2 py-0.5 text-warning-foreground">
-          {t(WEBUI.queryRecordFlow.forceMiss)}
+          {t(WEBUI.queryRecordFlow.alwaysFalseMatched)}
+        </span>
+        <span className="rounded-full border border-warning/40 bg-warning/10 px-2 py-0.5 text-warning-foreground">
+          {t(WEBUI.queryRecordFlow.alwaysFalseNotMatched)}
         </span>
         <span className="rounded-full border bg-muted/30 px-2 py-0.5">
           {t(WEBUI.queryRecordFlow.unchecked)}
@@ -586,9 +594,8 @@ function SequenceRuleRow({
     rule.exec,
     runtime,
   );
-  const missed = matchStatuses.some(
-    (status) =>
-      status.status === "not_matched" || status.status === "force_miss",
+  const missed = matchStatuses.some((status) =>
+    isMissedMatchStatus(status.status),
   );
   const ran = actionStatus.status !== "not_executed";
 
@@ -996,8 +1003,10 @@ function getMatchStatus(
   const status: MatchStatus =
     last?.outcome === "matched" ||
     last?.outcome === "not_matched" ||
-    last?.outcome === "force_hit" ||
-    last?.outcome === "force_miss"
+    last?.outcome === "always_true_matched" ||
+    last?.outcome === "always_true_not_matched" ||
+    last?.outcome === "always_false_matched" ||
+    last?.outcome === "always_false_not_matched"
       ? last.outcome
       : "unchecked";
   return { status, events, runtimeTag };
@@ -1168,11 +1177,11 @@ function InvertMark() {
 function matchStatusIcon(status: MatchStatus) {
   if (status === "matched") return <Check className="h-3 w-3 shrink-0" />;
   if (status === "not_matched") return <X className="h-3 w-3 shrink-0" />;
-  if (status === "force_hit") {
-    return <CheckCircle2 className="h-3 w-3 shrink-0" />;
+  if (status.startsWith("always_true_")) {
+    return <ToggleRight className="h-3 w-3 shrink-0" />;
   }
-  if (status === "force_miss") {
-    return <XCircle className="h-3 w-3 shrink-0" />;
+  if (status.startsWith("always_false_")) {
+    return <ToggleLeft className="h-3 w-3 shrink-0" />;
   }
   return <Circle className="h-3 w-3 shrink-0" />;
 }
@@ -1186,8 +1195,18 @@ function actionStatusIcon(status: ActionStatus) {
 function matchStatusLabel(status: MatchStatus, t: TFn) {
   if (status === "matched") return t(WEBUI.queryRecordFlow.matched);
   if (status === "not_matched") return t(WEBUI.queryRecordFlow.notMatched);
-  if (status === "force_hit") return t(WEBUI.queryRecordFlow.forceHit);
-  if (status === "force_miss") return t(WEBUI.queryRecordFlow.forceMiss);
+  if (status === "always_true_matched") {
+    return t(WEBUI.queryRecordFlow.alwaysTrueMatched);
+  }
+  if (status === "always_true_not_matched") {
+    return t(WEBUI.queryRecordFlow.alwaysTrueNotMatched);
+  }
+  if (status === "always_false_matched") {
+    return t(WEBUI.queryRecordFlow.alwaysFalseMatched);
+  }
+  if (status === "always_false_not_matched") {
+    return t(WEBUI.queryRecordFlow.alwaysFalseNotMatched);
+  }
   return t(WEBUI.queryRecordFlow.unchecked);
 }
 
@@ -1215,13 +1234,17 @@ function matchStatusClass(status: MatchStatus) {
   if (status === "not_matched") {
     return "border-rose-500/30 bg-rose-500/10 text-rose-700 hover:border-rose-500/60 dark:text-rose-300";
   }
-  if (status === "force_hit") {
+  if (status.startsWith("always_true_")) {
     return "border-destructive/40 bg-destructive/10 text-destructive hover:border-destructive/70";
   }
-  if (status === "force_miss") {
+  if (status.startsWith("always_false_")) {
     return "border-warning/40 bg-warning/10 text-warning-foreground hover:border-warning/70";
   }
   return "border-border bg-muted/30 text-muted-foreground hover:border-primary/40";
+}
+
+function isMissedMatchStatus(status: MatchStatus) {
+  return status === "not_matched" || status.endsWith("_not_matched");
 }
 
 function actionStatusClass(status: ActionStatus) {

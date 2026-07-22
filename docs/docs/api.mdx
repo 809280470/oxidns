@@ -557,14 +557,14 @@ POST /api/plugins/<matcher_tag>/mode
 设置模式时提交 JSON 请求体：
 
 ```json
-{ "mode": "force_miss" }
+{ "mode": "always_false" }
 ```
 
-`mode` 支持 `normal`、`force_miss` 和 `force_hit`，重复设置同一模式是幂等操作。两个强制模式都会跳过内部 matcher，并覆盖直接引用的最终表达式结果：`force_miss` 使 `$match_cn` 与 `!$match_cn` 都不命中，`force_hit` 使两者都命中。缺少或不支持的模式返回 `400 invalid_matcher_runtime_mode`。
+`mode` 支持 `normal`、`always_false` 和 `always_true`，重复设置同一模式是幂等操作。两个固定模式都会跳过内部 matcher，并固定 matcher 的基础布尔值；每个引用随后仍独立应用取反。因此 `always_false` 下 `$match_cn` 不命中而 `!$match_cn` 命中，`always_true` 下结果相反。缺少或不支持的模式返回 `400 invalid_matcher_runtime_mode`。
 
 模式只属于当前 runtime，不写入 YAML；应用级 reload 或进程重启后恢复为 `normal`。`sequence` 和 `any_match` 内的 quick-setup matcher 使用内部 `qs.match...` tag，不注册控制接口。如需运行时控制，应先将其提取为 `plugins:` 中的独立 matcher 并通过 `$tag` 引用。
 
-WebUI 对 `force_miss` 与 `force_hit` 都要求二次确认；恢复 `normal` 不需要确认。旧的 `/enable`、`/disable` 接口和 `enabled` 响应字段已经移除，API 客户端必须迁移到 `/mode`。
+WebUI 对 `always_false` 与 `always_true` 都要求二次确认；恢复 `normal` 不需要确认。旧的 `/enable`、`/disable` 接口和 `enabled` 响应字段已经移除，API 客户端必须迁移到 `/mode`。
 
 ### provider
 

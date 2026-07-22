@@ -183,28 +183,28 @@ export const enUSWebui = {
     matcherRuntimeNormal: "Participating normally",
     matcherRuntimeNormalDescription:
       "This matcher is participating in rule evaluation as configured.",
-    matcherForceMiss: "Forced miss",
-    matcherForceMissDescription:
-      "Every direct reference to this matcher currently misses without running its internal predicate.",
-    matcherForceMissAction: "Force miss",
-    matcherForceHit: "Forced hit",
-    matcherForceHitDescription:
-      "Every direct reference to this matcher currently hits without running its internal predicate.",
-    matcherForceHitAction: "Force hit",
+    matcherAlwaysFalse: "Fixed to false",
+    matcherAlwaysFalseDescription:
+      "This matcher's base result is fixed to false; each reference still applies its own negation.",
+    matcherAlwaysFalseAction: "Fix to false",
+    matcherAlwaysTrue: "Fixed to true",
+    matcherAlwaysTrueDescription:
+      "This matcher's base result is fixed to true; each reference still applies its own negation.",
+    matcherAlwaysTrueAction: "Fix to true",
     matcherModeActions: "Matcher runtime mode",
     matcherRestoreAction: "Restore matching",
-    matcherForceMissConfirmTitle: "Force {tag} to miss?",
-    matcherForceMissConfirmDescription:
+    matcherAlwaysFalseConfirmTitle: "Fix {tag}'s base result to false?",
+    matcherAlwaysFalseConfirmDescription:
       "This skips the internal predicate, affects only the current runtime, and does not modify configuration.",
-    matcherForceMissImpact:
-      "Conditions directly referencing {positive} and {negative} will both miss.",
-    matcherForceMissConfirmAction: "Confirm forced miss",
-    matcherForceHitConfirmTitle: "Force {tag} to hit?",
-    matcherForceHitConfirmDescription:
-      "This skips the internal predicate, may activate multiple policy branches, and affects only the current runtime.",
-    matcherForceHitImpact:
-      "Conditions directly referencing {positive} and {negative} will both hit.",
-    matcherForceHitConfirmAction: "Confirm forced hit",
+    matcherAlwaysFalseImpact:
+      "{positive} will miss; {negative} will match after negation.",
+    matcherAlwaysFalseConfirmAction: "Confirm fixed false",
+    matcherAlwaysTrueConfirmTitle: "Fix {tag}'s base result to true?",
+    matcherAlwaysTrueConfirmDescription:
+      "This skips the internal predicate, may activate policy branches that reference it, and affects only the current runtime.",
+    matcherAlwaysTrueImpact:
+      "{positive} will match; {negative} will miss after negation.",
+    matcherAlwaysTrueConfirmAction: "Confirm fixed true",
     matcherModeResetHint:
       "An application reload or process restart restores normal matching.",
     matcherControlLoading: "Loading matcher runtime state",
@@ -434,8 +434,10 @@ export const enUSWebui = {
     eventCount: "{count} events",
     matched: "Matched",
     notMatched: "Not matched",
-    forceHit: "Forced hit",
-    forceMiss: "Forced miss",
+    alwaysTrueMatched: "Fixed true · matched",
+    alwaysTrueNotMatched: "Fixed true · negated miss",
+    alwaysFalseMatched: "Fixed false · negated match",
+    alwaysFalseNotMatched: "Fixed false · missed",
     unchecked: "Unchecked",
     topologyUnavailable:
       "Config topology is unavailable; showing events in recorded order.",

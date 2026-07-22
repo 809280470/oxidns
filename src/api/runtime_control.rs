@@ -78,7 +78,7 @@ impl ApiHandler for MatcherModeHandler {
                     StatusCode::BAD_REQUEST,
                     "invalid_matcher_runtime_mode",
                     format!(
-                        "request body must contain mode normal, force_miss, or force_hit: {err}"
+                        "request body must contain mode normal, always_false, or always_true: {err}"
                     ),
                 );
             }

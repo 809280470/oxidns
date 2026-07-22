@@ -28,7 +28,7 @@ function plugin(
 }
 
 describe("matcher runtime state", () => {
-  it.each(["force_miss", "force_hit"] as const)(
+  it.each(["always_false", "always_true"] as const)(
     "requires confirmation before applying %s",
     (mode) => {
       expect(planMatcherModeChange(mode)).toEqual({ kind: "confirm", mode });
@@ -46,7 +46,7 @@ describe("matcher runtime state", () => {
     const ready: MatcherControlState = {
       availability: "ready",
       pending: false,
-      mode: "force_miss",
+      mode: "always_false",
     };
     const controls = reconcileMatcherControls(
       [

@@ -559,14 +559,14 @@ Both endpoints return the same status shape:
 Set the mode with a JSON request body:
 
 ```json
-{ "mode": "force_miss" }
+{ "mode": "always_false" }
 ```
 
-Supported values are `normal`, `force_miss`, and `force_hit`; setting the current mode again is idempotent. Both forced modes skip the internal matcher and override the final result of a direct reference: `force_miss` makes both `$match_cn` and `!$match_cn` miss, while `force_hit` makes both hit. A missing or unsupported mode returns `400 invalid_matcher_runtime_mode`.
+Supported values are `normal`, `always_false`, and `always_true`; setting the current mode again is idempotent. Both fixed modes skip the internal matcher and fix its base Boolean value, after which each reference still applies its own negation. With `always_false`, `$match_cn` misses and `!$match_cn` matches; `always_true` produces the opposite results. A missing or unsupported mode returns `400 invalid_matcher_runtime_mode`.
 
 The mode belongs only to the current runtime and is not written to YAML. An application reload or process restart restores `normal`. Quick-setup matchers inside `sequence` or `any_match` use internal `qs.match...` tags and do not register these endpoints. Extract a quick-setup expression into a standalone matcher under `plugins:` and reference it with `$tag` when runtime control is required.
 
-The WebUI requires confirmation for both `force_miss` and `force_hit`; restoring `normal` does not require confirmation. The old `/enable` and `/disable` endpoints and the `enabled` response field have been removed, so API clients must migrate to `/mode`.
+The WebUI requires confirmation for both `always_false` and `always_true`; restoring `normal` does not require confirmation. The old `/enable` and `/disable` endpoints and the `enabled` response field have been removed, so API clients must migrate to `/mode`.
 
 ### provider
 

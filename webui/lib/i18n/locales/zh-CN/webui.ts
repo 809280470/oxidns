@@ -175,27 +175,26 @@ export const zhCNWebui = {
     matcherRuntimeControl: "运行时控制",
     matcherRuntimeNormal: "正常参与匹配",
     matcherRuntimeNormalDescription: "该 matcher 正在按照配置参与规则判断。",
-    matcherForceMiss: "强制不命中",
-    matcherForceMissDescription:
-      "该 matcher 的所有直接引用当前都不命中，内部匹配逻辑不会执行。",
-    matcherForceMissAction: "强制不命中",
-    matcherForceHit: "强制命中",
-    matcherForceHitDescription:
-      "该 matcher 的所有直接引用当前都会命中，内部匹配逻辑不会执行。",
-    matcherForceHitAction: "强制命中",
+    matcherAlwaysFalse: "固定为 false",
+    matcherAlwaysFalseDescription:
+      "该 matcher 的基础结果固定为 false；各引用仍会独立应用取反。",
+    matcherAlwaysFalseAction: "固定为 false",
+    matcherAlwaysTrue: "固定为 true",
+    matcherAlwaysTrueDescription:
+      "该 matcher 的基础结果固定为 true；各引用仍会独立应用取反。",
+    matcherAlwaysTrueAction: "固定为 true",
     matcherModeActions: "Matcher 运行模式",
     matcherRestoreAction: "恢复匹配",
-    matcherForceMissConfirmTitle: "将 {tag} 设为强制不命中？",
-    matcherForceMissConfirmDescription:
+    matcherAlwaysFalseConfirmTitle: "将 {tag} 的基础结果固定为 false？",
+    matcherAlwaysFalseConfirmDescription:
       "该操作会跳过内部匹配逻辑，只影响当前运行实例，不会修改配置。",
-    matcherForceMissImpact:
-      "直接引用 {positive} 和 {negative} 的条件都将不命中。",
-    matcherForceMissConfirmAction: "确认强制不命中",
-    matcherForceHitConfirmTitle: "将 {tag} 设为强制命中？",
-    matcherForceHitConfirmDescription:
-      "该操作会跳过内部匹配逻辑，可能同时触发多个策略分支，只影响当前运行实例。",
-    matcherForceHitImpact: "直接引用 {positive} 和 {negative} 的条件都将命中。",
-    matcherForceHitConfirmAction: "确认强制命中",
+    matcherAlwaysFalseImpact: "{positive} 将不命中，{negative} 取反后将命中。",
+    matcherAlwaysFalseConfirmAction: "确认固定为 false",
+    matcherAlwaysTrueConfirmTitle: "将 {tag} 的基础结果固定为 true？",
+    matcherAlwaysTrueConfirmDescription:
+      "该操作会跳过内部匹配逻辑，可能触发引用它的策略分支，只影响当前运行实例。",
+    matcherAlwaysTrueImpact: "{positive} 将命中，{negative} 取反后将不命中。",
+    matcherAlwaysTrueConfirmAction: "确认固定为 true",
     matcherModeResetHint: "应用 reload 或进程重启后自动恢复为正常匹配。",
     matcherControlLoading: "正在读取 matcher 运行状态",
     matcherControlUnavailable:
@@ -418,8 +417,10 @@ export const zhCNWebui = {
     eventCount: "{count} 个事件",
     matched: "命中",
     notMatched: "未命中",
-    forceHit: "强制命中",
-    forceMiss: "强制不命中",
+    alwaysTrueMatched: "固定 true · 命中",
+    alwaysTrueNotMatched: "固定 true · 取反未命中",
+    alwaysFalseMatched: "固定 false · 取反命中",
+    alwaysFalseNotMatched: "固定 false · 未命中",
     unchecked: "未检查",
     topologyUnavailable: "配置拓扑不可用，已按事件顺序降级显示",
     missingSequenceConfig: "缺少 sequence 配置：{names}",
