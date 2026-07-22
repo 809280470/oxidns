@@ -13,7 +13,7 @@ export function pluginCardGridColumnClass(itemCount: number): string {
 
 export function PluginCardItemSurface({ children }: { children: ReactNode }) {
   return (
-    <div className="h-[5.25rem] overflow-hidden rounded-md bg-muted/25 px-2.5 py-2">
+    <div className="flex h-[5.25rem] items-center overflow-hidden rounded-md bg-muted/25 px-3 py-2">
       {children}
     </div>
   );
@@ -23,14 +23,14 @@ export function PluginCardItemGrid({ items }: { items: PluginCardItem[] }) {
   return (
     <div
       className={cn(
-        "grid gap-x-3 gap-y-1",
+        "grid w-full gap-x-5 gap-y-1",
         pluginCardGridColumnClass(items.length),
       )}
     >
       {items.map((item) => (
         <div
           key={item.key}
-          className="flex min-w-0 items-baseline justify-between gap-2 text-xs leading-5"
+          className="grid h-5 min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-[11px] leading-5"
         >
           <span
             className="min-w-0 truncate text-muted-foreground"
@@ -39,7 +39,7 @@ export function PluginCardItemGrid({ items }: { items: PluginCardItem[] }) {
             {item.label}
           </span>
           <span
-            className="min-w-0 truncate text-right font-mono font-medium text-foreground tabular-nums"
+            className="max-w-[9.5rem] min-w-0 truncate text-right font-mono text-[11px] font-semibold tracking-[-0.01em] text-foreground tabular-nums"
             title={item.value}
           >
             {item.value}

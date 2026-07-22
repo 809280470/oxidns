@@ -97,8 +97,12 @@ export function MatcherRuntimeControl({
     <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
       <AlertDialogTrigger asChild>
         <Button
-          variant="outline"
+          variant={mode === "compact" ? "ghost" : "outline"}
           size={mode === "compact" ? "icon-xs" : "sm"}
+          className={cn(
+            mode === "compact" &&
+              "text-muted-foreground hover:bg-muted hover:text-foreground",
+          )}
           aria-label={
             mode === "compact"
               ? t(WEBUI.plugins.matcherBypassAction)

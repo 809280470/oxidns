@@ -72,7 +72,7 @@ function CachePluginCard({
     <PluginCardTemplate
       plugin={plugin}
       compact={compact}
-      icon={<DatabaseZap className="h-4 w-4 text-primary" />}
+      icon={<DatabaseZap className="h-4 w-4" />}
     >
       <div className="space-y-2 text-xs text-muted-foreground">
         <div>{t(WEBUI.cache.cardDescription)}</div>

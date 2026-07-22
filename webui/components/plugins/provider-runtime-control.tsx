@@ -61,9 +61,7 @@ export function ProviderRuntimeControl({
   );
   const skipped = liveStatus === false;
   const unavailable =
-    isOfflineMode ||
-    appliedStatus === "not-applied" ||
-    liveStatus !== true;
+    isOfflineMode || appliedStatus === "not-applied" || liveStatus !== true;
 
   useEffect(() => {
     if (outcome !== "success") return;
@@ -95,9 +93,11 @@ export function ProviderRuntimeControl({
 
   const actionButton = (
     <Button
-      variant="outline"
+      variant={mode === "compact" ? "ghost" : "outline"}
       size={mode === "compact" ? "icon-xs" : "sm"}
       className={cn(
+        mode === "compact" &&
+          "text-muted-foreground hover:bg-muted hover:text-foreground",
         outcome === "success" &&
           "border-primary/30 bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary",
         outcome === "error" &&
