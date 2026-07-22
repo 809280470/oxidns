@@ -341,6 +341,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         "cache_lookup_total",
         "cache_miss_total",
         "cache_expired_total",
+        "cache_skip_total",
       ],
       derivedCard: [
         {
@@ -1057,6 +1058,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         "reverse_lookup_cache_entries",
         "reverse_lookup_ptr_hit_total",
         "reverse_lookup_ptr_miss_total",
+        "reverse_lookup_cache_insert_total",
       ],
     } satisfies PluginMetricsDef,
     configSchema: [
@@ -1562,6 +1564,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
       },
       cardPriority: [
         "script_run_total",
+        "script_success_total",
         "script_error_total",
         "script_timeout_total",
       ],
@@ -1646,7 +1649,12 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ipset_write_total: "通过 netlink 成功写入 ipset 的 IP 条目总数。",
         ipset_write_error_total: "ipset netlink 写入失败的总次数。",
       },
-      cardPriority: ["ipset_write_total", "ipset_write_error_total"],
+      cardPriority: [
+        "ipset_write_total",
+        "ipset_write_error_total",
+        "ipset_entries_total",
+        "ipset_dropped_total",
+      ],
     } satisfies PluginMetricsDef,
     configSchema: [
       {
@@ -1701,7 +1709,12 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         nftset_write_total: "通过 netlink 成功写入 nftables 的 IP 前缀总数。",
         nftset_write_error_total: "nftset netlink 写入失败的总次数。",
       },
-      cardPriority: ["nftset_write_total", "nftset_write_error_total"],
+      cardPriority: [
+        "nftset_write_total",
+        "nftset_write_error_total",
+        "nftset_entries_total",
+        "nftset_dropped_total",
+      ],
     } satisfies PluginMetricsDef,
     configSchema: [
       {
@@ -1836,10 +1849,10 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_route_degraded: "RouterOS transport 当前是否处于降级状态。",
       },
       cardPriority: [
-        "ros_route_last_write_success_timestamp_seconds",
+        "ros_route_write_success_total",
         "ros_route_write_error_total",
         "ros_route_dropped_total",
-        "ros_route_degraded",
+        "ros_route_last_write_success_timestamp_seconds",
         "ros_route_managed_entries",
         "ros_route_pending_observations",
       ],
@@ -2055,10 +2068,10 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         ros_address_list_degraded: "RouterOS transport 当前是否处于降级状态。",
       },
       cardPriority: [
-        "ros_address_list_last_write_success_timestamp_seconds",
+        "ros_address_list_write_success_total",
         "ros_address_list_write_error_total",
         "ros_address_list_dropped_total",
-        "ros_address_list_degraded",
+        "ros_address_list_last_write_success_timestamp_seconds",
         "ros_address_list_managed_entries",
         "ros_address_list_pending_observations",
       ],

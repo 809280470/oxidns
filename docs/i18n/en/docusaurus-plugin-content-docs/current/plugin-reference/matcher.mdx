@@ -7,11 +7,21 @@ import Admonition from "@theme/Admonition";
 
 Matcher plugins return `true` or `false`. They are mainly used by `sequence.matches`.
 
-## Runtime Enable and Disable
+## Runtime Modes
 
-Matchers declared in `plugins:` with stable tags can be enabled, disabled, and inspected through the management API for the current runtime. The WebUI presents disabling as a confirmed temporary bypass. A bypassed matcher skips its internal predicate and produces a base result of `false`; outer negation still applies, so `!$matcher` evaluates to `true`. Normal matching can be restored with one action.
+Matchers declared in `plugins:` with stable tags can be inspected and switched among three modes for the current runtime:
 
-This state is not written to the configuration, and a full reload or process restart restores the matcher to enabled. Quick-setup matchers do not have stable public tags and therefore do not expose runtime switches; extract the expression into a standalone matcher when control is required. See the [Management API](../api.mdx#matcher) for endpoint details.
+| Mode | `$matcher` | `!$matcher` |
+| --- | --- | --- |
+| `normal` | Use the matcher result | Negate the matcher result |
+| `always_false` | Miss | Match |
+| `always_true` | Match | Miss |
+
+Both fixed modes skip the internal predicate and fix its base Boolean value, but every reference still applies its own outer negation. The WebUI requires confirmation for both fixed actions; restoring `normal` does not require confirmation.
+
+The runtime mode is shared by matcher tag, while reference semantics remain local to each reference. If the same tag appears as `$matcher` and `!$matcher` in one or more sequences, both references share the fixed base value but their final results remain opposites. Child references in `any_match` follow the same rule; control the `any_match` tag itself when the entire composition must be fixed.
+
+This state is not written to the configuration, and a full reload or process restart restores `normal`. Quick-setup matchers do not have stable public tags and therefore do not expose runtime modes; extract the expression into a standalone matcher when control is required. See the [Management API](../api.mdx#matcher) for endpoint details.
 
 ## Matcher Expression Rules
 

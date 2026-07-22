@@ -1030,11 +1030,18 @@ pub(super) fn load_plugin_stats(
                 s.tag,
                 SUM(CASE
                     WHEN s.kind = 'matcher'
-                     AND s.outcome IN ('matched', 'not_matched') THEN 1
+                     AND s.outcome IN (
+                         'matched', 'not_matched',
+                         'always_true_matched', 'always_true_not_matched',
+                         'always_false_matched', 'always_false_not_matched'
+                     ) THEN 1
                     ELSE 0
                 END) AS checked,
                 SUM(CASE
-                    WHEN s.kind = 'matcher' AND s.outcome = 'matched' THEN 1
+                    WHEN s.kind = 'matcher'
+                     AND s.outcome IN (
+                         'matched', 'always_true_matched', 'always_false_matched'
+                     ) THEN 1
                     ELSE 0
                 END) AS matched,
                 SUM(CASE
@@ -1650,7 +1657,9 @@ fn record_filter_clauses(
                 SELECT s.record_id
                 FROM {steps} s
                 WHERE s.kind = 'matcher'
-                  AND s.outcome = 'matched'
+                  AND s.outcome IN (
+                      'matched', 'always_true_matched', 'always_false_matched'
+                  )
                   AND s.tag = ?
             )",
             steps = tables.steps,

@@ -543,25 +543,30 @@ Every matcher declared in `plugins:` with a stable tag registers these runtime-c
 
 ```text
 GET  /api/plugins/<matcher_tag>/status
-POST /api/plugins/<matcher_tag>/enable
-POST /api/plugins/<matcher_tag>/disable
+POST /api/plugins/<matcher_tag>/mode
 ```
 
-All three endpoints return the same status shape:
+Both endpoints return the same status shape:
 
 ```json
 {
   "ok": true,
   "matcher": "match_cn",
-  "enabled": true
+  "mode": "normal"
 }
 ```
 
-`enable` and `disable` are idempotent and require no request body. A disabled matcher skips its internal predicate and produces a base result of `false`; existing negation still applies, so `!$match_cn` evaluates to `true` while that matcher is disabled.
+Set the mode with a JSON request body:
 
-The switch belongs only to the current runtime and is not written to YAML. An application reload or process restart restores the matcher to enabled. Quick-setup matchers inside `sequence` or `any_match` use internal `qs.match...` tags and do not register these endpoints. Extract a quick-setup expression into a standalone matcher under `plugins:` and reference it with `$tag` when runtime control is required.
+```json
+{ "mode": "always_false" }
+```
 
-The WebUI presents disabling as a temporary bypass and explains the different effects on positive and negated references before applying it. Restoring matching does not require editing or reapplying YAML.
+Supported values are `normal`, `always_false`, and `always_true`; setting the current mode again is idempotent. Both fixed modes skip the internal matcher and fix its base Boolean value, after which each reference still applies its own negation. With `always_false`, `$match_cn` misses and `!$match_cn` matches; `always_true` produces the opposite results. A missing or unsupported mode returns `400 invalid_matcher_runtime_mode`.
+
+The mode belongs only to the current runtime and is not written to YAML. An application reload or process restart restores `normal`. Quick-setup matchers inside `sequence` or `any_match` use internal `qs.match...` tags and do not register these endpoints. Extract a quick-setup expression into a standalone matcher under `plugins:` and reference it with `$tag` when runtime control is required.
+
+The WebUI requires confirmation for both `always_false` and `always_true`; restoring `normal` does not require confirmation. The old `/enable` and `/disable` endpoints and the `enabled` response field have been removed, so API clients must migrate to `/mode`.
 
 ### provider
 

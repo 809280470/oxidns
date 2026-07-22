@@ -2,6 +2,7 @@
 
 import { useAuthStore } from "./auth-store";
 import { WEBUI, tClient } from "./i18n";
+import type { MatcherRuntimeMode } from "./matcher-control";
 
 export interface ConfigFileResponse {
   ok: boolean;
@@ -95,7 +96,7 @@ export interface ControlResponse {
 export interface MatcherStatusResponse {
   ok: boolean;
   matcher: string;
-  enabled: boolean;
+  mode: MatcherRuntimeMode;
 }
 
 export interface ProviderReloadResponse {
@@ -530,16 +531,16 @@ export async function fetchMatcherStatus(
   return readJsonResponse<MatcherStatusResponse>(response);
 }
 
-export async function setMatcherEnabled(
+export async function setMatcherMode(
   tag: string,
-  enabled: boolean,
+  mode: MatcherRuntimeMode,
 ): Promise<MatcherStatusResponse> {
-  const action = enabled ? "enable" : "disable";
   const response = await fetch(
-    apiUrl(`/plugins/${encodeURIComponent(tag)}/${action}`),
+    apiUrl(`/plugins/${encodeURIComponent(tag)}/mode`),
     {
       method: "POST",
-      headers: apiHeaders(),
+      headers: { ...apiHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
     },
   );
   return readJsonResponse<MatcherStatusResponse>(response);
@@ -975,6 +976,11 @@ export interface UpgradeCheckOptions {
   githubToken?: string;
 }
 
+export interface UpgradeApplyOptions extends UpgradeCheckOptions {
+  force?: boolean;
+  cleanup?: boolean;
+}
+
 export interface UpgradeCheckResponse {
   ok: boolean;
   current_version: string;
@@ -1021,7 +1027,7 @@ export async function fetchUpgradeCheck(
 }
 
 export async function triggerUpgradeApply(
-  options: UpgradeCheckOptions = {},
+  options: UpgradeApplyOptions = {},
 ): Promise<UpgradeApplyResponse> {
   const body: Record<string, unknown> = {};
   if (options.repository) body.repository = options.repository;
@@ -1029,6 +1035,8 @@ export async function triggerUpgradeApply(
   if (options.outbound) body.outbound = options.outbound;
   if (options.socks5) body.socks5 = options.socks5;
   if (options.allowPrerelease) body.allow_prerelease = true;
+  if (options.force) body.force = true;
+  if (options.cleanup !== undefined) body.cleanup = options.cleanup;
   if (options.target) body.target = options.target;
   if (options.githubToken) body.github_token = options.githubToken;
   const response = await fetch(apiUrl("/upgrade/apply"), {

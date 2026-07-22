@@ -1,7 +1,12 @@
 "use client";
 
 import { useState, type MouseEvent } from "react";
-import { RotateCcwIcon, ShieldCheckIcon, ShieldOffIcon } from "lucide-react";
+import {
+  RotateCcwIcon,
+  SlidersHorizontalIcon,
+  ToggleLeftIcon,
+  ToggleRightIcon,
+} from "lucide-react";
 
 import {
   AlertDialog,
@@ -13,7 +18,6 @@ import {
   AlertDialogHeader,
   AlertDialogMedia,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,6 +29,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
@@ -33,6 +45,11 @@ import {
 } from "@/components/ui/tooltip";
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
+import {
+  planMatcherModeChange,
+  type FixedMatcherRuntimeMode,
+  type MatcherRuntimeMode,
+} from "@/lib/matcher-control";
 import { useAppStore } from "@/lib/store";
 import type { PluginInstance } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -47,99 +64,168 @@ export function MatcherRuntimeControl({
   mode = "compact",
 }: MatcherRuntimeControlProps) {
   const { t } = useI18n();
-  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmMode, setConfirmMode] =
+    useState<FixedMatcherRuntimeMode | null>(null);
   const control = useAppStore((state) => state.matcherControls[plugin.name]);
-  const setMatcherEnabled = useAppStore((state) => state.setMatcherEnabled);
+  const setMatcherMode = useAppStore((state) => state.setMatcherMode);
 
   if (plugin.type !== "matcher") return null;
 
-  const ready = control?.availability === "ready" && control.enabled !== null;
+  const ready = control?.availability === "ready" && control.mode !== null;
   const pending = Boolean(control?.pending);
-  const bypassed = ready && control.enabled === false;
+  const currentMode = ready ? control.mode : null;
+  const alwaysFalse = currentMode === "always_false";
+  const alwaysTrue = currentMode === "always_true";
+  const fixed = alwaysFalse || alwaysTrue;
   const loading = control?.availability === "loading";
   const unavailable = !ready && !loading;
   const positiveReference = `$${plugin.name}`;
   const negativeReference = `!$${plugin.name}`;
 
   const statusLabel = ready
-    ? bypassed
-      ? t(WEBUI.plugins.matcherBypassed)
-      : t(WEBUI.plugins.matcherRuntimeNormal)
+    ? alwaysFalse
+      ? t(WEBUI.plugins.matcherAlwaysFalse)
+      : alwaysTrue
+        ? t(WEBUI.plugins.matcherAlwaysTrue)
+        : t(WEBUI.plugins.matcherRuntimeNormal)
     : loading
       ? t(WEBUI.plugins.matcherControlLoading)
       : t(WEBUI.plugins.matcherControlUnavailable);
 
   const statusDescription = ready
-    ? bypassed
-      ? t(WEBUI.plugins.matcherBypassedDescription)
-      : t(WEBUI.plugins.matcherRuntimeNormalDescription)
+    ? alwaysFalse
+      ? t(WEBUI.plugins.matcherAlwaysFalseDescription)
+      : alwaysTrue
+        ? t(WEBUI.plugins.matcherAlwaysTrueDescription)
+        : t(WEBUI.plugins.matcherRuntimeNormalDescription)
     : loading
       ? t(WEBUI.plugins.matcherControlLoading)
       : t(WEBUI.plugins.matcherControlUnavailable);
 
-  const handleBypass = async (event: MouseEvent<HTMLButtonElement>) => {
+  const applyFixedMode = async (event: MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
+    if (!confirmMode) return;
     try {
-      await setMatcherEnabled(plugin.id, false);
-      setConfirmOpen(false);
+      await setMatcherMode(plugin.id, confirmMode);
+      setConfirmMode(null);
     } catch {
       // The store keeps the backend error beside this matcher.
     }
   };
 
-  const handleRestore = () => {
-    void setMatcherEnabled(plugin.id, true).catch(() => {
+  const requestModeChange = (nextMode: MatcherRuntimeMode) => {
+    const plan = planMatcherModeChange(nextMode);
+    if (plan.kind === "confirm") {
+      setConfirmMode(plan.mode);
+      return;
+    }
+    void setMatcherMode(plugin.id, plan.mode).catch(() => {
       // The store keeps the backend error beside this matcher.
     });
   };
 
-  const bypassDialog = (
-    <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-      <AlertDialogTrigger asChild>
+  const modeIcon = loading ? (
+    <Spinner data-icon="inline-start" />
+  ) : alwaysFalse ? (
+    <ToggleLeftIcon data-icon="inline-start" />
+  ) : alwaysTrue ? (
+    <ToggleRightIcon data-icon="inline-start" />
+  ) : (
+    <SlidersHorizontalIcon data-icon="inline-start" />
+  );
+
+  const actionMenu = (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
         <Button
-          variant="outline"
-          size={mode === "compact" ? "icon-xs" : "sm"}
-          aria-label={
-            mode === "compact"
-              ? t(WEBUI.plugins.matcherBypassAction)
-              : undefined
-          }
-          disabled={!ready || pending || bypassed}
+          variant="ghost"
+          size="icon-xs"
+          className="text-muted-foreground hover:bg-muted hover:text-foreground"
+          aria-label={t(WEBUI.plugins.matcherModeActions)}
+          disabled={!ready || pending}
         >
-          {loading ? (
-            <Spinner data-icon="inline-start" />
-          ) : (
-            <ShieldOffIcon data-icon="inline-start" />
-          )}
-          {mode === "detail" ? t(WEBUI.plugins.matcherBypassAction) : null}
+          {modeIcon}
         </Button>
-      </AlertDialogTrigger>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-44">
+        <DropdownMenuLabel>{statusLabel}</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {fixed ? (
+          <DropdownMenuItem onSelect={() => requestModeChange("normal")}>
+            <RotateCcwIcon />
+            {t(WEBUI.plugins.matcherRestoreAction)}
+          </DropdownMenuItem>
+        ) : null}
+        {!alwaysFalse ? (
+          <DropdownMenuItem onSelect={() => requestModeChange("always_false")}>
+            <ToggleLeftIcon />
+            {t(WEBUI.plugins.matcherAlwaysFalseAction)}
+          </DropdownMenuItem>
+        ) : null}
+        {!alwaysTrue ? (
+          <DropdownMenuItem
+            variant="destructive"
+            onSelect={() => requestModeChange("always_true")}
+          >
+            <ToggleRightIcon />
+            {t(WEBUI.plugins.matcherAlwaysTrueAction)}
+          </DropdownMenuItem>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
+  const confirmation = (
+    <AlertDialog
+      open={confirmMode !== null}
+      onOpenChange={(open) => {
+        if (!open && !pending) setConfirmMode(null);
+      }}
+    >
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogMedia className="bg-warning/15 text-warning-foreground">
-            <ShieldOffIcon />
+          <AlertDialogMedia
+            className={cn(
+              confirmMode === "always_true"
+                ? "bg-destructive/10 text-destructive"
+                : "bg-warning/15 text-warning-foreground",
+            )}
+          >
+            {confirmMode === "always_true" ? (
+              <ToggleRightIcon />
+            ) : (
+              <ToggleLeftIcon />
+            )}
           </AlertDialogMedia>
           <AlertDialogTitle>
-            {t(WEBUI.plugins.matcherBypassConfirmTitle, {
-              tag: plugin.name,
-            })}
+            {t(
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueConfirmTitle
+                : WEBUI.plugins.matcherAlwaysFalseConfirmTitle,
+              { tag: plugin.name },
+            )}
           </AlertDialogTitle>
           <AlertDialogDescription>
-            {t(WEBUI.plugins.matcherBypassConfirmDescription)}
+            {t(
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueConfirmDescription
+                : WEBUI.plugins.matcherAlwaysFalseConfirmDescription,
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="flex flex-col gap-2 text-sm text-muted-foreground">
           <p>
-            {t(WEBUI.plugins.matcherBypassPositiveImpact, {
-              reference: positiveReference,
-            })}
+            {t(
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueImpact
+                : WEBUI.plugins.matcherAlwaysFalseImpact,
+              {
+                positive: positiveReference,
+                negative: negativeReference,
+              },
+            )}
           </p>
-          <p>
-            {t(WEBUI.plugins.matcherBypassNegatedImpact, {
-              reference: negativeReference,
-            })}
-          </p>
-          <p>{t(WEBUI.plugins.matcherBypassResetHint)}</p>
+          <p>{t(WEBUI.plugins.matcherModeResetHint)}</p>
           {control?.error ? (
             <p className="text-destructive">
               {t(WEBUI.plugins.matcherControlFailed)}: {control.error}
@@ -151,35 +237,58 @@ export function MatcherRuntimeControl({
             {t(WEBUI.common.cancel)}
           </AlertDialogCancel>
           <AlertDialogAction
-            variant="warning"
-            disabled={pending}
-            onClick={handleBypass}
+            variant={confirmMode === "always_true" ? "destructive" : "warning"}
+            disabled={pending || confirmMode === null}
+            onClick={applyFixedMode}
           >
             {pending ? <Spinner data-icon="inline-start" /> : null}
-            {t(WEBUI.plugins.matcherBypassConfirmAction)}
+            {t(
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueConfirmAction
+                : WEBUI.plugins.matcherAlwaysFalseConfirmAction,
+            )}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
   );
 
-  const restoreButton = (
-    <Button
-      variant="warning"
-      size={mode === "compact" ? "icon-xs" : "sm"}
-      aria-label={
-        mode === "compact" ? t(WEBUI.plugins.matcherRestoreAction) : undefined
-      }
-      disabled={!ready || pending || !bypassed}
-      onClick={handleRestore}
-    >
-      {pending ? (
-        <Spinner data-icon="inline-start" />
-      ) : (
-        <RotateCcwIcon data-icon="inline-start" />
-      )}
-      {mode === "detail" ? t(WEBUI.plugins.matcherRestoreAction) : null}
-    </Button>
+  const detailActions = (
+    <div className="flex flex-wrap items-center gap-2">
+      {fixed ? (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={!ready || pending}
+          onClick={() => requestModeChange("normal")}
+        >
+          {pending ? <Spinner data-icon="inline-start" /> : <RotateCcwIcon />}
+          {t(WEBUI.plugins.matcherRestoreAction)}
+        </Button>
+      ) : null}
+      {!alwaysFalse ? (
+        <Button
+          variant="warning"
+          size="sm"
+          disabled={!ready || pending}
+          onClick={() => requestModeChange("always_false")}
+        >
+          <ToggleLeftIcon />
+          {t(WEBUI.plugins.matcherAlwaysFalseAction)}
+        </Button>
+      ) : null}
+      {!alwaysTrue ? (
+        <Button
+          variant="destructive"
+          size="sm"
+          disabled={!ready || pending}
+          onClick={() => requestModeChange("always_true")}
+        >
+          <ToggleRightIcon />
+          {t(WEBUI.plugins.matcherAlwaysTrueAction)}
+        </Button>
+      ) : null}
+    </div>
   );
 
   if (mode === "compact") {
@@ -191,26 +300,27 @@ export function MatcherRuntimeControl({
       >
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="inline-flex">
-              {bypassed ? restoreButton : bypassDialog}
-            </span>
+            <span className="inline-flex">{actionMenu}</span>
           </TooltipTrigger>
           <TooltipContent side="bottom">
-            {unavailable
-              ? control?.error
-                ? `${statusLabel}: ${control.error}`
-                : statusLabel
-              : bypassed
-                ? t(WEBUI.plugins.matcherRestoreAction)
-                : t(WEBUI.plugins.matcherBypassAction)}
+            {unavailable && control?.error
+              ? `${statusLabel}: ${control.error}`
+              : statusLabel}
           </TooltipContent>
         </Tooltip>
+        {confirmation}
       </div>
     );
   }
 
   return (
-    <Card className={cn("mt-4", bypassed && "border-warning/40 bg-warning/5")}>
+    <Card
+      className={cn(
+        "mt-4",
+        alwaysFalse && "border-warning/40 bg-warning/5",
+        alwaysTrue && "border-destructive/40 bg-destructive/5",
+      )}
+    >
       <CardHeader className="flex flex-row items-start justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-1">
           <CardTitle className="text-sm">
@@ -218,46 +328,48 @@ export function MatcherRuntimeControl({
           </CardTitle>
           <CardDescription>{statusDescription}</CardDescription>
         </div>
-        <Badge variant={bypassed ? "warning" : ready ? "secondary" : "outline"}>
-          {ready ? (
-            bypassed ? (
-              <ShieldOffIcon data-icon="inline-start" />
-            ) : (
-              <ShieldCheckIcon data-icon="inline-start" />
-            )
-          ) : loading ? (
-            <Spinner data-icon="inline-start" />
-          ) : null}
+        <Badge
+          variant={
+            alwaysTrue
+              ? "destructive"
+              : alwaysFalse
+                ? "warning"
+                : ready
+                  ? "secondary"
+                  : "outline"
+          }
+        >
+          {modeIcon}
           {statusLabel}
         </Badge>
       </CardHeader>
-      {bypassed || control?.error ? (
+      {fixed || control?.error ? (
         <CardContent className="flex flex-col gap-2 text-xs text-muted-foreground">
-          {bypassed ? (
+          {fixed ? (
             <>
               <p>
-                {t(WEBUI.plugins.matcherBypassPositiveImpact, {
-                  reference: positiveReference,
-                })}
+                {t(
+                  alwaysTrue
+                    ? WEBUI.plugins.matcherAlwaysTrueImpact
+                    : WEBUI.plugins.matcherAlwaysFalseImpact,
+                  {
+                    positive: positiveReference,
+                    negative: negativeReference,
+                  },
+                )}
               </p>
-              <p>
-                {t(WEBUI.plugins.matcherBypassNegatedImpact, {
-                  reference: negativeReference,
-                })}
-              </p>
-              <p>{t(WEBUI.plugins.matcherBypassResetHint)}</p>
+              <p>{t(WEBUI.plugins.matcherModeResetHint)}</p>
             </>
           ) : null}
           {control?.error ? (
-            <p>
-              <span className="text-destructive">
-                {t(WEBUI.plugins.matcherControlFailed)}: {control.error}
-              </span>
+            <p className="text-destructive">
+              {t(WEBUI.plugins.matcherControlFailed)}: {control.error}
             </p>
           ) : null}
         </CardContent>
       ) : null}
-      <CardFooter>{bypassed ? restoreButton : bypassDialog}</CardFooter>
+      <CardFooter>{detailActions}</CardFooter>
+      {confirmation}
     </Card>
   );
 }

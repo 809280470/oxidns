@@ -1652,11 +1652,22 @@ export const enUSPluginDefined = {
     },
     ros_route: {
       name: "RouterOS Route",
-      description: "Sync response IPs as per-IP static routes in a RouterOS routing table",
+      description:
+        "Sync response IPs as per-IP static routes in a RouterOS routing table",
       fields: {
-        address: { label: "RouterOS API address", placeholder: "172.16.1.1:8728" },
+        address: {
+          label: "RouterOS API address",
+          placeholder: "172.16.1.1:8728",
+        },
         username: { label: "Username" },
         password: { label: "Password" },
+        tls: {
+          label: "TLS",
+          description: "Enable RouterOS API-SSL, typically on port 8729.",
+        },
+        "tls.server_name": { label: "Server name" },
+        "tls.ca": { label: "Custom CA file" },
+        "tls.insecure": { label: "Skip certificate verification" },
         connect_timeout: { label: "Connect timeout" },
         send_timeout: { label: "Send timeout" },
         receive_timeout: { label: "Receive timeout" },
@@ -1678,21 +1689,35 @@ export const enUSPluginDefined = {
         comment_prefix: { label: "Comment prefix" },
         persistent: {
           label: "Persistent routes",
-          description: "Desired state recovered at startup and reconciled every 180 seconds; dynamic routes are excluded.",
+          description:
+            "Desired state recovered at startup and reconciled every 180 seconds; dynamic routes are excluded.",
         },
-        "persistent.ips": { label: "IP / CIDR", placeholder: "1.1.1.1\n100.64.1.0/24" },
+        "persistent.ips": {
+          label: "IP / CIDR",
+          description: "Declare persistent IP or CIDR routes inline.",
+          placeholder: "1.1.1.1\n100.64.1.0/24",
+        },
         "persistent.ips[]": { label: "Value", placeholder: "1.1.1.1" },
-        "persistent.files": { label: "Files", placeholder: "/etc/oxidns/persistent_routes.txt" },
-        "persistent.files[]": { label: "Value", placeholder: "/etc/oxidns/persistent_routes.txt" },
+        "persistent.files": {
+          label: "Files",
+          description: "Load persistent IP or CIDR routes from external files.",
+          placeholder: "/etc/oxidns/persistent_routes.txt",
+        },
+        "persistent.files[]": {
+          label: "Value",
+          placeholder: "/etc/oxidns/persistent_routes.txt",
+        },
         min_ttl: { label: "Minimum dynamic-route TTL" },
         max_ttl: { label: "Maximum dynamic-route TTL" },
         fixed_ttl: {
           label: "Fixed dynamic-route TTL",
-          description: "Set to 0 to disable time-based expiry; only later DNS observations refresh dynamic routes.",
+          description:
+            "Set to 0 to disable time-based expiry; only later DNS observations refresh dynamic routes.",
         },
         conntrack_guard: {
           label: "Connection tracking guard",
-          description: "Check exact target IPs before deleting expired dynamic host routes and defer when a connection exists.",
+          description:
+            "Check exact target IPs before deleting expired dynamic host routes and defer when a connection exists.",
         },
         cleanup_on_shutdown: {
           label: "Clean up on shutdown",
@@ -1706,8 +1731,23 @@ export const enUSPluginDefined = {
           ros_route_dropped_total: "Async drops",
           ros_route_sync_error_total: "Sync failures",
           ros_route_sync_timeout_total: "Sync timeouts",
+          ros_route_write_success_total: "Successful writes",
+          ros_route_write_error_total: "Failed writes",
+          ros_route_last_write_success_timestamp_seconds:
+            "Last successful write",
           ros_route_delete_deferred_total: "Deferred deletions",
           ros_route_connection_check_error_total: "Connection check failures",
+          ros_route_pending_observations: "Pending observations",
+          ros_route_managed_entries: "Managed routes",
+          ros_route_coalesced_total: "Coalesced observations",
+          ros_route_reconnect_total: "Reconnects",
+          ros_route_connect_attempt_total: "Connection attempts",
+          ros_route_backoff_total: "Backoffs",
+          ros_route_reconcile_error_total: "Reconciliation failures",
+          ros_route_last_reconcile_success_timestamp_seconds:
+            "Last successful reconciliation",
+          ros_route_degraded: "Degraded connection",
+          ros_route_cleanup_error_total: "Cleanup failures",
         },
         help: {
           ros_route_observe_total:
@@ -1718,16 +1758,29 @@ export const enUSPluginDefined = {
             "The total number of synchronous observations that failed in the RouterOS route manager.",
           ros_route_sync_timeout_total:
             "The total number of synchronous observations that timed out waiting for manager completion.",
+          ros_route_write_success_total:
+            "The total number of successful RouterOS route upserts.",
+          ros_route_write_error_total:
+            "The total number of failed RouterOS route upserts.",
+          ros_route_last_write_success_timestamp_seconds:
+            "The Unix timestamp of the most recent successful RouterOS route upsert.",
           ros_route_delete_deferred_total:
             "The total number of route deletions deferred because RouterOS conntrack still has a target connection.",
           ros_route_connection_check_error_total:
             "The total number of RouterOS conntrack queries that failed during route deletion.",
+          ros_route_pending_observations:
+            "The current number of coalesced observations waiting for the manager.",
+          ros_route_managed_entries:
+            "The number of route entries currently retained by the manager.",
+          ros_route_degraded:
+            "Whether the RouterOS transport is currently degraded.",
         },
       },
     },
     ros_address_list: {
       name: "RouterOS Address List",
-      description: "Sync response IPs into an address-list consumed by firewall, mangle, or routing rules",
+      description:
+        "Sync response IPs into an address-list consumed by firewall, mangle, or routing rules",
       fields: {
         address: {
           label: "RouterOS API address",
@@ -1743,6 +1796,13 @@ export const enUSPluginDefined = {
           label: "password",
           description: "Specify the RouterOS API login password.",
         },
+        tls: {
+          label: "TLS",
+          description: "Enable RouterOS API-SSL, typically on port 8729.",
+        },
+        "tls.server_name": { label: "Server name" },
+        "tls.ca": { label: "Custom CA file" },
+        "tls.insecure": { label: "Skip certificate verification" },
         connect_timeout: {
           label: "Connection timeout",
           description:
@@ -1839,6 +1899,21 @@ export const enUSPluginDefined = {
           ros_address_list_dropped_total: "Asynchronous discard",
           ros_address_list_sync_error_total: "Sync failed",
           ros_address_list_sync_timeout_total: "Sync timeout",
+          ros_address_list_write_success_total: "Successful writes",
+          ros_address_list_write_error_total: "Failed writes",
+          ros_address_list_last_write_success_timestamp_seconds:
+            "Last successful write",
+          ros_address_list_pending_observations: "Pending observations",
+          ros_address_list_managed_entries: "Managed entries",
+          ros_address_list_coalesced_total: "Coalesced observations",
+          ros_address_list_reconnect_total: "Reconnects",
+          ros_address_list_connect_attempt_total: "Connection attempts",
+          ros_address_list_backoff_total: "Backoffs",
+          ros_address_list_reconcile_error_total: "Reconciliation failures",
+          ros_address_list_last_reconcile_success_timestamp_seconds:
+            "Last successful reconciliation",
+          ros_address_list_degraded: "Degraded connection",
+          ros_address_list_cleanup_error_total: "Cleanup failures",
         },
         help: {
           ros_address_list_observe_total:
@@ -1849,6 +1924,18 @@ export const enUSPluginDefined = {
             "The total number of observations that failed on the RouterOS manager side in sync mode.",
           ros_address_list_sync_timeout_total:
             "The total number of synchronous observations that timed out waiting for manager completion.",
+          ros_address_list_write_success_total:
+            "The total number of successful RouterOS address-list upserts.",
+          ros_address_list_write_error_total:
+            "The total number of failed RouterOS address-list upserts.",
+          ros_address_list_last_write_success_timestamp_seconds:
+            "The Unix timestamp of the most recent successful RouterOS address-list upsert.",
+          ros_address_list_pending_observations:
+            "The current number of coalesced observations waiting for the manager.",
+          ros_address_list_managed_entries:
+            "The number of address-list entries currently retained by the manager.",
+          ros_address_list_degraded:
+            "Whether the RouterOS transport is currently degraded.",
         },
       },
     },
@@ -2431,7 +2518,8 @@ export const enUSPluginDefined = {
         },
         "periods[].end": {
           label: "End time",
-          description: "Use HH:MM; an earlier value than start crosses midnight.",
+          description:
+            "Use HH:MM; an earlier value than start crosses midnight.",
           placeholder: "18:00",
         },
         "periods[].weekdays": {
@@ -2452,7 +2540,8 @@ export const enUSPluginDefined = {
         },
         "periods[].monthdays": {
           label: "Days of month",
-          description: "Enter values from 1 to 31; leave empty to allow every day.",
+          description:
+            "Enter values from 1 to 31; leave empty to allow every day.",
           placeholder: "1\n15",
         },
         "periods[].monthdays[]": {

@@ -10,7 +10,33 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-07
 
 <div className="release-stack">
-   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-19" defaultOpen>
+   <ReleaseCard version="v1.5.1" badge="Patch Release" date="2026-07-22" defaultOpen>
+       **Release Scope**
+
+       - Patch Release. v1.5.1 focuses on matcher runtime control, upgrade operations, and WebUI quality. It expands temporary matcher switching into tri-state base-result controls, adds force and post-upgrade cleanup controls, and delivers a concentrated set of localization, polling, log-viewer, and plugin-card fixes.
+       - Existing YAML configurations upgrade directly, but the matcher runtime management API has a breaking change. Clients using that API must migrate before upgrading.
+
+       **Changes**
+
+       - `feat/fix(matcher)`: replace the runtime switch with `normal`, `always_false`, and `always_true` modes. Both fixed modes skip the matcher implementation and fix its base Boolean value; each `$tag` or `!$tag` reference then applies its own outer negation, so positive and negated results remain opposites. `sequence`, `any_match`, and query recorder now track both the fixed mode and effective match result, with regression coverage for shared controls.
+       - `feat(upgrade)`: let the management API and WebUI set `force` to reinstall a release even when it is already current. Add `cleanup` to control removal of download caches and backups after a successful upgrade. The WebUI persists both preferences and generates equivalent CLI commands. Cleanup releases the upgrade lock first and reports cleanup failures without changing a successful apply result.
+       - `fix(webui/i18n)`: complete Chinese and English localization for RouterOS, plugin definitions, metrics, configuration history, and console components, including locale-aware date formatting. Add coverage auditing to prevent missing English translations or fallback to Chinese.
+       - `fix(webui/runtime)`: schedule runtime polling according to page visibility while retaining background metric collection. Isolate responses, metric baselines, and update-check caches between backend connections; fetch matcher state only on initial load or explicit refresh; reset QPS sampling after long gaps.
+       - `feat(webui/logs)`: add persisted timestamp formats, optional elapsed-time display, adaptive duration units, and compact target paths. Unify plugin configuration and metric cards around an adaptive grid, with better RouterOS write-result, timestamp-metric, and system-memory presentation.
+       - `perf(build)`: use size-oriented release optimization, fat LTO, one codegen unit, and symbol stripping. Limit Tokio, QUIC, and TLS dependencies to required features, and attempt UPX compression for minimal and standard release artifacts without making compression failure block publication. Exclude development-only benchmarks, site documentation, and WebUI sources from the crates.io source package to stay clear of the registry size limit.
+       - `deps/ci/release`: update `wincode`, `syn`, other Rust dependencies, and GitHub Actions. Temporarily apply the RouterOS unbounded-response-channel fix through a Git patch to prevent protocol-event loss under burst traffic. The patch is not published separately, and crates.io publication uses `--no-verify` until upstream ships the fix. GitHub Release and Telegram announcements now share version-heading-validated release notes; announcements target the configured topic and are pinned automatically.
+
+       **Compatibility and Upgrade Notes**
+
+       - The root crate version is `1.5.1`; publishable workspace crate versions remain unchanged, and the release tag should be `v1.5.1`. The RouterOS patch is not published as a separate crate.
+       - v1.5.0 YAML configurations upgrade directly. No configuration fields are added, renamed, or given new defaults. Run `oxidns check -c <config-file>` before replacing the binary.
+       - **Matcher API migration**: `POST /api/plugins/<matcher_tag>/enable` and `/disable` are removed. Use `POST /api/plugins/<matcher_tag>/mode` with `{ "mode": "normal|always_false|always_true" }`. The `GET /status` response replaces `enabled` with `mode`. Unmigrated automation and third-party controllers will receive a 404 or fail response decoding.
+       - Fixed matcher modes exist only in the current runtime and reset to `normal` after an application reload or process restart. The mode is shared by matcher tag, while reference semantics remain local: with `always_false`, `$tag` misses and `!$tag` matches; `always_true` produces the opposite results. Control the `any_match` matcher itself when the whole composition must be fixed.
+       - The WebUI defaults to deleting download caches and backups after a successful upgrade. Disable post-upgrade cleanup when local rollback files must be retained. Use `force` only to repair a damaged installation or redeploy the same version, after confirming the intended bundle and platform.
+       - Minimal and standard artifacts may be UPX-compressed. Environments with binary scanners, allowlists, or integrity baselines should verify the release asset digest again and smoke-test startup, upgrade, and rollback before production replacement.
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-19">
        **Release Scope**
 
        - Minor Release. v1.5.0 centers on RouterOS policy synchronization and live operations: it adds the `ros_route` static policy-route plugin, comprehensively rebuilds `ros_address_list`, and adds management API plus WebUI runtime controls for matchers and providers.

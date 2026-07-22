@@ -48,9 +48,14 @@ function formatUptime(ms: number, t: TFn): string {
   return t(WEBUI.dashboard.uptimeS, { s: sec });
 }
 
-function formatMemory(mb: number): string {
-  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-  return `${mb} MB`;
+function formatMemory(
+  mb: number,
+  formatNumber: (value: number, options?: Intl.NumberFormatOptions) => string,
+): string {
+  if (mb >= 1024) {
+    return `${formatNumber(mb / 1024, { maximumFractionDigits: 1 })} GB`;
+  }
+  return `${formatNumber(mb, { maximumFractionDigits: 1 })} MB`;
 }
 
 function formatQps(
@@ -123,10 +128,10 @@ export function SystemMetrics() {
     system?.process_memory_kind ??
     (system?.os === "windows" ? "working_set" : "rss");
   const usesPhysicalMemory = memoryKind !== "private_commit";
-  const memPct =
-    usesPhysicalMemory && totalMemMb > 0
-      ? Math.min((memMb / totalMemMb) * 100, 100)
-      : 0;
+  const hasPhysicalMemoryTotal = usesPhysicalMemory && totalMemMb > 0;
+  const memPct = hasPhysicalMemoryTotal
+    ? Math.min((memMb / totalMemMb) * 100, 100)
+    : 0;
   const memoryMetricLabel =
     memoryKind === "private_working_set"
       ? t(WEBUI.dashboard.processPrivateWorkingSet)
@@ -275,27 +280,40 @@ export function SystemMetrics() {
         <CardContent className="space-y-2">
           <div>
             <div
-              className={cn("text-2xl font-bold font-mono", usageColor(memPct))}
+              className={cn("font-mono text-2xl font-bold", usageColor(memPct))}
             >
-              {system ? formatMemory(memMb) : "-"}
+              {system ? formatMemory(memMb, formatNumber) : "-"}
             </div>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {usesPhysicalMemory && totalMemMb > 0
-                ? t(WEBUI.dashboard.memPhysical, {
-                    metric: memoryMetricLabel,
-                    total: formatMemory(totalMemMb),
-                    pct: memPct.toFixed(1),
-                  })
-                : memoryMetricLabel}
+            <p className="mt-0.5 truncate text-xs text-muted-foreground">
+              {memoryMetricLabel}
             </p>
           </div>
-          {usesPhysicalMemory && totalMemMb > 0 && (
-            <Progress
-              value={memPct}
-              className="h-1.5"
-              indicatorClassName={usageBarColor(memPct)}
-            />
-          )}
+          {hasPhysicalMemoryTotal ? (
+            <div className="space-y-1.5">
+              <Progress
+                value={memPct}
+                className="h-1.5"
+                indicatorClassName={usageBarColor(memPct)}
+              />
+              <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                <span
+                  className={cn(
+                    "shrink-0 font-medium tabular-nums",
+                    usageColor(memPct),
+                  )}
+                >
+                  {t(WEBUI.dashboard.memUsed, {
+                    pct: formatNumber(memPct, { maximumFractionDigits: 1 }),
+                  })}
+                </span>
+                <span className="min-w-0 truncate text-right tabular-nums">
+                  {t(WEBUI.dashboard.memTotal, {
+                    total: formatMemory(totalMemMb, formatNumber),
+                  })}
+                </span>
+              </div>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 

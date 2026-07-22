@@ -14,7 +14,6 @@ import {
 } from "./oxidns-config";
 import {
   fetchBuildInfo,
-  fetchControl,
   fetchConfigFile,
   fetchHealth,
   fetchMatcherStatus,
@@ -25,12 +24,11 @@ import {
   requestRestart,
   reloadProvider as requestProviderReload,
   saveConfigFile,
-  setMatcherEnabled as requestMatcherEnabled,
+  setMatcherMode as requestMatcherMode,
   validateConfigText,
   type BuildInfo,
   type ConfigFileResponse,
   type ConfigValidateResponse,
-  type ControlResponse,
   type DependencyGraphReport,
   type HealthResponse,
   ProviderReloadBusyError,
@@ -66,6 +64,7 @@ import {
   type ConfigSnapshot,
 } from "./config-history";
 import { WEBUI, tClient } from "./i18n";
+import { useAuthStore } from "./auth-store";
 import {
   isReservedPluginTag,
   pluginTagValidationMessageKey,
@@ -80,6 +79,7 @@ import {
 import {
   reconcileMatcherControls,
   type MatcherControlState,
+  type MatcherRuntimeMode,
 } from "./matcher-control";
 import {
   reconcileProviderReloads,
@@ -119,7 +119,6 @@ interface AppState {
   plugins: PluginInstance[];
   health: HealthResponse | null;
   buildInfo: BuildInfo | null;
-  control: ControlResponse | null;
   system: SystemResponse | null;
   reloadStatus: ReloadSnapshot | null;
   pluginMetrics: PluginMetricsMap;
@@ -165,7 +164,10 @@ interface AppState {
   enterOfflineConfig: (text: string, fileName?: string) => void;
   exitOfflineMode: () => void;
   loadConfig: () => Promise<void>;
+  refreshHealthState: () => Promise<void>;
+  refreshSystemState: () => Promise<void>;
   refreshRuntimeState: () => Promise<void>;
+  /** Fetch matcher bypass state once at explicit config/list refresh boundaries. */
   refreshMatcherStates: () => Promise<void>;
   refreshMetrics: () => Promise<void>;
   validateCurrentConfig: () => Promise<void>;
@@ -177,7 +179,7 @@ interface AppState {
   deleteConfigSnapshot: (id: string) => void;
   clearConfigHistory: () => void;
   togglePluginPin: (id: string) => void;
-  setMatcherEnabled: (id: string, enabled: boolean) => Promise<void>;
+  setMatcherMode: (id: string, mode: MatcherRuntimeMode) => Promise<void>;
   reloadProvider: (id: string) => Promise<void>;
   clearProviderReloadResult: (id: string) => void;
   reorderPlugins: (orderedVisibleIds: string[]) => Promise<void>;
@@ -199,9 +201,32 @@ interface AppState {
 
 let queuedConfigSave: Promise<void> = Promise.resolve();
 let pendingConfigSaveCount = 0;
-let metricsRefreshInFlight: Promise<void> | null = null;
+interface ScopedRefresh {
+  backendKey: string;
+  promise: Promise<void>;
+}
+
+let metricsRefreshInFlight: ScopedRefresh | null = null;
+let healthRefreshInFlight: ScopedRefresh | null = null;
+let systemRefreshInFlight: ScopedRefresh | null = null;
+let runtimeRefreshInFlight: ScopedRefresh | null = null;
+let buildInfoBackendKey: string | null = null;
 let requestRateBaseline: RequestCounterSample | null = null;
+let requestRateBaselineBackendKey: string | null = null;
 let matcherRefreshGeneration = 0;
+let configLoadGeneration = 0;
+let configValidationGeneration = 0;
+let activeBackendKey: string | null = null;
+
+function currentBackendKey(): string {
+  const { connectionEpoch, serverConfig } = useAuthStore.getState();
+  return `${connectionEpoch}\0${serverConfig.url.trim()}`;
+}
+
+function isCurrentBackend(backendKey: string): boolean {
+  const auth = useAuthStore.getState();
+  return auth.isConnected && currentBackendKey() === backendKey;
+}
 
 function enqueueConfigSave(
   set: StoreSet,
@@ -227,7 +252,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   plugins: [],
   health: null,
   buildInfo: null,
-  control: null,
   system: null,
   reloadStatus: null,
   pluginMetrics: {},
@@ -315,7 +339,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       reloadStatus: null,
       health: null,
       buildInfo: null,
-      control: null,
       system: null,
     });
     get().setYamlConfig(text);
@@ -327,6 +350,30 @@ export const useAppStore = create<AppState>((set, get) => ({
   exitOfflineMode: () => set({ isOfflineMode: false, offlineFileName: null }),
 
   loadConfig: async () => {
+    const backendKey = currentBackendKey();
+    const generation = ++configLoadGeneration;
+    if (activeBackendKey !== backendKey) {
+      activeBackendKey = backendKey;
+      buildInfoBackendKey = null;
+      requestRateBaseline = null;
+      requestRateBaselineBackendKey = null;
+      set({
+        health: null,
+        system: null,
+        buildInfo: null,
+        reloadStatus: null,
+        pluginMetrics: {},
+        outboundMetrics: {},
+        trafficMetrics: {
+          status: "pending",
+          qps: null,
+          requestTotal: 0,
+          sampleWindowSeconds: null,
+        },
+        matcherControls: {},
+        providerReloads: {},
+      });
+    }
     set({
       isConfigLoading: true,
       configError: null,
@@ -334,6 +381,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     try {
       const response = await fetchConfigFile();
+      if (
+        generation !== configLoadGeneration ||
+        !isCurrentBackend(backendKey)
+      ) {
+        return;
+      }
       applyConfigFileResponse(response, set, get());
       const scope = getScopeKey(response.path);
       recordSnapshot(scope, {
@@ -349,10 +402,30 @@ export const useAppStore = create<AppState>((set, get) => ({
         runningVersion: response.version,
       });
       await get().validateCurrentConfig();
+      if (
+        generation !== configLoadGeneration ||
+        !isCurrentBackend(backendKey)
+      ) {
+        return;
+      }
       set({ runningDependencyGraph: get().dependencyGraph });
       await get().refreshRuntimeState();
+      if (
+        generation !== configLoadGeneration ||
+        !isCurrentBackend(backendKey)
+      ) {
+        return;
+      }
+      // Matcher bypass state is intentionally sampled with the plugin list.
+      // It is not polled; later manual apply/reload actions sample it again.
       await get().refreshMatcherStates();
     } catch (error) {
+      if (
+        generation !== configLoadGeneration ||
+        !isCurrentBackend(backendKey)
+      ) {
+        return;
+      }
       set({
         configError:
           error instanceof Error
@@ -360,54 +433,105 @@ export const useAppStore = create<AppState>((set, get) => ({
             : tClient(WEBUI.storeErrors.readConfigFailed),
       });
     } finally {
-      set({ isConfigLoading: false });
+      if (generation === configLoadGeneration) {
+        set({ isConfigLoading: false });
+      }
     }
   },
 
-  refreshRuntimeState: async () => {
-    const results = await Promise.allSettled([
-      fetchHealth(),
-      fetchControl(),
-      fetchSystem(),
-      fetchReloadStatus(),
-      fetchBuildInfo(),
-    ]);
-    const [health, control, system, reloadStatus, buildInfo] = results;
-    const nextReload =
-      reloadStatus.status === "fulfilled"
-        ? reloadStatus.value
-        : get().reloadStatus;
-    const nextSystem = system.status === "fulfilled" ? system.value : null;
-    const nextBuildInfo =
-      buildInfo.status === "fulfilled"
-        ? buildInfo.value.build
-        : nextSystem
-          ? (nextSystem.build ?? null)
-          : get().buildInfo;
-    const current = get();
-    const nextRunningVersion =
-      nextReload?.running_version ?? current.runningVersion;
-    const runningDependencyGraph =
-      nextRunningVersion === current.runningVersion
-        ? current.runningDependencyGraph
-        : nextRunningVersion === current.configVersion
-          ? current.dependencyGraph
-          : null;
-    set({
-      health: health.status === "fulfilled" ? health.value : get().health,
-      buildInfo: nextBuildInfo,
-      control: control.status === "fulfilled" ? control.value : get().control,
-      system: nextSystem ?? get().system,
-      reloadStatus: nextReload,
-      // The backend authoritatively reports what config it is running; prefer
-      // it over the load-time disk-version guess so the "not applied" state
-      // survives page reloads. Falls back to the prior value for older
-      // backends that don't report running_version.
-      ...(nextReload?.running_version
-        ? { runningVersion: nextReload.running_version }
-        : {}),
-      runningDependencyGraph,
+  refreshHealthState: () => {
+    const backendKey = currentBackendKey();
+    if (healthRefreshInFlight?.backendKey === backendKey) {
+      return healthRefreshInFlight.promise;
+    }
+
+    const refresh = fetchHealth().then((health) => {
+      if (isCurrentBackend(backendKey)) set({ health });
     });
+    const entry: ScopedRefresh = { backendKey, promise: refresh };
+    entry.promise = refresh.finally(() => {
+      if (healthRefreshInFlight === entry) healthRefreshInFlight = null;
+    });
+    healthRefreshInFlight = entry;
+    return entry.promise;
+  },
+
+  refreshSystemState: () => {
+    const backendKey = currentBackendKey();
+    if (systemRefreshInFlight?.backendKey === backendKey) {
+      return systemRefreshInFlight.promise;
+    }
+
+    const refresh = fetchSystem().then((system) => {
+      if (!isCurrentBackend(backendKey)) return;
+      const current = get();
+      const nextReload = system.reload ?? current.reloadStatus;
+      const nextRunningVersion =
+        nextReload?.running_version ?? current.runningVersion;
+      const runningDependencyGraph =
+        nextRunningVersion === current.runningVersion
+          ? current.runningDependencyGraph
+          : nextRunningVersion === current.configVersion
+            ? current.dependencyGraph
+            : null;
+      set({
+        system,
+        buildInfo:
+          system.build ??
+          (buildInfoBackendKey === backendKey ? current.buildInfo : null),
+        reloadStatus: nextReload,
+        // The backend authoritatively reports what config it is running; prefer
+        // it over the load-time disk-version guess so the "not applied" state
+        // survives page reloads. Falls back to the prior value for older
+        // backends that don't report running_version.
+        ...(nextReload?.running_version
+          ? { runningVersion: nextReload.running_version }
+          : {}),
+        runningDependencyGraph,
+      });
+      if (system.build) buildInfoBackendKey = backendKey;
+    });
+    const entry: ScopedRefresh = { backendKey, promise: refresh };
+    entry.promise = refresh.finally(() => {
+      if (systemRefreshInFlight === entry) systemRefreshInFlight = null;
+    });
+    systemRefreshInFlight = entry;
+    return entry.promise;
+  },
+
+  refreshRuntimeState: () => {
+    const backendKey = currentBackendKey();
+    if (runtimeRefreshInFlight?.backendKey === backendKey) {
+      return runtimeRefreshInFlight.promise;
+    }
+
+    const refresh = (async () => {
+      await Promise.allSettled([
+        get().refreshHealthState(),
+        get().refreshSystemState(),
+      ]);
+
+      if (!isCurrentBackend(backendKey)) return;
+
+      // Current backends include build capabilities in /system. Fetch the
+      // fallback once per backend connection when that field is absent.
+      if (buildInfoBackendKey !== backendKey) {
+        try {
+          const response = await fetchBuildInfo();
+          if (!isCurrentBackend(backendKey)) return;
+          buildInfoBackendKey = backendKey;
+          set({ buildInfo: response.build });
+        } catch {
+          // Runtime health/system data remains useful without build metadata.
+        }
+      }
+    })();
+    const entry: ScopedRefresh = { backendKey, promise: refresh };
+    entry.promise = refresh.finally(() => {
+      if (runtimeRefreshInFlight === entry) runtimeRefreshInFlight = null;
+    });
+    runtimeRefreshInFlight = entry;
+    return entry.promise;
   },
 
   refreshMatcherStates: async () => {
@@ -432,7 +556,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           {
             availability: "loading" as const,
             pending: false,
-            enabled: state.matcherControls[plugin.name]?.enabled ?? null,
+            mode: state.matcherControls[plugin.name]?.mode ?? null,
             ...(state.matcherControls[plugin.name]?.error
               ? { error: state.matcherControls[plugin.name].error }
               : {}),
@@ -464,13 +588,13 @@ export const useAppStore = create<AppState>((set, get) => ({
           matcherControls[tag] = {
             availability: "ready",
             pending: false,
-            enabled: result.value.response.enabled,
+            mode: result.value.response.mode,
           };
         } else {
           matcherControls[tag] = {
             availability: "unavailable",
             pending: false,
-            enabled: state.matcherControls[tag]?.enabled ?? null,
+            mode: state.matcherControls[tag]?.mode ?? null,
             error:
               result.reason instanceof Error
                 ? result.reason.message
@@ -483,30 +607,39 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   refreshMetrics: () => {
-    if (metricsRefreshInFlight) return metricsRefreshInFlight;
+    const backendKey = currentBackendKey();
+    if (metricsRefreshInFlight?.backendKey === backendKey) {
+      return metricsRefreshInFlight.promise;
+    }
 
     const refresh = (async () => {
       try {
         const text = await fetchPrometheusMetrics();
+        if (!isCurrentBackend(backendKey)) return;
         const metrics = parsePrometheusMetrics(text);
         const currentSample = {
           requestTotal: sumServerRequestTotal(metrics.byTag),
           sampledAtMs: Date.now(),
         };
         const trafficMetrics = calculateDnsTrafficMetrics(
-          requestRateBaseline,
+          requestRateBaselineBackendKey === backendKey
+            ? requestRateBaseline
+            : null,
           currentSample,
         );
         requestRateBaseline = currentSample;
+        requestRateBaselineBackendKey = backendKey;
         set({
           pluginMetrics: metrics.byTag,
           outboundMetrics: metrics.outbound,
           trafficMetrics,
         });
       } catch {
+        if (!isCurrentBackend(backendKey)) return;
         // Do not keep showing a stale rate after a metrics fetch failure.
         // The next successful response establishes a fresh baseline.
         requestRateBaseline = null;
+        requestRateBaselineBackendKey = backendKey;
         set((state) => ({
           trafficMetrics: {
             ...state.trafficMetrics,
@@ -517,19 +650,24 @@ export const useAppStore = create<AppState>((set, get) => ({
         }));
       }
     })();
-    metricsRefreshInFlight = refresh.finally(() => {
-      metricsRefreshInFlight = null;
+    const entry: ScopedRefresh = { backendKey, promise: refresh };
+    entry.promise = refresh.finally(() => {
+      if (metricsRefreshInFlight === entry) metricsRefreshInFlight = null;
     });
-    return metricsRefreshInFlight;
+    metricsRefreshInFlight = entry;
+    return entry.promise;
   },
 
   validateCurrentConfig: async () => {
+    const generation = ++configValidationGeneration;
     const state = get();
     if (state.configError) return;
     try {
       const response = await validateConfigText(state.configText);
+      if (generation !== configValidationGeneration) return;
       applyConfigValidationResponse(response, set);
     } catch (error) {
+      if (generation !== configValidationGeneration) return;
       const message =
         error instanceof Error
           ? error.message
@@ -646,6 +784,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         });
       }
       await get().refreshRuntimeState();
+      // Applying the configuration is an explicit manual refresh boundary.
       await get().refreshMatcherStates();
       if (failed) {
         throw new Error(
@@ -752,13 +891,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     }),
 
-  setMatcherEnabled: async (id, enabled) => {
+  setMatcherMode: async (id, mode) => {
     const plugin = get().plugins.find((candidate) => candidate.id === id);
     if (!plugin || plugin.type !== "matcher") return;
     const control = get().matcherControls[plugin.name];
     if (
       control?.availability !== "ready" ||
-      control.enabled === null ||
+      control.mode === null ||
       control.pending
     )
       return;
@@ -769,20 +908,20 @@ export const useAppStore = create<AppState>((set, get) => ({
         [plugin.name]: {
           availability: "ready",
           pending: true,
-          enabled: control.enabled,
+          mode: control.mode,
         },
       },
     }));
 
     try {
-      const response = await requestMatcherEnabled(plugin.name, enabled);
+      const response = await requestMatcherMode(plugin.name, mode);
       set((state) => ({
         matcherControls: {
           ...state.matcherControls,
           [plugin.name]: {
             availability: "ready",
             pending: false,
-            enabled: response.enabled,
+            mode: response.mode,
           },
         },
       }));
@@ -797,7 +936,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           [plugin.name]: {
             availability: "ready",
             pending: false,
-            enabled: state.matcherControls[plugin.name]?.enabled ?? null,
+            mode: state.matcherControls[plugin.name]?.mode ?? null,
             error: message,
           },
         },
@@ -1169,7 +1308,7 @@ function applyConfigFileResponse(
           {
             availability: "loading" as const,
             pending: false,
-            enabled: state.matcherControls[plugin.name]?.enabled ?? null,
+            mode: state.matcherControls[plugin.name]?.mode ?? null,
           },
         ]),
     ),

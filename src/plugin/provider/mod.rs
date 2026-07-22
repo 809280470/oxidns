@@ -89,7 +89,7 @@ mod tests {
 
     use async_trait::async_trait;
     use http::{Method, Request as HttpRequest, StatusCode, Uri};
-    use http_body_util::{BodyExt, Empty};
+    use http_body_util::{BodyExt, Full};
     use hyper_util::client::legacy::Client;
     use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_util::rt::TokioExecutor;
@@ -102,8 +102,10 @@ mod tests {
     use crate::config::types::{ApiConfig, ApiHttpConfig, PluginConfig};
     use crate::infra::clock::AppClock;
     use crate::plugin::dependency::DependencyKind;
+    use crate::plugin::executor::sequence::SequenceFactory;
     use crate::plugin::matcher::qname::QnameFactory;
-    use crate::plugin::{self, PluginFactory, PluginRegistry, UninitializedPlugin};
+    use crate::plugin::test_utils::test_context;
+    use crate::plugin::{self, PluginFactory, PluginRegistry, PluginResolver, UninitializedPlugin};
 
     fn reserve_local_addr() -> SocketAddr {
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind test listener");
@@ -190,6 +192,11 @@ mod tests {
         let mut registry = PluginRegistry::new();
         registry.register_factory("qname", DependencyKind::Matcher, Box::new(QnameFactory {}));
         registry.register_factory(
+            "sequence",
+            DependencyKind::Executor,
+            Box::new(SequenceFactory {}),
+        );
+        registry.register_factory(
             "reloadable_provider",
             DependencyKind::Provider,
             Box::new(ReloadableProviderFactory {
@@ -209,6 +216,32 @@ mod tests {
                 plugin_type: "qname".to_string(),
                 args: Some(serde_yaml_ng::from_str("- \"$reloadable\"").unwrap()),
             },
+            PluginConfig {
+                tag: "positive_sequence".to_string(),
+                plugin_type: "sequence".to_string(),
+                args: Some(
+                    serde_yaml_ng::from_str(
+                        r#"
+- matches: "$match_qname"
+  exec: reject 2
+"#,
+                    )
+                    .unwrap(),
+                ),
+            },
+            PluginConfig {
+                tag: "negated_sequence".to_string(),
+                plugin_type: "sequence".to_string(),
+                args: Some(
+                    serde_yaml_ng::from_str(
+                        r#"
+- matches: "!$match_qname"
+  exec: reject 2
+"#,
+                    )
+                    .unwrap(),
+                ),
+            },
         ];
 
         registry
@@ -220,7 +253,7 @@ mod tests {
         register_plugin_runtime_control_routes(&ApiRegister::new(hub.clone()), &registry)?;
         hub.start().await.expect("api hub should start");
 
-        let client: Client<HttpConnector, Empty<bytes::Bytes>> =
+        let client: Client<HttpConnector, Full<bytes::Bytes>> =
             Client::builder(TokioExecutor::new()).build(HttpConnector::new());
         let uri: Uri = format!("http://{listen}/api/plugins/reloadable/reload")
             .parse()
@@ -228,7 +261,7 @@ mod tests {
         let request = HttpRequest::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Empty::new())
+            .body(Full::new(bytes::Bytes::new()))
             .expect("request should build");
         let response = client
             .request(request)
@@ -258,7 +291,7 @@ mod tests {
                 HttpRequest::builder()
                     .method(Method::GET)
                     .uri(uri)
-                    .body(Empty::new())
+                    .body(Full::new(bytes::Bytes::new()))
                     .expect("request should build"),
             )
             .await
@@ -273,9 +306,44 @@ mod tests {
         )
         .expect("response should be valid json");
         assert_eq!(payload["matcher"], "match_qname");
-        assert_eq!(payload["enabled"], true);
+        assert_eq!(payload["mode"], "normal");
+        assert!(payload.get("enabled").is_none());
+        let positive_sequence = registry
+            .get_plugin("positive_sequence")
+            .expect("positive sequence should be initialized")
+            .to_executor();
+        let negated_sequence = registry
+            .get_plugin("negated_sequence")
+            .expect("negated sequence should be initialized")
+            .to_executor();
+        let public_positive_ref = PluginResolver::matcher_ref(
+            registry.as_ref(),
+            "positive_sequence",
+            "args[0].matches[0]",
+            "match_qname",
+            false,
+        )?;
+        let public_negated_ref = PluginResolver::matcher_ref(
+            registry.as_ref(),
+            "negated_sequence",
+            "args[0].matches[0]",
+            "match_qname",
+            true,
+        )?;
+        let mut positive_normal_context = test_context();
+        positive_sequence
+            .execute(&mut positive_normal_context)
+            .await?;
+        assert!(positive_normal_context.response().is_none());
+        let mut negated_normal_context = test_context();
+        negated_sequence
+            .execute(&mut negated_normal_context)
+            .await?;
+        assert!(negated_normal_context.response().is_some());
+        assert!(!public_positive_ref.is_match(&mut test_context()));
+        assert!(public_negated_ref.is_match(&mut test_context()));
 
-        let uri: Uri = format!("http://{listen}/api/plugins/match_qname/disable")
+        let uri: Uri = format!("http://{listen}/api/plugins/match_qname/mode")
             .parse()
             .expect("uri should parse");
         let response = client
@@ -283,7 +351,10 @@ mod tests {
                 HttpRequest::builder()
                     .method(Method::POST)
                     .uri(uri)
-                    .body(Empty::new())
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(bytes::Bytes::from_static(
+                        br#"{"mode":"always_false"}"#,
+                    )))
                     .expect("request should build"),
             )
             .await
@@ -298,11 +369,97 @@ mod tests {
                 .to_bytes(),
         )
         .expect("response should be valid json");
-        assert_eq!(payload["enabled"], false);
+        assert_eq!(payload["mode"], "always_false");
+        let mut positive_false_context = test_context();
+        positive_sequence
+            .execute(&mut positive_false_context)
+            .await?;
+        assert!(positive_false_context.response().is_none());
+        let mut negated_false_context = test_context();
+        negated_sequence.execute(&mut negated_false_context).await?;
+        assert!(negated_false_context.response().is_some());
+        assert!(!public_positive_ref.is_match(&mut test_context()));
+        assert!(public_negated_ref.is_match(&mut test_context()));
+
+        let uri: Uri = format!("http://{listen}/api/plugins/match_qname/mode")
+            .parse()
+            .expect("uri should parse");
+        let response = client
+            .request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(bytes::Bytes::from_static(
+                        br#"{"mode":"always_true"}"#,
+                    )))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = serde_json::from_slice::<serde_json::Value>(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body should collect")
+                .to_bytes(),
+        )
+        .expect("response should be valid json");
+        assert_eq!(payload["mode"], "always_true");
+        let mut positive_true_context = test_context();
+        positive_sequence
+            .execute(&mut positive_true_context)
+            .await?;
+        assert!(positive_true_context.response().is_some());
+        let mut negated_true_context = test_context();
+        negated_sequence.execute(&mut negated_true_context).await?;
+        assert!(negated_true_context.response().is_none());
+        assert!(public_positive_ref.is_match(&mut test_context()));
+        assert!(!public_negated_ref.is_match(&mut test_context()));
+
+        let uri: Uri = format!("http://{listen}/api/plugins/match_qname/mode")
+            .parse()
+            .expect("uri should parse");
+        let response = client
+            .request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(bytes::Bytes::from_static(
+                        br#"{"mode":"invalid"}"#,
+                    )))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let uri: Uri = format!("http://{listen}/api/plugins/match_qname/disable")
+            .parse()
+            .expect("uri should parse");
+        let response = client
+            .request(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .body(Full::new(bytes::Bytes::new()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let next_reload_count = Arc::new(AtomicUsize::new(0));
         let mut next_registry = PluginRegistry::new();
         next_registry.register_factory("qname", DependencyKind::Matcher, Box::new(QnameFactory {}));
+        next_registry.register_factory(
+            "sequence",
+            DependencyKind::Executor,
+            Box::new(SequenceFactory {}),
+        );
         next_registry.register_factory(
             "reloadable_provider",
             DependencyKind::Provider,
@@ -326,7 +483,7 @@ mod tests {
                 HttpRequest::builder()
                     .method(Method::POST)
                     .uri(uri)
-                    .body(Empty::new())
+                    .body(Full::new(bytes::Bytes::new()))
                     .expect("request should build"),
             )
             .await

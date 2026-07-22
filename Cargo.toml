@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "oxidns"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 authors = ["Sven Shi <isvenshi@gmail.com>"]
 description = "A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability."
@@ -18,6 +18,13 @@ license = "GPL-3.0-or-later"
 readme = "README_EN.md"
 keywords = ["dns", "rustdns", "pipeline", "flow", "dns-server"]
 categories = ["network-programming"]
+exclude = [
+    ".github/**",
+    "ai/**",
+    "benchmarks/**",
+    "docs/**",
+    "webui/**",
+]
 
 
 [dependencies]
@@ -25,7 +32,17 @@ categories = ["network-programming"]
 async-trait = "0.1"
 futures = "0.3.31"
 socket2 = "0.6.4"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 
 # Configuration, CLI, and observability
@@ -54,7 +71,7 @@ url = "2.5"
 fs2 = "0.4"
 hex = "0.4"
 sha2 = "0.11.0"
-wincode = { version = "0.5", features = ["derive"] }
+wincode = { version = "0.6", features = ["derive"] }
 oxidns-proto = { version = "0.1.4", path = "crates/proto" }
 oxidns-macros = { version = "0.1.0", path = "crates/macros" }
 hotpath = "0.21"
@@ -72,12 +89,12 @@ tar = { version = "0.4", optional = true }
 # their respective pieces; `quinn` / `h3` / `h3-quinn` are reached through
 # `server-doq` / `server-doh3` and the shared `_dns-client-*` features.
 h2 = { version = "0.4", optional = true }
-quinn = { version = "0.11.9", optional = true }
+quinn = { version = "0.11.9", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"], optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
-rustls = { version = "0.23.40", features = ["ring"], optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
-tokio-rustls = { version = "0.26.4", optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"], optional = true }
 webpki-roots = { version = "1.0.2", optional = true }
 
 # HTTP stack for DoH server/client paths, the management API, and the
@@ -86,7 +103,7 @@ base64 = "0.22"
 http = { version = "1.4", optional = true }
 http-body-util = { version = "0.1.3", optional = true }
 hyper = { version = "1.10.1", features = ["server", "client", "http1", "http2"], optional = true }
-hyper-rustls = { version = "0.27.8", features = ["http1", "http2", "ring", "webpki-tokio"], optional = true }
+hyper-rustls = { version = "0.27.8", default-features = false, features = ["http1", "http2", "logging", "ring", "tls12", "webpki-tokio"], optional = true }
 hyper-util = { version = "0.1.20", features = ["server", "client", "client-legacy", "http1", "http2", "tokio"], optional = true }
 tower-service = { version = "0.3", optional = true }
 
@@ -108,8 +125,8 @@ zoneparser = { package = "oxidns-zoneparser", version = "0.1.1", path = "crates/
 # Service management
 service-manager = "0.11.0"
 
-# Use the forked Tokio transport until the response-channel fix is
-# released upstream.
+# Use the forked Tokio transport until the response-channel fix is released
+# upstream. Release publication skips Cargo's build verification temporarily.
 [patch.crates-io]
 mikrotik-proto = { git = "https://github.com/svenshi/mikrotik-rs.git", branch = "fix/tokio-unbounded-response-channel", package = "mikrotik-proto" }
 mikrotik-tokio = { git = "https://github.com/svenshi/mikrotik-rs.git", branch = "fix/tokio-unbounded-response-channel", package = "mikrotik-tokio" }
@@ -138,10 +155,10 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Proc
 # builds a forwarder-only binary with no hyper / rustls / quinn / ...
 #
 # Cargo build cookbook:
-#   cargo build                                                # = full
-#   cargo build --no-default-features --features minimal       # ~smallest
-#   cargo build --no-default-features --features standard
-#   cargo build --no-default-features --features "minimal,plugin-mikrotik"
+#   cargo build --release                                                # = full
+#   cargo build --release --no-default-features --features minimal       # ~smallest
+#   cargo build --release --no-default-features --features standard
+#   cargo build --release --no-default-features --features "minimal,plugin-mikrotik"
 # =============================================================================
 [features]
 default = ["full"]
@@ -360,6 +377,7 @@ hotpath-alloc = ["hotpath/hotpath-alloc"]
 [dev-dependencies]
 criterion = "0.8.2"
 tempfile = "3.23.0"
+tokio = { version = "1", features = ["test-util"] }
 # Integration tests use hyper to spin up mock HTTP servers regardless of
 # which library features are enabled, so we re-declare them as dev deps.
 http-body-util = "0.1.3"
@@ -395,6 +413,13 @@ path = "src/main.rs"
 name = "oxidns"
 path = "src/lib.rs"
 doctest = false
+
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
 
 
 [package.metadata.deb]

@@ -7,11 +7,21 @@ import Admonition from "@theme/Admonition";
 
 匹配器插件返回 `true` 或 `false`，主要供 `sequence` 的 `matches` 使用。
 
-## 运行时开启与关闭
+## 运行时模式
 
-`plugins:` 中具有稳定 tag 的 matcher 可以通过管理 API 在当前 runtime 内开启、关闭和查询状态。WebUI 将关闭操作呈现为需要确认的“临时旁路”，旁路后 matcher 不再执行内部逻辑，基础结果固定为 `false`；外层取反仍按原规则应用，因此 `!$matcher` 会得到 `true`。恢复匹配可以一键完成。
+`plugins:` 中具有稳定 tag 的 matcher 可以通过管理 API 在当前 runtime 内查询和切换三种模式：
 
-该状态不会写入配置，全量 reload 或进程重启后恢复开启。quick-setup matcher 没有稳定的公开 tag，因此不提供运行时开关；需要控制时应先把表达式提取为独立 matcher。接口详情见 [管理 API](../api.mdx#matcher)。
+| 模式 | `$matcher` | `!$matcher` |
+| --- | --- | --- |
+| `normal` | 使用 matcher 原始结果 | 使用原始结果的取反 |
+| `always_false` | 不命中 | 命中 |
+| `always_true` | 命中 | 不命中 |
+
+`always_false` 和 `always_true` 会跳过 matcher 内部逻辑并固定其基础布尔值，但每个引用仍独立应用外层取反。WebUI 对两个固定操作都要求二次确认，恢复 `normal` 不需要确认。
+
+运行时模式由 matcher tag 共享，引用语义则由引用位置决定。例如同一 tag 同时以 `$matcher` 与 `!$matcher` 出现在一个或多个 sequence 中，两者共享同一个固定基础值，但最终结果始终互为取反。`any_match` 的子引用也遵循同一规则；如需控制整个组合，应切换 `any_match` 自身的运行时模式。
+
+该状态不会写入配置，全量 reload 或进程重启后恢复 `normal`。quick-setup matcher 没有稳定的公开 tag，因此不提供运行时模式；需要控制时应先把表达式提取为独立 matcher。接口详情见 [管理 API](../api.mdx#matcher)。
 
 ## 匹配表达式规则
 

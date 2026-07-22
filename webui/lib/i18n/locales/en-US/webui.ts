@@ -14,6 +14,7 @@ export const enUSWebui = {
     all: "All",
     back: "Back",
     cancel: "Cancel",
+    close: "Close",
     clear: "Clear",
     clearSearch: "Clear search",
     delete: "Delete",
@@ -21,6 +22,8 @@ export const enUSWebui = {
     fields: "Fields",
     loading: "Loading...",
     logLevel: "Log level",
+    key: "Key",
+    more: "More",
     name: "Name",
     plugin: "Plugin",
     readOnly: "Current config is read-only",
@@ -72,6 +75,10 @@ export const enUSWebui = {
     switchToEditor: "Switch to editor mode",
     switchToConsole: "Switch to console mode",
     toggleTheme: "Toggle theme",
+    breadcrumb: "Breadcrumb",
+    sidebar: "Sidebar",
+    sidebarDescription: "Displays the mobile sidebar.",
+    toggleSidebar: "Toggle sidebar",
   },
   plugins: {
     centerTitle: "Plugin Center",
@@ -136,6 +143,7 @@ export const enUSWebui = {
     missingReference: "Referenced plugin '{tag}' does not exist",
     missingPluginType: "Plugin type '{kind}' does not exist",
     metricsTitle: "Runtime Metrics",
+    metricCount: "{count} metrics",
     cardBadge: "Card",
     emptyConfigItems: "No config items yet. Click below to add one.",
     addConfigItem: "Add config item",
@@ -175,21 +183,30 @@ export const enUSWebui = {
     matcherRuntimeNormal: "Participating normally",
     matcherRuntimeNormalDescription:
       "This matcher is participating in rule evaluation as configured.",
-    matcherBypassed: "Temporarily bypassed",
-    matcherBypassedDescription:
-      "This matcher currently returns false without running its internal predicate.",
-    matcherBypassAction: "Temporarily bypass",
+    matcherAlwaysFalse: "Fixed to false",
+    matcherAlwaysFalseDescription:
+      "This matcher's base result is fixed to false; each reference still applies its own negation.",
+    matcherAlwaysFalseAction: "Fix to false",
+    matcherAlwaysTrue: "Fixed to true",
+    matcherAlwaysTrueDescription:
+      "This matcher's base result is fixed to true; each reference still applies its own negation.",
+    matcherAlwaysTrueAction: "Fix to true",
+    matcherModeActions: "Matcher runtime mode",
     matcherRestoreAction: "Restore matching",
-    matcherBypassConfirmTitle: "Temporarily bypass {tag}?",
-    matcherBypassConfirmDescription:
-      "This only affects the current runtime and does not modify the configuration.",
-    matcherBypassPositiveImpact:
-      "Conditions referencing {reference} will no longer match.",
-    matcherBypassNegatedImpact:
-      "Conditions referencing {reference} will match.",
-    matcherBypassResetHint:
+    matcherAlwaysFalseConfirmTitle: "Fix {tag}'s base result to false?",
+    matcherAlwaysFalseConfirmDescription:
+      "This skips the internal predicate, affects only the current runtime, and does not modify configuration.",
+    matcherAlwaysFalseImpact:
+      "{positive} will miss; {negative} will match after negation.",
+    matcherAlwaysFalseConfirmAction: "Confirm fixed false",
+    matcherAlwaysTrueConfirmTitle: "Fix {tag}'s base result to true?",
+    matcherAlwaysTrueConfirmDescription:
+      "This skips the internal predicate, may activate policy branches that reference it, and affects only the current runtime.",
+    matcherAlwaysTrueImpact:
+      "{positive} will match; {negative} will miss after negation.",
+    matcherAlwaysTrueConfirmAction: "Confirm fixed true",
+    matcherModeResetHint:
       "An application reload or process restart restores normal matching.",
-    matcherBypassConfirmAction: "Confirm temporary bypass",
     matcherControlLoading: "Loading matcher runtime state",
     matcherControlUnavailable:
       "The matcher runtime API is unavailable; apply the config or check the backend version",
@@ -296,6 +313,7 @@ export const enUSWebui = {
     paramLabel: "Param",
     builtinLabel: "Builtin",
     invertedLabel: "Inverted",
+    always: "Always",
   },
   sequence: {
     modeReference: "Reference",
@@ -343,6 +361,7 @@ export const enUSWebui = {
     unconfiguredAction: "Unconfigured action",
     arrangement: "Sequence",
     ruleCount: "Rules",
+    ruleCountValue: "{count} rules",
     paramOptional: "Parameter (optional)",
     notCompiled: "Not compiled",
   },
@@ -415,6 +434,10 @@ export const enUSWebui = {
     eventCount: "{count} events",
     matched: "Matched",
     notMatched: "Not matched",
+    alwaysTrueMatched: "Fixed true · matched",
+    alwaysTrueNotMatched: "Fixed true · negated miss",
+    alwaysFalseMatched: "Fixed false · negated match",
+    alwaysFalseNotMatched: "Fixed false · missed",
     unchecked: "Unchecked",
     topologyUnavailable:
       "Config topology is unavailable; showing events in recorded order.",
@@ -556,7 +579,9 @@ export const enUSWebui = {
     loadingRecords: "Loading query records...",
     noRecords: "No query records",
     matcherStatsTitle: "Matcher hit rate",
+    matcherColumn: "Matcher",
     sampleCount: "{count} samples",
+    topCount: "Top {count}",
     matcherCount: "{count} matchers",
     clearMatcherFilterTitle: "Clear selected matcher filter",
     selectedMatcher: "Filtered: {matcher}",
@@ -792,7 +817,8 @@ export const enUSWebui = {
     processCpu: "CPU {value}",
     requestTotal: "{value} total requests",
     memUsage: "Memory Usage",
-    memPhysical: "{metric} · {pct}% / {total}",
+    memUsed: "{pct}% used",
+    memTotal: "Total {total}",
     processRss: "Process RSS",
     processPrivateWorkingSet: "Private working set",
     processPrivateCommit: "Process private commit (commit charge)",
@@ -820,6 +846,13 @@ export const enUSWebui = {
     pause: "Pause",
     waiting: "Waiting for logs…",
     connectingBackend: "Connecting to backend…",
+    timeFormat: "Time format",
+    timeFormatDescription:
+      "Supports YYYY, MM, DD, HH, mm, ss, and SSS. Time only by default.",
+    timeFormatPreview: "Preview: {value}",
+    showElapsed: "Show process elapsed time",
+    showElapsedDescription:
+      "Show time since startup with adaptive units and millisecond precision.",
   },
   restartOverlay: {
     title: "Restarting OxiDNS service",
@@ -915,6 +948,8 @@ export const enUSWebui = {
       "Configure resolver nameservers and SOCKS5 proxy for this profile.",
     removeOutboundProfile: "Remove outbound profile",
     outboundProfileName: "Profile Name",
+    outboundProfileNameRequired: "Outbound profile name cannot be empty",
+    outboundProfileNameDuplicate: "Duplicate outbound profile name '{name}'",
     outboundProfileSocks5: "Profile SOCKS5 Proxy",
     resolverMode: "Resolver Mode",
     resolverModeSystem: "System resolver",
@@ -1010,6 +1045,7 @@ export const enUSWebui = {
     checkUpdates: "Check for Updates",
     upgrading: "Upgrading…",
     upgradeNow: "Upgrade Now",
+    forceUpgradeNow: "Force Upgrade",
     upgradeProgressTitle: "Upgrading OxiDNS",
     upgradeProgressDesc:
       "The backend is applying the new release and will reconnect automatically. Do not refresh or close this page.",
@@ -1054,9 +1090,15 @@ export const enUSWebui = {
     allowPrerelease: "Allow Pre-release Versions",
     allowPrereleaseDesc:
       "Includes pre-release tags such as alpha, beta, and rc",
+    forceUpgrade: "Force upgrade",
+    forceUpgradeDesc:
+      "Ignore version comparison and reinstall the selected release.",
+    cleanupAfterUpgrade: "Clean up after upgrade",
+    cleanupAfterUpgradeDesc:
+      "Delete download caches and upgrade backups after success; disable to keep rollback files.",
     autoCheck: "Auto-check for Updates",
     autoCheckDesc:
-      "Automatically check for the latest version on each backend connection",
+      "Check on connection only when due; successful checks are reused for 24 hours",
     cliCommand: "Equivalent CLI Command",
     cliCommandDesc:
       "Run on the server as root or a privileged user. Automatically downloads and replaces the current binary. To avoid leaks, the command shows only a token placeholder.",

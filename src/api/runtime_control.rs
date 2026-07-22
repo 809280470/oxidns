@@ -8,10 +8,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Request, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiHandler, ApiRegister, json_error, json_ok};
 use crate::infra::error::Result as DnsResult;
+use crate::plugin::matcher::MatcherRuntimeMode;
 use crate::plugin::provider::{ProviderReloadError, ProviderRuntimeControl};
 use crate::plugin::runtime_control::PluginRuntimeControl;
 use crate::plugin::{PluginRuntime, current_runtime};
@@ -20,13 +21,22 @@ use crate::plugin::{PluginRuntime, current_runtime};
 struct MatcherStatusResponse {
     ok: bool,
     matcher: String,
-    enabled: bool,
+    mode: MatcherRuntimeMode,
 }
 
 #[derive(Debug)]
 struct MatcherStatusHandler {
     tag: String,
-    desired: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MatcherModeRequest {
+    mode: MatcherRuntimeMode,
+}
+
+#[derive(Debug)]
+struct MatcherModeHandler {
+    tag: String,
 }
 
 fn live_runtime_control(tag: &str) -> Option<PluginRuntimeControl> {
@@ -47,20 +57,47 @@ impl ApiHandler for MatcherStatusHandler {
         let Some(PluginRuntimeControl::Matcher(control)) = live_runtime_control(&self.tag) else {
             return runtime_control_unavailable(&self.tag, "matcher");
         };
-        if let Some(enabled) = self.desired {
-            control.set_enabled(enabled);
-            tracing::info!(
-                matcher = %self.tag,
-                enabled,
-                "matcher runtime control updated"
-            );
-        }
         json_ok(
             StatusCode::OK,
             &MatcherStatusResponse {
                 ok: true,
                 matcher: self.tag.clone(),
-                enabled: control.enabled(),
+                mode: control.mode(),
+            },
+        )
+    }
+}
+
+#[async_trait]
+impl ApiHandler for MatcherModeHandler {
+    async fn handle(&self, request: Request<Bytes>) -> crate::api::ApiResponse {
+        let desired = match serde_json::from_slice::<MatcherModeRequest>(request.body()) {
+            Ok(request) => request.mode,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_matcher_runtime_mode",
+                    format!(
+                        "request body must contain mode normal, always_false, or always_true: {err}"
+                    ),
+                );
+            }
+        };
+        let Some(PluginRuntimeControl::Matcher(control)) = live_runtime_control(&self.tag) else {
+            return runtime_control_unavailable(&self.tag, "matcher");
+        };
+        control.set_mode(desired);
+        tracing::info!(
+            matcher = %self.tag,
+            mode = ?desired,
+            "matcher runtime control updated"
+        );
+        json_ok(
+            StatusCode::OK,
+            &MatcherStatusResponse {
+                ok: true,
+                matcher: self.tag.clone(),
+                mode: control.mode(),
             },
         )
     }
@@ -126,25 +163,9 @@ pub(crate) fn register_plugin_runtime_control_routes(
             PluginRuntimeControl::Matcher(_) => {
                 plugin.get(
                     "/status",
-                    Arc::new(MatcherStatusHandler {
-                        tag: tag.clone(),
-                        desired: None,
-                    }),
+                    Arc::new(MatcherStatusHandler { tag: tag.clone() }),
                 )?;
-                plugin.post(
-                    "/enable",
-                    Arc::new(MatcherStatusHandler {
-                        tag: tag.clone(),
-                        desired: Some(true),
-                    }),
-                )?;
-                plugin.post(
-                    "/disable",
-                    Arc::new(MatcherStatusHandler {
-                        tag,
-                        desired: Some(false),
-                    }),
-                )?;
+                plugin.post("/mode", Arc::new(MatcherModeHandler { tag }))?;
             }
             PluginRuntimeControl::Provider(_) => {
                 plugin.post("/reload", Arc::new(ProviderReloadHandler { tag }))?;
