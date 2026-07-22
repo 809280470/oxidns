@@ -5,29 +5,21 @@ import { PluginCardTemplate } from "./plugin-card-template";
 import { getPluginCatalogItem } from "./catalog";
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
+import { PluginCardItemGrid } from "./plugin-card-item-grid";
 
 export function DefaultPluginCard(props: PluginCardComponentProps) {
   const { locale, t } = useI18n();
   const definition = getPluginCatalogItem(props.plugin.pluginKind, locale);
   const configFields = definition?.configSchema.slice(0, 3) ?? [];
+  const configItems = configFields.map((field) => ({
+    key: field.key,
+    label: field.label,
+    value: formatCardConfigValue(props.plugin.config[field.key], t),
+  }));
 
   return (
     <PluginCardTemplate {...props}>
-      <div className="space-y-1">
-        {configFields.map((field) => (
-          <div
-            key={field.key}
-            className="flex min-w-0 items-center justify-between gap-3 text-xs leading-5"
-          >
-            <span className="truncate text-muted-foreground">
-              {field.label}
-            </span>
-            <span className="truncate text-right font-mono text-foreground">
-              {formatCardConfigValue(props.plugin.config[field.key], t)}
-            </span>
-          </div>
-        ))}
-      </div>
+      <PluginCardItemGrid items={configItems} />
     </PluginCardTemplate>
   );
 }

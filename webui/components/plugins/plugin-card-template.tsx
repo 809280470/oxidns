@@ -22,6 +22,12 @@ import { getPluginCatalogItem, renderPluginKindIcon } from "./catalog";
 import { PluginDeleteButton } from "./plugin-delete-button";
 import { MatcherRuntimeControl } from "./matcher-runtime-control";
 import { ProviderRuntimeControl } from "./provider-runtime-control";
+import {
+  PluginCardItemGrid,
+  PluginCardItemSurface,
+} from "./plugin-card-item-grid";
+
+const MAX_CARD_METRICS = 6;
 
 export function PluginCardTemplate({
   plugin,
@@ -37,7 +43,12 @@ export function PluginCardTemplate({
     plugin.type === "matcher" ? s.matcherControls[plugin.name] : undefined,
   );
   const buildInfo = useAppStore((s) => s.buildInfo);
-  const cardMetrics = selectCardMetrics(series, plugin.pluginKind, 4, locale);
+  const cardMetrics = selectCardMetrics(
+    series,
+    plugin.pluginKind,
+    MAX_CARD_METRICS,
+    locale,
+  );
   const showFallbackContent = cardMetrics.length === 0 && Boolean(children);
   const definition = getPluginCatalogItem(plugin.pluginKind, locale);
   const supported = isPluginKindSupported(
@@ -161,28 +172,20 @@ export function PluginCardTemplate({
       </CardHeader>
       {cardMetrics.length > 0 && (
         <CardContent className="px-3 pb-1 pt-0">
-          <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-md bg-muted/25 px-2.5 py-2">
-            {cardMetrics.map((metric) => (
-              <div
-                key={metric.label}
-                className="flex min-w-0 items-baseline justify-between gap-2"
-              >
-                <span className="truncate text-[10px] text-muted-foreground">
-                  {metric.label}
-                </span>
-                <span className="shrink-0 font-mono text-xs font-medium tabular-nums">
-                  {metric.value}
-                </span>
-              </div>
-            ))}
-          </div>
+          <PluginCardItemSurface>
+            <PluginCardItemGrid
+              items={cardMetrics.map((metric) => ({
+                key: metric.label,
+                label: metric.label,
+                value: metric.value,
+              }))}
+            />
+          </PluginCardItemSurface>
         </CardContent>
       )}
       {showFallbackContent && (
         <CardContent className="px-3 pb-1 pt-0">
-          <div className="min-h-[4.75rem] rounded-md bg-muted/25 px-2.5 py-2">
-            {children}
-          </div>
+          <PluginCardItemSurface>{children}</PluginCardItemSurface>
         </CardContent>
       )}
     </Card>

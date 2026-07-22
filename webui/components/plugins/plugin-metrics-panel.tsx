@@ -75,7 +75,7 @@ function MetricRowItem({
           )}
         </div>
         <span className="shrink-0 font-mono text-sm font-semibold tabular-nums">
-          {formatMetricValue(row.total, locale)}
+          {formatMetricValue(row.total, locale, { metricName: row.name })}
         </span>
       </div>
       {row.breakdown.length > 0 && (
@@ -89,7 +89,9 @@ function MetricRowItem({
                 {item.key}
               </span>
               <span className="shrink-0 font-mono tabular-nums">
-                {formatMetricValue(item.value, locale)}
+                {formatMetricValue(item.value, locale, {
+                  metricName: row.name,
+                })}
               </span>
             </div>
           ))}
