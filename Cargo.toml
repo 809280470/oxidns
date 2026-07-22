@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "oxidns"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
 authors = ["Sven Shi <isvenshi@gmail.com>"]
 description = "A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability."
@@ -18,6 +18,13 @@ license = "GPL-3.0-or-later"
 readme = "README_EN.md"
 keywords = ["dns", "rustdns", "pipeline", "flow", "dns-server"]
 categories = ["network-programming"]
+exclude = [
+    ".github/**",
+    "ai/**",
+    "benchmarks/**",
+    "docs/**",
+    "webui/**",
+]
 
 
 [dependencies]
@@ -118,8 +125,8 @@ zoneparser = { package = "oxidns-zoneparser", version = "0.1.1", path = "crates/
 # Service management
 service-manager = "0.11.0"
 
-# Use the forked Tokio transport until the response-channel fix is
-# released upstream.
+# Use the forked Tokio transport until the response-channel fix is released
+# upstream. Release publication skips Cargo's build verification temporarily.
 [patch.crates-io]
 mikrotik-proto = { git = "https://github.com/svenshi/mikrotik-rs.git", branch = "fix/tokio-unbounded-response-channel", package = "mikrotik-proto" }
 mikrotik-tokio = { git = "https://github.com/svenshi/mikrotik-rs.git", branch = "fix/tokio-unbounded-response-channel", package = "mikrotik-tokio" }

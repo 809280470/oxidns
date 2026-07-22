@@ -10,7 +10,33 @@ import ReleaseCard from '@site/src/components/ReleaseCard';
 ## 2026-07
 
 <div className="release-stack">
-   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-19" defaultOpen>
+   <ReleaseCard version="v1.5.1" badge="Patch Release" date="2026-07-22" defaultOpen>
+       **版本定位**
+
+       - Patch Release。v1.5.1 聚焦 matcher 运行时控制、升级运维与 WebUI 质量：将 matcher 的临时启停扩展为三态基础结果控制，补齐强制升级与升级后清理入口，并集中修复国际化、轮询、日志和插件卡片展示。
+       - 现有 YAML 配置可以直接升级，但 matcher 运行时管理 API 存在不兼容变更；使用该 API 的客户端必须在升级前迁移。
+
+       **主要变更**
+
+       - `feat/fix(matcher)`：运行时控制改为 `normal`、`always_false`、`always_true` 三态。两个固定模式跳过 matcher 内部逻辑并固定其基础布尔值，每个 `$tag` 或 `!$tag` 引用随后仍独立应用外层取反，因此正向与取反结果始终相反；`sequence`、`any_match` 与 query recorder 同步记录固定模式和最终匹配结果，并增加共享控制器的回归覆盖。
+       - `feat(upgrade)`：管理 API 与 WebUI 支持 `force`，可在当前版本已是最新时重新安装；新增 `cleanup` 选项控制成功升级后是否删除下载缓存和备份，WebUI 会持久化两项偏好并生成对应 CLI 命令。清理流程会先释放升级锁，失败时记录告警而不改变已成功的升级结果。
+       - `fix(webui/i18n)`：补齐 RouterOS、插件定义、指标、配置历史和控制台组件的中英文文本与本地化日期格式；新增覆盖审计，防止英文界面缺少翻译或回退到中文。
+       - `fix(webui/runtime)`：按页面可见性调度运行时轮询，同时保留后台指标采集；不同后端连接的响应、指标基线和升级检查缓存相互隔离，matcher 状态只在首次加载或显式刷新时获取，并在长时间采样中断后重置 QPS 基线。
+       - `feat(webui/logs)`：日志查看器支持可持久化的时间戳格式、可选耗时显示、自适应时间单位和 target 路径压缩；插件配置与指标卡片统一为自适应网格，改进 RouterOS 写入结果、时间戳指标和系统内存展示。
+       - `perf(build)`：release profile 改用体积优先优化、fat LTO、单 codegen unit 与符号剥离；Tokio、QUIC 和 TLS 依赖仅启用所需 feature，并在 minimal/standard release 流程中尝试使用 UPX 压缩，压缩失败不会阻断发布；crates.io 源码包排除仅供开发的 benchmark、站点文档和 WebUI 源码，避免触及 registry 包体限制。
+       - `deps/ci/release`：升级 `wincode`、`syn` 及一组 Rust/GitHub Actions 依赖；RouterOS 暂时通过 Git patch 使用 unbounded response channel 修复突发流量下的协议事件丢失，该 patch 不单独发布，crates.io 发布在上游修复前暂用 `--no-verify`；GitHub Release 与 Telegram 公告统一读取经过版本标题校验的发布说明，公告发送到指定 topic 并自动置顶。
+
+       **配置与升级说明**
+
+       - 根 crate 版本号升级为 `1.5.1`；可发布的 workspace crate 版本保持不变，release tag 应使用 `v1.5.1`。RouterOS patch 不作为独立 crate 发布。
+       - v1.5.0 YAML 配置可以直接升级，本次没有新增、重命名或改变默认值的配置字段。替换二进制前仍建议运行 `oxidns check -c <配置文件>`。
+       - **Matcher API 迁移**：`POST /api/plugins/<matcher_tag>/enable` 与 `/disable` 已移除，改用 `POST /api/plugins/<matcher_tag>/mode` 并提交 `{ "mode": "normal|always_false|always_true" }`；`GET /status` 的 `enabled` 字段改为 `mode`。未迁移的自动化与第三方控制端会收到 404 或解析失败。
+       - matcher 固定模式只保存在当前运行时；应用 reload 或进程重启后恢复为 `normal`。模式由 matcher tag 共享，但引用语义由各引用位置决定：`always_false` 下 `$tag` 不命中而 `!$tag` 命中，`always_true` 下结果相反；如需固定整个 `any_match` 组合，应控制组合 matcher 自身。
+       - WebUI 默认在成功升级后清理下载缓存与备份；需要保留本地回滚文件时应关闭“升级后清理”。`force` 会重新安装当前版本，应仅用于修复损坏安装或重新部署相同版本，并在执行前确认目标 bundle 与平台。
+       - minimal/standard 产物可能经过 UPX 压缩；依赖二进制扫描、白名单或完整性基线的环境应使用 release asset digest 重新校验，并在生产替换前完成启动与升级回滚演练。
+   </ReleaseCard>
+
+   <ReleaseCard version="v1.5.0" badge="Minor Release" date="2026-07-19">
        **版本定位**
 
        - Minor Release。v1.5.0 以 RouterOS 策略同步和运行时运维能力为主线：新增 `ros_route` 静态策略路由插件，完整重构 `ros_address_list`，并为 matcher/provider 增加管理 API 与 WebUI 运行时控制。

@@ -259,8 +259,10 @@ Also verify before tagging:
   built release candidate.
 - `oxidns check` accepts the packaged full and minimal example configs under
   their corresponding bundles.
-- `cargo publish --locked --dry-run` succeeds when package metadata or
-  publishable workspace crates changed.
+- `cargo publish --locked --dry-run --no-verify` succeeds. The temporary
+  `--no-verify` is required while the RouterOS response-channel fix is supplied
+  through `[patch.crates-io]`; remove it after upgrading to a fixed upstream
+  release.
 - No release-note claim depends on uncommitted working-tree changes.
 
 ## 7. Hand Off For Commit And Tag
