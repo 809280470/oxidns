@@ -95,7 +95,14 @@ export function ConfigHistorySheet({
                     <div className="min-w-0 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="text-sm font-medium">
-                          {formatDateTime(entry.createdAt)}
+                          {formatDateTime(entry.createdAt, {
+                            year: "numeric",
+                            month: "2-digit",
+                            day: "2-digit",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            second: "2-digit",
+                          })}
                         </span>
                         {isRunning && (
                           <Badge
