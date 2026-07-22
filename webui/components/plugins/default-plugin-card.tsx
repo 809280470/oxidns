@@ -5,7 +5,12 @@ import { PluginCardTemplate } from "./plugin-card-template";
 import { getPluginCatalogItem } from "./catalog";
 import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
+import type { ConfigField } from "@/lib/plugin-definitions";
 import { PluginCardItemGrid } from "./plugin-card-item-grid";
+
+const MAX_CARD_CONFIG_ITEMS = 6;
+const SENSITIVE_CONFIG_KEY =
+  /(?:password|passwd|secret|token|api[_-]?key|private[_-]?key)/i;
 
 export function DefaultPluginCard(props: PluginCardComponentProps) {
   const { locale, t } = useI18n();
@@ -17,7 +22,13 @@ export function DefaultPluginCard(props: PluginCardComponentProps) {
   const configItems = configFields.map((field) => ({
     key: field.key,
     label: field.label,
-    value: formatCardConfigValue(props.plugin.config[field.key], t),
+    value: formatCardConfigValue(
+      field,
+      props.plugin.config[field.key] === undefined
+        ? field.default
+        : props.plugin.config[field.key],
+      t,
+    ),
   }));
 
   return (
@@ -29,38 +40,53 @@ export function DefaultPluginCard(props: PluginCardComponentProps) {
   );
 }
 
-export function selectCardConfigFields<
-  T extends { key: string; advanced?: boolean },
->(fields: T[], config: Record<string, unknown>): T[] {
-  const visibleFields = fields.filter((field) => !field.advanced);
+export function selectCardConfigFields(
+  fields: ConfigField[],
+  config: Record<string, unknown>,
+  limit = MAX_CARD_CONFIG_ITEMS,
+): ConfigField[] {
+  const visibleFields = fields.filter(
+    (field) => !field.advanced && isCardConfigField(field),
+  );
   const configuredAdvancedFields = fields.filter(
-    (field) => field.advanced && hasCardConfigValue(config[field.key]),
+    (field) =>
+      field.advanced &&
+      isCardConfigField(field) &&
+      hasCardConfigValue(config[field.key]),
   );
 
-  const prioritizeConfigured = (candidates: T[]) =>
+  const prioritizeFields = (candidates: ConfigField[]) =>
     candidates
       .map((field, index) => ({
         field,
         index,
+        required: Boolean(field.required),
         configured: hasCardConfigValue(config[field.key]),
       }))
       .sort(
         (left, right) =>
+          Number(right.required) - Number(left.required) ||
           Number(right.configured) - Number(left.configured) ||
           left.index - right.index,
       )
       .map(({ field }) => field);
 
-  const primary = prioritizeConfigured(visibleFields).slice(0, 3);
-  if (primary.length === 3) return primary;
+  const primary = prioritizeFields(visibleFields).slice(0, limit);
+  if (primary.length === limit) return primary;
 
   return [
     ...primary,
-    ...prioritizeConfigured(configuredAdvancedFields).slice(
+    ...prioritizeFields(configuredAdvancedFields).slice(
       0,
-      3 - primary.length,
+      limit - primary.length,
     ),
   ];
+}
+
+function isCardConfigField(field: ConfigField): boolean {
+  if (field.type === "password" || field.type === "textarea") return false;
+  if (field.type === "json") return false;
+  return !SENSITIVE_CONFIG_KEY.test(field.key);
 }
 
 function hasCardConfigValue(value: unknown): boolean {
@@ -71,6 +97,7 @@ function hasCardConfigValue(value: unknown): boolean {
 }
 
 function formatCardConfigValue(
+  field: ConfigField,
   value: unknown,
   t: ReturnType<typeof useI18n>["t"],
 ) {
@@ -81,14 +108,21 @@ function formatCardConfigValue(
     return value ? t(WEBUI.common.yes) : t(WEBUI.common.no);
   }
   if (typeof value === "number") return String(value);
-  if (typeof value === "string") return value;
+  if (typeof value === "string") {
+    const option = field.options?.find(
+      (candidate) =>
+        candidate.value === value || candidate.aliases?.includes(value),
+    );
+    return option?.label ?? value;
+  }
   if (Array.isArray(value))
     return value.length > 0
       ? t(WEBUI.common.itemCount, { count: value.length })
       : t(WEBUI.common.empty);
   if (typeof value === "object") {
-    return Object.keys(value).length > 0
-      ? t(WEBUI.common.configured)
+    const count = Object.keys(value).length;
+    return count > 0
+      ? t(WEBUI.common.itemCount, { count })
       : t(WEBUI.common.empty);
   }
   return String(value);

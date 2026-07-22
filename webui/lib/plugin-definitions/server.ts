@@ -25,6 +25,7 @@ const serverMetrics: PluginMetricsDef = {
     "server_request_total",
     "server_inflight",
     "server_failed_total",
+    "server_controlled_total",
   ],
   derivedCard: [
     { kind: "latency", prefix: "server", label: "平均延迟" },

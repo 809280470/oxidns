@@ -10,8 +10,33 @@ import {
   selectCardMetrics,
   type PluginMetricsMap,
 } from "./metrics";
+import { pluginKindDefinitions } from "./plugin-definitions";
 
 describe("plugin metric formatting", () => {
+  it("keeps every curated metric card within the six-item surface", () => {
+    const oversized = pluginKindDefinitions
+      .filter((definition) => definition.metrics)
+      .filter(
+        (definition) =>
+          (definition.metrics?.derivedCard?.length ?? 0) +
+            (definition.metrics?.cardPriority?.length ?? 0) >
+          6,
+      )
+      .map((definition) => definition.kind);
+
+    expect(oversized).toEqual([]);
+  });
+
+  it("provides a display label for every card-priority metric", () => {
+    const unlabeled = pluginKindDefinitions.flatMap((definition) =>
+      (definition.metrics?.cardPriority ?? [])
+        .filter((name) => !definition.metrics?.metricLabels?.[name])
+        .map((name) => `${definition.kind}:${name}`),
+    );
+
+    expect(unlabeled).toEqual([]);
+  });
+
   it("formats timestamp gauges as local date-times", () => {
     const timestamp = 1_784_701_820;
 

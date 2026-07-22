@@ -21,7 +21,7 @@ export interface PluginMetricsDef {
   metricLabels?: Record<string, string>;
   /** Prometheus metric name → Chinese description shown in the detail panel (overrides backend HELP). */
   metricHelp?: Record<string, string>;
-  /** Ordered metric names surfaced on the plugin card (first 4 shown). */
+  /** Ordered metric names surfaced on the plugin card (up to 6 shown). */
   cardPriority?: string[];
   /** Derived metrics prepended to card display before raw metric values. */
   derivedCard?: DerivedMetricSpec[];
