@@ -527,7 +527,7 @@ impl PluginRegistry {
     }
 
     /// Resolve a matcher dependency together with expression-level negation
-    /// and the runtime force-mode control shared by its configured tag.
+    /// and the runtime base-result control shared by its configured tag.
     pub fn get_matcher_ref_dependency(
         &self,
         source_tag: &str,

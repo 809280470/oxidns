@@ -56,12 +56,12 @@ export function PluginCardTemplate({
     plugin.type,
     plugin.pluginKind,
   );
-  const matcherForceMiss =
+  const matcherAlwaysFalse =
     matcherControl?.availability === "ready" &&
-    matcherControl.mode === "force_miss";
-  const matcherForceHit =
+    matcherControl.mode === "always_false";
+  const matcherAlwaysTrue =
     matcherControl?.availability === "ready" &&
-    matcherControl.mode === "force_hit";
+    matcherControl.mode === "always_true";
   const resolvedIcon =
     icon ??
     (definition
@@ -80,9 +80,9 @@ export function PluginCardTemplate({
       className={cn(
         "group relative flex h-full min-h-[10.75rem] cursor-pointer flex-col gap-0 overflow-hidden py-0 transition-[border-color,box-shadow,transform] duration-200 hover:-translate-y-px hover:border-primary/40 hover:shadow-md",
         plugin.pinned && "border-primary/30",
-        matcherForceMiss &&
+        matcherAlwaysFalse &&
           "border-warning/40 bg-warning/5 hover:border-warning/60",
-        matcherForceHit &&
+        matcherAlwaysTrue &&
           "border-destructive/40 bg-destructive/5 hover:border-destructive/60",
         !supported && "border-dashed opacity-70",
       )}

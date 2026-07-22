@@ -174,25 +174,29 @@ export const WEBUI = {
     matcherRuntimeNormal: "webui.plugins.matcherRuntimeNormal",
     matcherRuntimeNormalDescription:
       "webui.plugins.matcherRuntimeNormalDescription",
-    matcherForceMiss: "webui.plugins.matcherForceMiss",
-    matcherForceMissDescription: "webui.plugins.matcherForceMissDescription",
-    matcherForceMissAction: "webui.plugins.matcherForceMissAction",
-    matcherForceHit: "webui.plugins.matcherForceHit",
-    matcherForceHitDescription: "webui.plugins.matcherForceHitDescription",
-    matcherForceHitAction: "webui.plugins.matcherForceHitAction",
+    matcherAlwaysFalse: "webui.plugins.matcherAlwaysFalse",
+    matcherAlwaysFalseDescription:
+      "webui.plugins.matcherAlwaysFalseDescription",
+    matcherAlwaysFalseAction: "webui.plugins.matcherAlwaysFalseAction",
+    matcherAlwaysTrue: "webui.plugins.matcherAlwaysTrue",
+    matcherAlwaysTrueDescription: "webui.plugins.matcherAlwaysTrueDescription",
+    matcherAlwaysTrueAction: "webui.plugins.matcherAlwaysTrueAction",
     matcherModeActions: "webui.plugins.matcherModeActions",
     matcherRestoreAction: "webui.plugins.matcherRestoreAction",
-    matcherForceMissConfirmTitle: "webui.plugins.matcherForceMissConfirmTitle",
-    matcherForceMissConfirmDescription:
-      "webui.plugins.matcherForceMissConfirmDescription",
-    matcherForceMissImpact: "webui.plugins.matcherForceMissImpact",
-    matcherForceMissConfirmAction:
-      "webui.plugins.matcherForceMissConfirmAction",
-    matcherForceHitConfirmTitle: "webui.plugins.matcherForceHitConfirmTitle",
-    matcherForceHitConfirmDescription:
-      "webui.plugins.matcherForceHitConfirmDescription",
-    matcherForceHitImpact: "webui.plugins.matcherForceHitImpact",
-    matcherForceHitConfirmAction: "webui.plugins.matcherForceHitConfirmAction",
+    matcherAlwaysFalseConfirmTitle:
+      "webui.plugins.matcherAlwaysFalseConfirmTitle",
+    matcherAlwaysFalseConfirmDescription:
+      "webui.plugins.matcherAlwaysFalseConfirmDescription",
+    matcherAlwaysFalseImpact: "webui.plugins.matcherAlwaysFalseImpact",
+    matcherAlwaysFalseConfirmAction:
+      "webui.plugins.matcherAlwaysFalseConfirmAction",
+    matcherAlwaysTrueConfirmTitle:
+      "webui.plugins.matcherAlwaysTrueConfirmTitle",
+    matcherAlwaysTrueConfirmDescription:
+      "webui.plugins.matcherAlwaysTrueConfirmDescription",
+    matcherAlwaysTrueImpact: "webui.plugins.matcherAlwaysTrueImpact",
+    matcherAlwaysTrueConfirmAction:
+      "webui.plugins.matcherAlwaysTrueConfirmAction",
     matcherModeResetHint: "webui.plugins.matcherModeResetHint",
     matcherControlLoading: "webui.plugins.matcherControlLoading",
     matcherControlUnavailable: "webui.plugins.matcherControlUnavailable",
@@ -482,8 +486,10 @@ export const WEBUI = {
     eventCount: "webui.queryRecordFlow.eventCount",
     matched: "webui.queryRecordFlow.matched",
     notMatched: "webui.queryRecordFlow.notMatched",
-    forceHit: "webui.queryRecordFlow.forceHit",
-    forceMiss: "webui.queryRecordFlow.forceMiss",
+    alwaysTrueMatched: "webui.queryRecordFlow.alwaysTrueMatched",
+    alwaysTrueNotMatched: "webui.queryRecordFlow.alwaysTrueNotMatched",
+    alwaysFalseMatched: "webui.queryRecordFlow.alwaysFalseMatched",
+    alwaysFalseNotMatched: "webui.queryRecordFlow.alwaysFalseNotMatched",
     unchecked: "webui.queryRecordFlow.unchecked",
     topologyUnavailable: "webui.queryRecordFlow.topologyUnavailable",
     missingSequenceConfig: "webui.queryRecordFlow.missingSequenceConfig",

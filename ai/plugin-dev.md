@@ -43,7 +43,7 @@ Fall back to `register_plugin_factory!("type", expr)` only when:
 - Reuse existing abstractions (`DnsContext`, `Executor`, `Matcher`, `Provider`, `RequestHandle`, upstream pools, plugin registry) before introducing parallel frameworks.
 - Keep platform-specific code clearly guarded — especially Linux-only netlink, `ipset`, and `nftset` paths.
 - Management HTTP API integration must compile cleanly without the `api` feature. Gate the module with `#[cfg(feature = "api")]` or keep feature-specific implementations behind internal `cfg` branches when a no-op facade is required.
-- Resolve configured matcher dependencies with `PluginInitContext::matcher_ref(field, tag, reverse)` and evaluate the returned `MatcherRef`. Do not extract an `Arc<dyn Matcher>` and apply `!` outside the reference: runtime `force_hit` / `force_miss` modes override the final expression result after negation.
+- Resolve configured matcher dependencies with `PluginInitContext::matcher_ref(field, tag, reverse)` and evaluate the returned `MatcherRef`. Do not extract an `Arc<dyn Matcher>` and apply `!` outside the reference: runtime `always_true` / `always_false` modes fix the matcher base result before each reference applies its own negation.
 
 ### Package boundaries
 

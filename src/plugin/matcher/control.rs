@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(any(feature = "api", test))]
 use serde::{Deserialize, Serialize};
 
-/// Operational override applied after matcher-expression negation.
+/// Operational override applied to the matcher result before expression
+/// negation.
 #[cfg(any(feature = "api", test))]
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[repr(u8)]
@@ -17,8 +18,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum MatcherRuntimeMode {
     #[default]
     Normal = 0,
-    ForceMiss = 1,
-    ForceHit = 2,
+    AlwaysFalse = 1,
+    AlwaysTrue = 2,
 }
 
 #[cfg(any(feature = "api", test))]
@@ -26,8 +27,8 @@ impl MatcherRuntimeMode {
     #[inline]
     fn from_raw(raw: u8) -> Self {
         match raw {
-            value if value == Self::ForceMiss as u8 => Self::ForceMiss,
-            value if value == Self::ForceHit as u8 => Self::ForceHit,
+            value if value == Self::AlwaysFalse as u8 => Self::AlwaysFalse,
+            value if value == Self::AlwaysTrue as u8 => Self::AlwaysTrue,
             _ => Self::Normal,
         }
     }
@@ -100,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_modes_override_final_positive_and_negated_results() {
+    fn runtime_modes_fix_the_base_result_before_reference_negation() {
         let calls = Arc::new(AtomicUsize::new(0));
         let matcher: Arc<dyn Matcher> = Arc::new(CountingMatcher {
             calls: calls.clone(),
@@ -118,17 +119,26 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
 
-        control.set_mode(MatcherRuntimeMode::ForceMiss);
-        assert_eq!(normal.evaluate(&mut context), MatcherEvaluation::ForceMiss);
+        control.set_mode(MatcherRuntimeMode::AlwaysFalse);
+        assert_eq!(
+            normal.evaluate(&mut context),
+            MatcherEvaluation::AlwaysFalse { matched: false }
+        );
         assert_eq!(
             reversed.evaluate(&mut context),
-            MatcherEvaluation::ForceMiss
+            MatcherEvaluation::AlwaysFalse { matched: true }
         );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
 
-        control.set_mode(MatcherRuntimeMode::ForceHit);
-        assert_eq!(normal.evaluate(&mut context), MatcherEvaluation::ForceHit);
-        assert_eq!(reversed.evaluate(&mut context), MatcherEvaluation::ForceHit);
+        control.set_mode(MatcherRuntimeMode::AlwaysTrue);
+        assert_eq!(
+            normal.evaluate(&mut context),
+            MatcherEvaluation::AlwaysTrue { matched: true }
+        );
+        assert_eq!(
+            reversed.evaluate(&mut context),
+            MatcherEvaluation::AlwaysTrue { matched: false }
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
 
         control.set_mode(MatcherRuntimeMode::Normal);

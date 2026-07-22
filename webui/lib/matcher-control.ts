@@ -1,12 +1,12 @@
 import type { PluginInstance } from "./types";
 
 export type MatcherControlAvailability = "loading" | "ready" | "unavailable";
-export type MatcherRuntimeMode = "normal" | "force_miss" | "force_hit";
-export type ForcedMatcherRuntimeMode = Exclude<MatcherRuntimeMode, "normal">;
+export type MatcherRuntimeMode = "normal" | "always_false" | "always_true";
+export type FixedMatcherRuntimeMode = Exclude<MatcherRuntimeMode, "normal">;
 
 export type MatcherModeChangePlan =
   | { kind: "apply"; mode: "normal" }
-  | { kind: "confirm"; mode: ForcedMatcherRuntimeMode };
+  | { kind: "confirm"; mode: FixedMatcherRuntimeMode };
 
 export interface MatcherControlState {
   availability: MatcherControlAvailability;

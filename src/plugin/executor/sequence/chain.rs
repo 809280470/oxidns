@@ -877,41 +877,91 @@ mod tests {
 
     #[cfg(feature = "_sequence-step-recording")]
     #[tokio::test]
-    async fn test_sequence_records_forced_matcher_outcomes() {
+    async fn test_shared_runtime_mode_preserves_positive_and_negated_references() {
         use crate::plugin::matcher::{MatcherRuntimeControl, MatcherRuntimeMode};
 
         let control = Arc::new(MatcherRuntimeControl::new());
-        let matcher =
-            MatcherRef::with_runtime_control(Arc::new(AlwaysMatcher), true, control.clone());
-        let program = Arc::new(ChainProgram::new(
-            "test_sequence".to_string(),
+        let matcher = Arc::new(AlwaysMatcher);
+        let positive_program = Arc::new(ChainProgram::new(
+            "positive_sequence".to_string(),
             vec![Instruction::new(
                 0,
-                vec![matcher],
+                vec![MatcherRef::with_runtime_control(
+                    matcher.clone(),
+                    false,
+                    control.clone(),
+                )],
+                InstructionOp::Builtin(BuiltinOp::Accept),
+            )],
+        ));
+        let negated_program = Arc::new(ChainProgram::new(
+            "negated_sequence".to_string(),
+            vec![Instruction::new(
+                0,
+                vec![MatcherRef::with_runtime_control(
+                    matcher,
+                    true,
+                    control.clone(),
+                )],
                 InstructionOp::Builtin(BuiltinOp::Accept),
             )],
         ));
 
-        control.set_mode(MatcherRuntimeMode::ForceMiss);
-        let mut miss_context = make_context();
-        miss_context.enable_execution_path();
+        control.set_mode(MatcherRuntimeMode::AlwaysFalse);
+        let mut positive_false_context = make_context();
+        positive_false_context.enable_execution_path();
         assert_eq!(
-            program.run(&mut miss_context).await.unwrap(),
+            positive_program
+                .run(&mut positive_false_context)
+                .await
+                .unwrap(),
             ExecStep::Next
         );
-        assert_eq!(miss_context.execution_path_events().len(), 1);
         assert_eq!(
-            miss_context.execution_path_events()[0].outcome,
-            "force_miss"
+            positive_false_context.execution_path_events()[0].outcome,
+            "always_false_not_matched"
+        );
+        let mut negated_false_context = make_context();
+        negated_false_context.enable_execution_path();
+        assert_eq!(
+            negated_program
+                .run(&mut negated_false_context)
+                .await
+                .unwrap(),
+            ExecStep::Stop
+        );
+        assert_eq!(
+            negated_false_context.execution_path_events()[0].outcome,
+            "always_false_matched"
         );
 
-        control.set_mode(MatcherRuntimeMode::ForceHit);
-        let mut hit_context = make_context();
-        hit_context.enable_execution_path();
-        assert_eq!(program.run(&mut hit_context).await.unwrap(), ExecStep::Stop);
-        assert_eq!(hit_context.execution_path_events().len(), 2);
-        assert_eq!(hit_context.execution_path_events()[0].outcome, "force_hit");
-        assert_eq!(hit_context.execution_path_events()[1].outcome, "stop");
+        control.set_mode(MatcherRuntimeMode::AlwaysTrue);
+        let mut positive_true_context = make_context();
+        positive_true_context.enable_execution_path();
+        assert_eq!(
+            positive_program
+                .run(&mut positive_true_context)
+                .await
+                .unwrap(),
+            ExecStep::Stop
+        );
+        assert_eq!(
+            positive_true_context.execution_path_events()[0].outcome,
+            "always_true_matched"
+        );
+        let mut negated_true_context = make_context();
+        negated_true_context.enable_execution_path();
+        assert_eq!(
+            negated_program
+                .run(&mut negated_true_context)
+                .await
+                .unwrap(),
+            ExecStep::Next
+        );
+        assert_eq!(
+            negated_true_context.execution_path_events()[0].outcome,
+            "always_true_not_matched"
+        );
     }
 
     #[cfg(not(feature = "_sequence-step-recording"))]

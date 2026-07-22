@@ -103,9 +103,9 @@ impl<'a> PluginInitContext<'a> {
 
     /// Resolve a configured matcher expression with its runtime control.
     ///
-    /// `reverse` represents the expression-level `!` modifier. Runtime force
-    /// modes are applied after this modifier, so consumers must keep matcher
-    /// evaluation inside the returned [`MatcherRef`].
+    /// `reverse` represents the expression-level `!` modifier. Runtime modes
+    /// determine the matcher base result first, then this modifier is applied,
+    /// so consumers must keep evaluation inside the returned [`MatcherRef`].
     pub fn matcher_ref(&self, field: &str, target_tag: &str, reverse: bool) -> Result<MatcherRef> {
         self.registry
             .get_matcher_ref_dependency(&self.tag, field, target_tag, reverse)

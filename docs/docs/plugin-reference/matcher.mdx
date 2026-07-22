@@ -14,12 +14,12 @@ import Admonition from "@theme/Admonition";
 | 模式 | `$matcher` | `!$matcher` |
 | --- | --- | --- |
 | `normal` | 使用 matcher 原始结果 | 使用原始结果的取反 |
-| `force_miss` | 不命中 | 不命中 |
-| `force_hit` | 命中 | 命中 |
+| `always_false` | 不命中 | 命中 |
+| `always_true` | 命中 | 不命中 |
 
-`force_miss` 和 `force_hit` 都覆盖直接引用的最终表达式结果，不再执行 matcher 内部逻辑，也不再应用外层取反。WebUI 对两个强制操作都要求二次确认，恢复 `normal` 不需要确认。
+`always_false` 和 `always_true` 会跳过 matcher 内部逻辑并固定其基础布尔值，但每个引用仍独立应用外层取反。WebUI 对两个固定操作都要求二次确认，恢复 `normal` 不需要确认。
 
-强制模式只作用于该 tag 的直接引用。例如把 `any_match` 的一个子 matcher 设为 `force_miss`，只会让该子项贡献 `false`，其它子项仍会正常参与组合；如需控制整个组合，应切换 `any_match` 自身的运行时模式。
+运行时模式由 matcher tag 共享，引用语义则由引用位置决定。例如同一 tag 同时以 `$matcher` 与 `!$matcher` 出现在一个或多个 sequence 中，两者共享同一个固定基础值，但最终结果始终互为取反。`any_match` 的子引用也遵循同一规则；如需控制整个组合，应切换 `any_match` 自身的运行时模式。
 
 该状态不会写入配置，全量 reload 或进程重启后恢复 `normal`。quick-setup matcher 没有稳定的公开 tag，因此不提供运行时模式；需要控制时应先把表达式提取为独立 matcher。接口详情见 [管理 API](../api.mdx#matcher)。
 

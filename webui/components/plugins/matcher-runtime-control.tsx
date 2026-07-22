@@ -2,10 +2,10 @@
 
 import { useState, type MouseEvent } from "react";
 import {
-  CheckCircle2Icon,
   RotateCcwIcon,
   SlidersHorizontalIcon,
-  XCircleIcon,
+  ToggleLeftIcon,
+  ToggleRightIcon,
 } from "lucide-react";
 
 import {
@@ -47,7 +47,7 @@ import { WEBUI } from "@/lib/i18n";
 import { useI18n } from "@/lib/i18n/provider";
 import {
   planMatcherModeChange,
-  type ForcedMatcherRuntimeMode,
+  type FixedMatcherRuntimeMode,
   type MatcherRuntimeMode,
 } from "@/lib/matcher-control";
 import { useAppStore } from "@/lib/store";
@@ -65,7 +65,7 @@ export function MatcherRuntimeControl({
 }: MatcherRuntimeControlProps) {
   const { t } = useI18n();
   const [confirmMode, setConfirmMode] =
-    useState<ForcedMatcherRuntimeMode | null>(null);
+    useState<FixedMatcherRuntimeMode | null>(null);
   const control = useAppStore((state) => state.matcherControls[plugin.name]);
   const setMatcherMode = useAppStore((state) => state.setMatcherMode);
 
@@ -74,35 +74,35 @@ export function MatcherRuntimeControl({
   const ready = control?.availability === "ready" && control.mode !== null;
   const pending = Boolean(control?.pending);
   const currentMode = ready ? control.mode : null;
-  const forcedMiss = currentMode === "force_miss";
-  const forcedHit = currentMode === "force_hit";
-  const forced = forcedMiss || forcedHit;
+  const alwaysFalse = currentMode === "always_false";
+  const alwaysTrue = currentMode === "always_true";
+  const fixed = alwaysFalse || alwaysTrue;
   const loading = control?.availability === "loading";
   const unavailable = !ready && !loading;
   const positiveReference = `$${plugin.name}`;
   const negativeReference = `!$${plugin.name}`;
 
   const statusLabel = ready
-    ? forcedMiss
-      ? t(WEBUI.plugins.matcherForceMiss)
-      : forcedHit
-        ? t(WEBUI.plugins.matcherForceHit)
+    ? alwaysFalse
+      ? t(WEBUI.plugins.matcherAlwaysFalse)
+      : alwaysTrue
+        ? t(WEBUI.plugins.matcherAlwaysTrue)
         : t(WEBUI.plugins.matcherRuntimeNormal)
     : loading
       ? t(WEBUI.plugins.matcherControlLoading)
       : t(WEBUI.plugins.matcherControlUnavailable);
 
   const statusDescription = ready
-    ? forcedMiss
-      ? t(WEBUI.plugins.matcherForceMissDescription)
-      : forcedHit
-        ? t(WEBUI.plugins.matcherForceHitDescription)
+    ? alwaysFalse
+      ? t(WEBUI.plugins.matcherAlwaysFalseDescription)
+      : alwaysTrue
+        ? t(WEBUI.plugins.matcherAlwaysTrueDescription)
         : t(WEBUI.plugins.matcherRuntimeNormalDescription)
     : loading
       ? t(WEBUI.plugins.matcherControlLoading)
       : t(WEBUI.plugins.matcherControlUnavailable);
 
-  const applyForcedMode = async (event: MouseEvent<HTMLButtonElement>) => {
+  const applyFixedMode = async (event: MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     if (!confirmMode) return;
     try {
@@ -126,10 +126,10 @@ export function MatcherRuntimeControl({
 
   const modeIcon = loading ? (
     <Spinner data-icon="inline-start" />
-  ) : forcedMiss ? (
-    <XCircleIcon data-icon="inline-start" />
-  ) : forcedHit ? (
-    <CheckCircle2Icon data-icon="inline-start" />
+  ) : alwaysFalse ? (
+    <ToggleLeftIcon data-icon="inline-start" />
+  ) : alwaysTrue ? (
+    <ToggleRightIcon data-icon="inline-start" />
   ) : (
     <SlidersHorizontalIcon data-icon="inline-start" />
   );
@@ -150,25 +150,25 @@ export function MatcherRuntimeControl({
       <DropdownMenuContent align="end" className="min-w-44">
         <DropdownMenuLabel>{statusLabel}</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        {forced ? (
+        {fixed ? (
           <DropdownMenuItem onSelect={() => requestModeChange("normal")}>
             <RotateCcwIcon />
             {t(WEBUI.plugins.matcherRestoreAction)}
           </DropdownMenuItem>
         ) : null}
-        {!forcedMiss ? (
-          <DropdownMenuItem onSelect={() => requestModeChange("force_miss")}>
-            <XCircleIcon />
-            {t(WEBUI.plugins.matcherForceMissAction)}
+        {!alwaysFalse ? (
+          <DropdownMenuItem onSelect={() => requestModeChange("always_false")}>
+            <ToggleLeftIcon />
+            {t(WEBUI.plugins.matcherAlwaysFalseAction)}
           </DropdownMenuItem>
         ) : null}
-        {!forcedHit ? (
+        {!alwaysTrue ? (
           <DropdownMenuItem
             variant="destructive"
-            onSelect={() => requestModeChange("force_hit")}
+            onSelect={() => requestModeChange("always_true")}
           >
-            <CheckCircle2Icon />
-            {t(WEBUI.plugins.matcherForceHitAction)}
+            <ToggleRightIcon />
+            {t(WEBUI.plugins.matcherAlwaysTrueAction)}
           </DropdownMenuItem>
         ) : null}
       </DropdownMenuContent>
@@ -186,39 +186,39 @@ export function MatcherRuntimeControl({
         <AlertDialogHeader>
           <AlertDialogMedia
             className={cn(
-              confirmMode === "force_hit"
+              confirmMode === "always_true"
                 ? "bg-destructive/10 text-destructive"
                 : "bg-warning/15 text-warning-foreground",
             )}
           >
-            {confirmMode === "force_hit" ? (
-              <CheckCircle2Icon />
+            {confirmMode === "always_true" ? (
+              <ToggleRightIcon />
             ) : (
-              <XCircleIcon />
+              <ToggleLeftIcon />
             )}
           </AlertDialogMedia>
           <AlertDialogTitle>
             {t(
-              confirmMode === "force_hit"
-                ? WEBUI.plugins.matcherForceHitConfirmTitle
-                : WEBUI.plugins.matcherForceMissConfirmTitle,
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueConfirmTitle
+                : WEBUI.plugins.matcherAlwaysFalseConfirmTitle,
               { tag: plugin.name },
             )}
           </AlertDialogTitle>
           <AlertDialogDescription>
             {t(
-              confirmMode === "force_hit"
-                ? WEBUI.plugins.matcherForceHitConfirmDescription
-                : WEBUI.plugins.matcherForceMissConfirmDescription,
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueConfirmDescription
+                : WEBUI.plugins.matcherAlwaysFalseConfirmDescription,
             )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="flex flex-col gap-2 text-sm text-muted-foreground">
           <p>
             {t(
-              confirmMode === "force_hit"
-                ? WEBUI.plugins.matcherForceHitImpact
-                : WEBUI.plugins.matcherForceMissImpact,
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueImpact
+                : WEBUI.plugins.matcherAlwaysFalseImpact,
               {
                 positive: positiveReference,
                 negative: negativeReference,
@@ -237,15 +237,15 @@ export function MatcherRuntimeControl({
             {t(WEBUI.common.cancel)}
           </AlertDialogCancel>
           <AlertDialogAction
-            variant={confirmMode === "force_hit" ? "destructive" : "warning"}
+            variant={confirmMode === "always_true" ? "destructive" : "warning"}
             disabled={pending || confirmMode === null}
-            onClick={applyForcedMode}
+            onClick={applyFixedMode}
           >
             {pending ? <Spinner data-icon="inline-start" /> : null}
             {t(
-              confirmMode === "force_hit"
-                ? WEBUI.plugins.matcherForceHitConfirmAction
-                : WEBUI.plugins.matcherForceMissConfirmAction,
+              confirmMode === "always_true"
+                ? WEBUI.plugins.matcherAlwaysTrueConfirmAction
+                : WEBUI.plugins.matcherAlwaysFalseConfirmAction,
             )}
           </AlertDialogAction>
         </AlertDialogFooter>
@@ -255,7 +255,7 @@ export function MatcherRuntimeControl({
 
   const detailActions = (
     <div className="flex flex-wrap items-center gap-2">
-      {forced ? (
+      {fixed ? (
         <Button
           variant="outline"
           size="sm"
@@ -266,26 +266,26 @@ export function MatcherRuntimeControl({
           {t(WEBUI.plugins.matcherRestoreAction)}
         </Button>
       ) : null}
-      {!forcedMiss ? (
+      {!alwaysFalse ? (
         <Button
           variant="warning"
           size="sm"
           disabled={!ready || pending}
-          onClick={() => requestModeChange("force_miss")}
+          onClick={() => requestModeChange("always_false")}
         >
-          <XCircleIcon />
-          {t(WEBUI.plugins.matcherForceMissAction)}
+          <ToggleLeftIcon />
+          {t(WEBUI.plugins.matcherAlwaysFalseAction)}
         </Button>
       ) : null}
-      {!forcedHit ? (
+      {!alwaysTrue ? (
         <Button
           variant="destructive"
           size="sm"
           disabled={!ready || pending}
-          onClick={() => requestModeChange("force_hit")}
+          onClick={() => requestModeChange("always_true")}
         >
-          <CheckCircle2Icon />
-          {t(WEBUI.plugins.matcherForceHitAction)}
+          <ToggleRightIcon />
+          {t(WEBUI.plugins.matcherAlwaysTrueAction)}
         </Button>
       ) : null}
     </div>
@@ -317,8 +317,8 @@ export function MatcherRuntimeControl({
     <Card
       className={cn(
         "mt-4",
-        forcedMiss && "border-warning/40 bg-warning/5",
-        forcedHit && "border-destructive/40 bg-destructive/5",
+        alwaysFalse && "border-warning/40 bg-warning/5",
+        alwaysTrue && "border-destructive/40 bg-destructive/5",
       )}
     >
       <CardHeader className="flex flex-row items-start justify-between gap-3">
@@ -330,9 +330,9 @@ export function MatcherRuntimeControl({
         </div>
         <Badge
           variant={
-            forcedHit
+            alwaysTrue
               ? "destructive"
-              : forcedMiss
+              : alwaysFalse
                 ? "warning"
                 : ready
                   ? "secondary"
@@ -343,15 +343,15 @@ export function MatcherRuntimeControl({
           {statusLabel}
         </Badge>
       </CardHeader>
-      {forced || control?.error ? (
+      {fixed || control?.error ? (
         <CardContent className="flex flex-col gap-2 text-xs text-muted-foreground">
-          {forced ? (
+          {fixed ? (
             <>
               <p>
                 {t(
-                  forcedHit
-                    ? WEBUI.plugins.matcherForceHitImpact
-                    : WEBUI.plugins.matcherForceMissImpact,
+                  alwaysTrue
+                    ? WEBUI.plugins.matcherAlwaysTrueImpact
+                    : WEBUI.plugins.matcherAlwaysFalseImpact,
                   {
                     positive: positiveReference,
                     negative: negativeReference,

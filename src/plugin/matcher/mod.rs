@@ -71,9 +71,13 @@ pub(crate) enum MatcherEvaluation {
     Matched,
     NotMatched,
     #[cfg(any(feature = "api", test))]
-    ForceHit,
+    AlwaysTrue {
+        matched: bool,
+    },
     #[cfg(any(feature = "api", test))]
-    ForceMiss,
+    AlwaysFalse {
+        matched: bool,
+    },
 }
 
 impl MatcherEvaluation {
@@ -83,9 +87,9 @@ impl MatcherEvaluation {
             Self::Matched => true,
             Self::NotMatched => false,
             #[cfg(any(feature = "api", test))]
-            Self::ForceHit => true,
+            Self::AlwaysTrue { matched } => matched,
             #[cfg(any(feature = "api", test))]
-            Self::ForceMiss => false,
+            Self::AlwaysFalse { matched } => matched,
         }
     }
 
@@ -96,9 +100,13 @@ impl MatcherEvaluation {
             Self::Matched => "matched",
             Self::NotMatched => "not_matched",
             #[cfg(any(feature = "api", test))]
-            Self::ForceHit => "force_hit",
+            Self::AlwaysTrue { matched: true } => "always_true_matched",
             #[cfg(any(feature = "api", test))]
-            Self::ForceMiss => "force_miss",
+            Self::AlwaysTrue { matched: false } => "always_true_not_matched",
+            #[cfg(any(feature = "api", test))]
+            Self::AlwaysFalse { matched: true } => "always_false_matched",
+            #[cfg(any(feature = "api", test))]
+            Self::AlwaysFalse { matched: false } => "always_false_not_matched",
         }
     }
 }
@@ -138,8 +146,16 @@ impl MatcherRef {
         #[cfg(any(feature = "api", test))]
         if let Some(control) = &self.runtime_control {
             match control.mode() {
-                MatcherRuntimeMode::ForceMiss => return MatcherEvaluation::ForceMiss,
-                MatcherRuntimeMode::ForceHit => return MatcherEvaluation::ForceHit,
+                MatcherRuntimeMode::AlwaysFalse => {
+                    return MatcherEvaluation::AlwaysFalse {
+                        matched: self.reverse,
+                    };
+                }
+                MatcherRuntimeMode::AlwaysTrue => {
+                    return MatcherEvaluation::AlwaysTrue {
+                        matched: !self.reverse,
+                    };
+                }
                 MatcherRuntimeMode::Normal => {}
             }
         }

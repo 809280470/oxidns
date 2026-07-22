@@ -217,7 +217,20 @@ mod tests {
                 args: Some(serde_yaml_ng::from_str("- \"$reloadable\"").unwrap()),
             },
             PluginConfig {
-                tag: "controlled_sequence".to_string(),
+                tag: "positive_sequence".to_string(),
+                plugin_type: "sequence".to_string(),
+                args: Some(
+                    serde_yaml_ng::from_str(
+                        r#"
+- matches: "$match_qname"
+  exec: reject 2
+"#,
+                    )
+                    .unwrap(),
+                ),
+            },
+            PluginConfig {
+                tag: "negated_sequence".to_string(),
                 plugin_type: "sequence".to_string(),
                 args: Some(
                     serde_yaml_ng::from_str(
@@ -295,22 +308,40 @@ mod tests {
         assert_eq!(payload["matcher"], "match_qname");
         assert_eq!(payload["mode"], "normal");
         assert!(payload.get("enabled").is_none());
-        let sequence = registry
-            .get_plugin("controlled_sequence")
-            .expect("sequence should be initialized")
+        let positive_sequence = registry
+            .get_plugin("positive_sequence")
+            .expect("positive sequence should be initialized")
             .to_executor();
-        let public_matcher_ref = PluginResolver::matcher_ref(
+        let negated_sequence = registry
+            .get_plugin("negated_sequence")
+            .expect("negated sequence should be initialized")
+            .to_executor();
+        let public_positive_ref = PluginResolver::matcher_ref(
             registry.as_ref(),
-            "controlled_sequence",
+            "positive_sequence",
+            "args[0].matches[0]",
+            "match_qname",
+            false,
+        )?;
+        let public_negated_ref = PluginResolver::matcher_ref(
+            registry.as_ref(),
+            "negated_sequence",
             "args[0].matches[0]",
             "match_qname",
             true,
         )?;
-        let mut normal_context = test_context();
-        sequence.execute(&mut normal_context).await?;
-        assert!(normal_context.response().is_some());
-        let mut public_normal_context = test_context();
-        assert!(public_matcher_ref.is_match(&mut public_normal_context));
+        let mut positive_normal_context = test_context();
+        positive_sequence
+            .execute(&mut positive_normal_context)
+            .await?;
+        assert!(positive_normal_context.response().is_none());
+        let mut negated_normal_context = test_context();
+        negated_sequence
+            .execute(&mut negated_normal_context)
+            .await?;
+        assert!(negated_normal_context.response().is_some());
+        assert!(!public_positive_ref.is_match(&mut test_context()));
+        assert!(public_negated_ref.is_match(&mut test_context()));
 
         let uri: Uri = format!("http://{listen}/api/plugins/match_qname/mode")
             .parse()
@@ -322,7 +353,7 @@ mod tests {
                     .uri(uri)
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Full::new(bytes::Bytes::from_static(
-                        br#"{"mode":"force_miss"}"#,
+                        br#"{"mode":"always_false"}"#,
                     )))
                     .expect("request should build"),
             )
@@ -338,12 +369,17 @@ mod tests {
                 .to_bytes(),
         )
         .expect("response should be valid json");
-        assert_eq!(payload["mode"], "force_miss");
-        let mut force_miss_context = test_context();
-        sequence.execute(&mut force_miss_context).await?;
-        assert!(force_miss_context.response().is_none());
-        let mut public_force_miss_context = test_context();
-        assert!(!public_matcher_ref.is_match(&mut public_force_miss_context));
+        assert_eq!(payload["mode"], "always_false");
+        let mut positive_false_context = test_context();
+        positive_sequence
+            .execute(&mut positive_false_context)
+            .await?;
+        assert!(positive_false_context.response().is_none());
+        let mut negated_false_context = test_context();
+        negated_sequence.execute(&mut negated_false_context).await?;
+        assert!(negated_false_context.response().is_some());
+        assert!(!public_positive_ref.is_match(&mut test_context()));
+        assert!(public_negated_ref.is_match(&mut test_context()));
 
         let uri: Uri = format!("http://{listen}/api/plugins/match_qname/mode")
             .parse()
@@ -355,7 +391,7 @@ mod tests {
                     .uri(uri)
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Full::new(bytes::Bytes::from_static(
-                        br#"{"mode":"force_hit"}"#,
+                        br#"{"mode":"always_true"}"#,
                     )))
                     .expect("request should build"),
             )
@@ -371,12 +407,17 @@ mod tests {
                 .to_bytes(),
         )
         .expect("response should be valid json");
-        assert_eq!(payload["mode"], "force_hit");
-        let mut force_hit_context = test_context();
-        sequence.execute(&mut force_hit_context).await?;
-        assert!(force_hit_context.response().is_some());
-        let mut public_force_hit_context = test_context();
-        assert!(public_matcher_ref.is_match(&mut public_force_hit_context));
+        assert_eq!(payload["mode"], "always_true");
+        let mut positive_true_context = test_context();
+        positive_sequence
+            .execute(&mut positive_true_context)
+            .await?;
+        assert!(positive_true_context.response().is_some());
+        let mut negated_true_context = test_context();
+        negated_sequence.execute(&mut negated_true_context).await?;
+        assert!(negated_true_context.response().is_none());
+        assert!(public_positive_ref.is_match(&mut test_context()));
+        assert!(!public_negated_ref.is_match(&mut test_context()));
 
         let uri: Uri = format!("http://{listen}/api/plugins/match_qname/mode")
             .parse()
