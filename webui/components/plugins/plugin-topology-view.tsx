@@ -470,7 +470,10 @@ export function TopologyView({
           edges={edges}
           onNodesChange={onNodesChange}
           nodeTypes={topologyNodeTypes}
-          fitView={!hasCustomPositions}
+          // Node positions are persisted, but the viewport is not. Always fit
+          // the restored graph on mount so a custom layout does not reopen at
+          // the canvas origin instead of the visual center.
+          fitView
           fitViewOptions={{ padding: 0.12 }}
           nodesDraggable
           minZoom={0.2}
