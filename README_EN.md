@@ -90,7 +90,7 @@ See [Configuration](https://oxidns.org/en/configuration) and [Common Scenarios](
 | Rule data | Domain and IP sets, GeoIP, GeoSite, AdGuard rules, dynamic domain learning |
 | System integrations | Linux `ipset` / `nftset`, RouterOS address lists / static routes, HTTP webhooks, external scripts |
 | Observability | Query auditing and execution paths, real-time logs, Prometheus metrics, upstream probes, health checks |
-| Runtime management | Config validation and hot reload, temporary matcher bypasses, targeted provider reloads, cache and upgrade management |
+| Runtime management | Config validation and hot reload, forced matcher hits/misses, targeted provider reloads, cache and upgrade management |
 | Deployment | Multi-platform builds, Debian packages, OpenWrt LuCI app, built-in WebUI and management API, service installation |
 
 See the [Plugin Reference](https://oxidns.org/en/plugin-reference/overview) for the complete list of built-in components and configuration fields.

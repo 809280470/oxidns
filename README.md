@@ -90,7 +90,7 @@ plugins:
 | 规则数据 | 域名与 IP 集、GeoIP、GeoSite、AdGuard 规则、动态域名学习 |
 | 系统联动 | Linux `ipset` / `nftset`、RouterOS address-list / static route、HTTP webhook、外部脚本 |
 | 可观测性 | 查询审计与执行路径、实时日志、Prometheus 指标、上游探测、健康检查 |
-| 运行时管理 | 配置校验与热重载、matcher 临时旁路、provider 定向重载、缓存与升级管理 |
+| 运行时管理 | 配置校验与热重载、matcher 强制命中/不命中、provider 定向重载、缓存与升级管理 |
 | 部署能力 | 多平台构建、Debian 包、OpenWrt LuCI 插件、内置 WebUI 与管理 API、服务化安装 |
 
 完整的内置组件和配置字段见[插件参考](https://oxidns.org/plugin-reference/overview)。

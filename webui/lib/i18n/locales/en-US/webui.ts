@@ -183,21 +183,30 @@ export const enUSWebui = {
     matcherRuntimeNormal: "Participating normally",
     matcherRuntimeNormalDescription:
       "This matcher is participating in rule evaluation as configured.",
-    matcherBypassed: "Temporarily bypassed",
-    matcherBypassedDescription:
-      "This matcher currently returns false without running its internal predicate.",
-    matcherBypassAction: "Temporarily bypass",
+    matcherForceMiss: "Forced miss",
+    matcherForceMissDescription:
+      "Every direct reference to this matcher currently misses without running its internal predicate.",
+    matcherForceMissAction: "Force miss",
+    matcherForceHit: "Forced hit",
+    matcherForceHitDescription:
+      "Every direct reference to this matcher currently hits without running its internal predicate.",
+    matcherForceHitAction: "Force hit",
+    matcherModeActions: "Matcher runtime mode",
     matcherRestoreAction: "Restore matching",
-    matcherBypassConfirmTitle: "Temporarily bypass {tag}?",
-    matcherBypassConfirmDescription:
-      "This only affects the current runtime and does not modify the configuration.",
-    matcherBypassPositiveImpact:
-      "Conditions referencing {reference} will no longer match.",
-    matcherBypassNegatedImpact:
-      "Conditions referencing {reference} will match.",
-    matcherBypassResetHint:
+    matcherForceMissConfirmTitle: "Force {tag} to miss?",
+    matcherForceMissConfirmDescription:
+      "This skips the internal predicate, affects only the current runtime, and does not modify configuration.",
+    matcherForceMissImpact:
+      "Conditions directly referencing {positive} and {negative} will both miss.",
+    matcherForceMissConfirmAction: "Confirm forced miss",
+    matcherForceHitConfirmTitle: "Force {tag} to hit?",
+    matcherForceHitConfirmDescription:
+      "This skips the internal predicate, may activate multiple policy branches, and affects only the current runtime.",
+    matcherForceHitImpact:
+      "Conditions directly referencing {positive} and {negative} will both hit.",
+    matcherForceHitConfirmAction: "Confirm forced hit",
+    matcherModeResetHint:
       "An application reload or process restart restores normal matching.",
-    matcherBypassConfirmAction: "Confirm temporary bypass",
     matcherControlLoading: "Loading matcher runtime state",
     matcherControlUnavailable:
       "The matcher runtime API is unavailable; apply the config or check the backend version",
@@ -425,6 +434,8 @@ export const enUSWebui = {
     eventCount: "{count} events",
     matched: "Matched",
     notMatched: "Not matched",
+    forceHit: "Forced hit",
+    forceMiss: "Forced miss",
     unchecked: "Unchecked",
     topologyUnavailable:
       "Config topology is unavailable; showing events in recorded order.",

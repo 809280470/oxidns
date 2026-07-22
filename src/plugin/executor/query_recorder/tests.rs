@@ -1135,6 +1135,67 @@ async fn test_query_recorder_matcher_stats_use_record_filters() {
 }
 
 #[tokio::test]
+async fn test_query_recorder_treats_forced_matcher_outcomes_as_effective_results() {
+    let temp = NamedTempFile::new().unwrap();
+    let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();
+    let mut plugin = QueryRecorder::new("rec".to_string(), config);
+    plugin.init_for_test().await.unwrap();
+    let backend = plugin.backend.as_ref().unwrap().clone();
+
+    backend.enqueue(pending_record(
+        1_000,
+        1,
+        "hit.example.com.",
+        RecordType::A,
+        Ipv4Addr::new(192, 0, 2, 1),
+        Some(Rcode::NoError),
+        None,
+        &[("controlled", "force_hit")],
+    ));
+    backend.enqueue(pending_record(
+        2_000,
+        2,
+        "miss.example.com.",
+        RecordType::A,
+        Ipv4Addr::new(192, 0, 2, 2),
+        Some(Rcode::NoError),
+        None,
+        &[("controlled", "force_miss")],
+    ));
+    flush_backend(&backend).await;
+
+    assert_eq!(
+        filtered_record_ids(
+            backend.clone(),
+            list_query(QueryRecordFilter {
+                matcher_tag: Some("controlled".to_string()),
+                ..QueryRecordFilter::default()
+            }),
+        ),
+        vec![1]
+    );
+
+    let (_, stats) = load_plugin_stats(
+        backend,
+        PluginsStatsQuery {
+            since_ms: None,
+            until_ms: None,
+            kind: PluginStatsKind::Matcher,
+            filter: QueryRecordFilter::default(),
+        },
+    )
+    .unwrap();
+    let controlled = stats
+        .iter()
+        .find(|row| row.tag.as_deref() == Some("controlled"))
+        .unwrap();
+    assert_eq!(controlled.checked, 2);
+    assert_eq!(controlled.matched, 1);
+
+    plugin.destroy().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_query_recorder_plugin_stats_preserve_total_without_steps() {
     let temp = NamedTempFile::new().unwrap();
     let config = resolve_config(Some(recorder_config(&temp.path().display().to_string()))).unwrap();

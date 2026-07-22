@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  planMatcherModeChange,
   reconcileMatcherControls,
   type MatcherControlState,
 } from "./matcher-control";
@@ -27,11 +28,25 @@ function plugin(
 }
 
 describe("matcher runtime state", () => {
+  it.each(["force_miss", "force_hit"] as const)(
+    "requires confirmation before applying %s",
+    (mode) => {
+      expect(planMatcherModeChange(mode)).toEqual({ kind: "confirm", mode });
+    },
+  );
+
+  it("restores normal mode without confirmation", () => {
+    expect(planMatcherModeChange("normal")).toEqual({
+      kind: "apply",
+      mode: "normal",
+    });
+  });
+
   it("keeps known controls, adds unavailable matchers, and removes stale tags", () => {
     const ready: MatcherControlState = {
       availability: "ready",
       pending: false,
-      enabled: false,
+      mode: "force_miss",
     };
     const controls = reconcileMatcherControls(
       [
@@ -47,7 +62,7 @@ describe("matcher runtime state", () => {
       new_matcher: {
         availability: "unavailable",
         pending: false,
-        enabled: null,
+        mode: null,
       },
     });
   });

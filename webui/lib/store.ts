@@ -24,7 +24,7 @@ import {
   requestRestart,
   reloadProvider as requestProviderReload,
   saveConfigFile,
-  setMatcherEnabled as requestMatcherEnabled,
+  setMatcherMode as requestMatcherMode,
   validateConfigText,
   type BuildInfo,
   type ConfigFileResponse,
@@ -79,6 +79,7 @@ import {
 import {
   reconcileMatcherControls,
   type MatcherControlState,
+  type MatcherRuntimeMode,
 } from "./matcher-control";
 import {
   reconcileProviderReloads,
@@ -178,7 +179,7 @@ interface AppState {
   deleteConfigSnapshot: (id: string) => void;
   clearConfigHistory: () => void;
   togglePluginPin: (id: string) => void;
-  setMatcherEnabled: (id: string, enabled: boolean) => Promise<void>;
+  setMatcherMode: (id: string, mode: MatcherRuntimeMode) => Promise<void>;
   reloadProvider: (id: string) => Promise<void>;
   clearProviderReloadResult: (id: string) => void;
   reorderPlugins: (orderedVisibleIds: string[]) => Promise<void>;
@@ -555,7 +556,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           {
             availability: "loading" as const,
             pending: false,
-            enabled: state.matcherControls[plugin.name]?.enabled ?? null,
+            mode: state.matcherControls[plugin.name]?.mode ?? null,
             ...(state.matcherControls[plugin.name]?.error
               ? { error: state.matcherControls[plugin.name].error }
               : {}),
@@ -587,13 +588,13 @@ export const useAppStore = create<AppState>((set, get) => ({
           matcherControls[tag] = {
             availability: "ready",
             pending: false,
-            enabled: result.value.response.enabled,
+            mode: result.value.response.mode,
           };
         } else {
           matcherControls[tag] = {
             availability: "unavailable",
             pending: false,
-            enabled: state.matcherControls[tag]?.enabled ?? null,
+            mode: state.matcherControls[tag]?.mode ?? null,
             error:
               result.reason instanceof Error
                 ? result.reason.message
@@ -890,13 +891,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     }),
 
-  setMatcherEnabled: async (id, enabled) => {
+  setMatcherMode: async (id, mode) => {
     const plugin = get().plugins.find((candidate) => candidate.id === id);
     if (!plugin || plugin.type !== "matcher") return;
     const control = get().matcherControls[plugin.name];
     if (
       control?.availability !== "ready" ||
-      control.enabled === null ||
+      control.mode === null ||
       control.pending
     )
       return;
@@ -907,20 +908,20 @@ export const useAppStore = create<AppState>((set, get) => ({
         [plugin.name]: {
           availability: "ready",
           pending: true,
-          enabled: control.enabled,
+          mode: control.mode,
         },
       },
     }));
 
     try {
-      const response = await requestMatcherEnabled(plugin.name, enabled);
+      const response = await requestMatcherMode(plugin.name, mode);
       set((state) => ({
         matcherControls: {
           ...state.matcherControls,
           [plugin.name]: {
             availability: "ready",
             pending: false,
-            enabled: response.enabled,
+            mode: response.mode,
           },
         },
       }));
@@ -935,7 +936,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           [plugin.name]: {
             availability: "ready",
             pending: false,
-            enabled: state.matcherControls[plugin.name]?.enabled ?? null,
+            mode: state.matcherControls[plugin.name]?.mode ?? null,
             error: message,
           },
         },
@@ -1307,7 +1308,7 @@ function applyConfigFileResponse(
           {
             availability: "loading" as const,
             pending: false,
-            enabled: state.matcherControls[plugin.name]?.enabled ?? null,
+            mode: state.matcherControls[plugin.name]?.mode ?? null,
           },
         ]),
     ),

@@ -16,9 +16,9 @@ use crate::config::types::PluginConfig;
 use crate::infra::error::{DnsError, Result};
 use crate::plugin::dependency::DependencyKind;
 use crate::plugin::executor::Executor;
-use crate::plugin::matcher::Matcher;
 #[cfg(feature = "api")]
-use crate::plugin::matcher::attach_runtime_control;
+use crate::plugin::matcher::MatcherRuntimeControl;
+use crate::plugin::matcher::{Matcher, MatcherRef};
 use crate::plugin::provider::{Provider, ProviderRuntimeControl};
 use crate::plugin::runtime_control::PluginRuntimeControl;
 use crate::plugin::{PluginCreateContext, PluginFactory, PluginHolder, PluginInfo, PluginType};
@@ -370,10 +370,11 @@ impl PluginRegistry {
                 #[cfg(feature = "api")]
                 {
                     if matcher_runtime_controls_enabled {
-                        let (matcher, control) = attach_runtime_control(matcher);
                         (
                             PluginHolder::Matcher(matcher),
-                            Some(PluginRuntimeControl::Matcher(control)),
+                            Some(PluginRuntimeControl::Matcher(Arc::new(
+                                MatcherRuntimeControl::new(),
+                            ))),
                         )
                     } else {
                         (PluginHolder::Matcher(matcher), None)
@@ -523,6 +524,26 @@ impl PluginRegistry {
             )));
         }
         Ok(plugin.to_matcher())
+    }
+
+    /// Resolve a matcher dependency together with expression-level negation
+    /// and the runtime force-mode control shared by its configured tag.
+    pub fn get_matcher_ref_dependency(
+        &self,
+        source_tag: &str,
+        field: &str,
+        target_tag: &str,
+        reverse: bool,
+    ) -> Result<MatcherRef> {
+        let matcher = self.get_matcher_dependency(source_tag, field, target_tag)?;
+        #[cfg(feature = "api")]
+        {
+            let plugin = self.get_required_plugin(source_tag, field, target_tag)?;
+            if let Some(PluginRuntimeControl::Matcher(control)) = plugin.runtime_control() {
+                return Ok(MatcherRef::with_runtime_control(matcher, reverse, control));
+            }
+        }
+        Ok(MatcherRef::new(matcher, reverse))
     }
 
     pub fn get_provider_dependency(

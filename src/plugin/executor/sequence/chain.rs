@@ -362,16 +362,16 @@ impl ChainProgram {
 
     fn matches_instruction(&self, context: &mut DnsContext, instruction: &Instruction) -> bool {
         for matcher_ref in &instruction.matchers {
-            let matched = matcher_ref.is_match(context);
+            let evaluation = matcher_ref.evaluate(context);
             record_sequence_event!(
                 self,
                 context,
                 instruction.node_index,
                 "matcher",
                 Some(matcher_ref.tag()),
-                if matched { "matched" } else { "not_matched" },
+                evaluation.outcome(),
             );
-            if !matched {
+            if !evaluation.is_match() {
                 debug!("instruction skipped, matcher: {}", matcher_ref.tag());
                 return false;
             }
@@ -503,11 +503,16 @@ impl<'a> ChainBuilder<'a> {
             for (match_index, matcher_raw) in matcher_exprs.iter().enumerate() {
                 let field = format!("args[{}].matches[{}]", node_index, match_index);
                 let (reverse, matcher_expr) = parse_matcher_expr(matcher_raw)?;
-                matchers.push(MatcherRef::new(
-                    self.resolve_matcher_ref(matcher_expr, node_index, match_index, &field)
-                        .await?,
-                    reverse,
-                ));
+                matchers.push(
+                    self.resolve_matcher_ref(
+                        matcher_expr,
+                        reverse,
+                        node_index,
+                        match_index,
+                        &field,
+                    )
+                    .await?,
+                );
             }
         }
 
@@ -604,12 +609,13 @@ impl<'a> ChainBuilder<'a> {
     async fn resolve_matcher_ref(
         &mut self,
         expr: &str,
+        reverse: bool,
         node_index: usize,
         match_index: usize,
         field: &str,
-    ) -> Result<Arc<dyn Matcher>> {
+    ) -> Result<MatcherRef> {
         match PluginRef::from_str(expr)? {
-            PluginRef::PluginTag(tag) => self.context.matcher(field, &tag),
+            PluginRef::PluginTag(tag) => self.context.matcher_ref(field, &tag, reverse),
             PluginRef::QuickSetup { plugin_type, param } => {
                 // Generate deterministic synthetic runtime tag for quick-setup matcher.
                 let quick_tag = format!(
@@ -630,7 +636,7 @@ impl<'a> ChainBuilder<'a> {
                     }
                 };
                 self.quick_setup_matchers.push(matcher.clone());
-                Ok(matcher)
+                Ok(MatcherRef::new(matcher, reverse))
             }
         }
     }
@@ -808,6 +814,22 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AlwaysMatcher;
+
+    #[async_trait]
+    impl Plugin for AlwaysMatcher {
+        fn tag(&self) -> &str {
+            "controlled"
+        }
+    }
+
+    impl Matcher for AlwaysMatcher {
+        fn is_match(&self, _context: &mut DnsContext) -> bool {
+            true
+        }
+    }
+
     fn make_context() -> DnsContext {
         let mut request = Message::new();
         request.set_id(42);
@@ -851,6 +873,45 @@ mod tests {
         assert_eq!(events[0].kind, "builtin");
         assert_eq!(events[0].tag.as_deref(), Some("accept"));
         assert_eq!(events[0].outcome, "stop");
+    }
+
+    #[cfg(feature = "_sequence-step-recording")]
+    #[tokio::test]
+    async fn test_sequence_records_forced_matcher_outcomes() {
+        use crate::plugin::matcher::{MatcherRuntimeControl, MatcherRuntimeMode};
+
+        let control = Arc::new(MatcherRuntimeControl::new());
+        let matcher =
+            MatcherRef::with_runtime_control(Arc::new(AlwaysMatcher), true, control.clone());
+        let program = Arc::new(ChainProgram::new(
+            "test_sequence".to_string(),
+            vec![Instruction::new(
+                0,
+                vec![matcher],
+                InstructionOp::Builtin(BuiltinOp::Accept),
+            )],
+        ));
+
+        control.set_mode(MatcherRuntimeMode::ForceMiss);
+        let mut miss_context = make_context();
+        miss_context.enable_execution_path();
+        assert_eq!(
+            program.run(&mut miss_context).await.unwrap(),
+            ExecStep::Next
+        );
+        assert_eq!(miss_context.execution_path_events().len(), 1);
+        assert_eq!(
+            miss_context.execution_path_events()[0].outcome,
+            "force_miss"
+        );
+
+        control.set_mode(MatcherRuntimeMode::ForceHit);
+        let mut hit_context = make_context();
+        hit_context.enable_execution_path();
+        assert_eq!(program.run(&mut hit_context).await.unwrap(), ExecStep::Stop);
+        assert_eq!(hit_context.execution_path_events().len(), 2);
+        assert_eq!(hit_context.execution_path_events()[0].outcome, "force_hit");
+        assert_eq!(hit_context.execution_path_events()[1].outcome, "stop");
     }
 
     #[cfg(not(feature = "_sequence-step-recording"))]

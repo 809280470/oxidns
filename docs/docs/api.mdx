@@ -541,25 +541,30 @@ API 路由分成三类：
 
 ```text
 GET  /api/plugins/<matcher_tag>/status
-POST /api/plugins/<matcher_tag>/enable
-POST /api/plugins/<matcher_tag>/disable
+POST /api/plugins/<matcher_tag>/mode
 ```
 
-三个接口返回相同的状态结构：
+两个接口返回相同的状态结构：
 
 ```json
 {
   "ok": true,
   "matcher": "match_cn",
-  "enabled": true
+  "mode": "normal"
 }
 ```
 
-`enable` 和 `disable` 均为幂等操作，不需要请求体。matcher 被关闭后不会执行内部匹配逻辑，其基础结果固定为 `false`；现有取反语义仍会继续应用，因此 `!$match_cn` 在该 matcher 关闭时为 `true`。
+设置模式时提交 JSON 请求体：
 
-开关只属于当前 runtime，不写入 YAML；应用级 reload 或进程重启后恢复为开启。`sequence` 和 `any_match` 内的 quick-setup matcher 使用内部 `qs.match...` tag，不注册控制接口。如需运行时控制，应先将其提取为 `plugins:` 中的独立 matcher 并通过 `$tag` 引用。
+```json
+{ "mode": "force_miss" }
+```
 
-WebUI 将关闭操作呈现为“临时旁路”，并在执行前明确提示正向引用与取反引用的不同影响；恢复匹配不需要修改或重新应用 YAML。
+`mode` 支持 `normal`、`force_miss` 和 `force_hit`，重复设置同一模式是幂等操作。两个强制模式都会跳过内部 matcher，并覆盖直接引用的最终表达式结果：`force_miss` 使 `$match_cn` 与 `!$match_cn` 都不命中，`force_hit` 使两者都命中。缺少或不支持的模式返回 `400 invalid_matcher_runtime_mode`。
+
+模式只属于当前 runtime，不写入 YAML；应用级 reload 或进程重启后恢复为 `normal`。`sequence` 和 `any_match` 内的 quick-setup matcher 使用内部 `qs.match...` tag，不注册控制接口。如需运行时控制，应先将其提取为 `plugins:` 中的独立 matcher 并通过 `$tag` 引用。
+
+WebUI 对 `force_miss` 与 `force_hit` 都要求二次确认；恢复 `normal` 不需要确认。旧的 `/enable`、`/disable` 接口和 `enabled` 响应字段已经移除，API 客户端必须迁移到 `/mode`。
 
 ### provider
 

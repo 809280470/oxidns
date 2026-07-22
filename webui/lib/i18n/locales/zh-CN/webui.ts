@@ -175,17 +175,28 @@ export const zhCNWebui = {
     matcherRuntimeControl: "运行时控制",
     matcherRuntimeNormal: "正常参与匹配",
     matcherRuntimeNormalDescription: "该 matcher 正在按照配置参与规则判断。",
-    matcherBypassed: "临时旁路中",
-    matcherBypassedDescription:
-      "该 matcher 当前固定返回 false，内部匹配逻辑不会执行。",
-    matcherBypassAction: "临时旁路",
+    matcherForceMiss: "强制不命中",
+    matcherForceMissDescription:
+      "该 matcher 的所有直接引用当前都不命中，内部匹配逻辑不会执行。",
+    matcherForceMissAction: "强制不命中",
+    matcherForceHit: "强制命中",
+    matcherForceHitDescription:
+      "该 matcher 的所有直接引用当前都会命中，内部匹配逻辑不会执行。",
+    matcherForceHitAction: "强制命中",
+    matcherModeActions: "Matcher 运行模式",
     matcherRestoreAction: "恢复匹配",
-    matcherBypassConfirmTitle: "临时旁路 {tag}？",
-    matcherBypassConfirmDescription: "该操作只影响当前运行实例，不会修改配置。",
-    matcherBypassPositiveImpact: "引用 {reference} 的条件将不再命中。",
-    matcherBypassNegatedImpact: "引用 {reference} 的条件将会命中。",
-    matcherBypassResetHint: "应用 reload 或进程重启后自动恢复。",
-    matcherBypassConfirmAction: "确认临时旁路",
+    matcherForceMissConfirmTitle: "将 {tag} 设为强制不命中？",
+    matcherForceMissConfirmDescription:
+      "该操作会跳过内部匹配逻辑，只影响当前运行实例，不会修改配置。",
+    matcherForceMissImpact:
+      "直接引用 {positive} 和 {negative} 的条件都将不命中。",
+    matcherForceMissConfirmAction: "确认强制不命中",
+    matcherForceHitConfirmTitle: "将 {tag} 设为强制命中？",
+    matcherForceHitConfirmDescription:
+      "该操作会跳过内部匹配逻辑，可能同时触发多个策略分支，只影响当前运行实例。",
+    matcherForceHitImpact: "直接引用 {positive} 和 {negative} 的条件都将命中。",
+    matcherForceHitConfirmAction: "确认强制命中",
+    matcherModeResetHint: "应用 reload 或进程重启后自动恢复为正常匹配。",
     matcherControlLoading: "正在读取 matcher 运行状态",
     matcherControlUnavailable:
       "matcher 运行时接口不可用，请先应用配置或检查后端版本",
@@ -407,6 +418,8 @@ export const zhCNWebui = {
     eventCount: "{count} 个事件",
     matched: "命中",
     notMatched: "未命中",
+    forceHit: "强制命中",
+    forceMiss: "强制不命中",
     unchecked: "未检查",
     topologyUnavailable: "配置拓扑不可用，已按事件顺序降级显示",
     missingSequenceConfig: "缺少 sequence 配置：{names}",
