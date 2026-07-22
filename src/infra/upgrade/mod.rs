@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::infra::VERSION;
 use crate::infra::error::{DnsError, Result};
@@ -228,7 +228,13 @@ pub(crate) async fn apply_unchecked(
     };
 
     if config.cleanup_after_apply {
-        let _ = cleanup_upgrade_artifacts(config);
+        if let Err(err) = FileExt::unlock(&lock_file) {
+            warn!(error = %err, "failed to release upgrade lock before cleanup");
+        }
+        drop(lock_file);
+        if let Err(err) = cleanup_upgrade_artifacts(config) {
+            warn!(error = %err, "failed to clean upgrade artifacts");
+        }
     }
 
     Ok(ApplyOutcome {
@@ -477,6 +483,28 @@ mod tests {
         assert!(!config.skip_webui);
         assert!(!config.no_restart);
         assert_eq!(config.bundle, UpgradeBundle::Auto);
+    }
+
+    #[test]
+    fn cleanup_upgrade_artifacts_removes_cache_and_backups() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let backup_dir = tmp.path().join("backups");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(cache_dir.join("archive.tmp"), b"cache").unwrap();
+        fs::write(backup_dir.join("oxidns.old"), b"backup").unwrap();
+        let config = UpgradeConfig {
+            cache_dir: cache_dir.clone(),
+            backup_dir: backup_dir.clone(),
+            ..UpgradeConfig::default()
+        };
+
+        let cleaned = cleanup_upgrade_artifacts(&config).unwrap();
+
+        assert_eq!(cleaned, vec![cache_dir.clone(), backup_dir.clone()]);
+        assert!(!cache_dir.exists());
+        assert!(!backup_dir.exists());
     }
 
     #[cfg(not(windows))]

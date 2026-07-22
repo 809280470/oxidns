@@ -971,9 +971,13 @@ export interface UpgradeCheckOptions {
   outbound?: string;
   socks5?: string;
   allowPrerelease?: boolean;
-  force?: boolean;
   target?: string;
   githubToken?: string;
+}
+
+export interface UpgradeApplyOptions extends UpgradeCheckOptions {
+  force?: boolean;
+  cleanup?: boolean;
 }
 
 export interface UpgradeCheckResponse {
@@ -1011,7 +1015,6 @@ export async function fetchUpgradeCheck(
   if (options.outbound) body.outbound = options.outbound;
   if (options.socks5) body.socks5 = options.socks5;
   if (options.allowPrerelease) body.allow_prerelease = true;
-  if (options.force) body.force = true;
   if (options.target) body.target = options.target;
   if (options.githubToken) body.github_token = options.githubToken;
   const response = await fetch(apiUrl("/upgrade/check"), {
@@ -1023,7 +1026,7 @@ export async function fetchUpgradeCheck(
 }
 
 export async function triggerUpgradeApply(
-  options: UpgradeCheckOptions = {},
+  options: UpgradeApplyOptions = {},
 ): Promise<UpgradeApplyResponse> {
   const body: Record<string, unknown> = {};
   if (options.repository) body.repository = options.repository;
@@ -1032,6 +1035,7 @@ export async function triggerUpgradeApply(
   if (options.socks5) body.socks5 = options.socks5;
   if (options.allowPrerelease) body.allow_prerelease = true;
   if (options.force) body.force = true;
+  if (options.cleanup !== undefined) body.cleanup = options.cleanup;
   if (options.target) body.target = options.target;
   if (options.githubToken) body.github_token = options.githubToken;
   const response = await fetch(apiUrl("/upgrade/apply"), {

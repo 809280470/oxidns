@@ -109,4 +109,17 @@ describe("update-check persistence", () => {
       true,
     );
   });
+
+  it("persists the post-upgrade cleanup preference", async () => {
+    const firstModule = await import("./update-store");
+    firstModule.useUpdateStore
+      .getState()
+      .setUpgradeConfig({ cleanupAfterUpgrade: false });
+
+    vi.resetModules();
+    const secondModule = await import("./update-store");
+    expect(
+      secondModule.useUpdateStore.getState().upgradeConfig.cleanupAfterUpgrade,
+    ).toBe(false);
+  });
 });

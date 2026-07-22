@@ -2154,7 +2154,7 @@ export default function SettingsPage() {
                         </p>
                       </div>
                     )}
-                    <div className="flex flex-wrap gap-6">
+                    <div className="grid gap-4 sm:grid-cols-2">
                       <div className="flex items-center justify-between gap-4">
                         <div>
                           <p className="text-sm font-medium">
@@ -2168,6 +2168,23 @@ export default function SettingsPage() {
                           checked={upgradeConfig.allowPrerelease}
                           onCheckedChange={(v) =>
                             setUpgradeConfig({ allowPrerelease: v })
+                          }
+                        />
+                      </div>
+                      <div className="flex items-center justify-between gap-4">
+                        <div>
+                          <p className="text-sm font-medium">
+                            {t(WEBUI.settings.cleanupAfterUpgrade)}
+                          </p>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            {t(WEBUI.settings.cleanupAfterUpgradeDesc)}
+                          </p>
+                        </div>
+                        <Switch
+                          aria-label={t(WEBUI.settings.cleanupAfterUpgrade)}
+                          checked={upgradeConfig.cleanupAfterUpgrade}
+                          onCheckedChange={(v) =>
+                            setUpgradeConfig({ cleanupAfterUpgrade: v })
                           }
                         />
                       </div>

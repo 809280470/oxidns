@@ -1016,6 +1016,8 @@ export const zhCNWebui = {
     allowPrereleaseDesc: "包含 alpha/beta/rc 等预发布标签",
     forceUpgrade: "强制升级",
     forceUpgradeDesc: "忽略版本比较并重新安装所选发布版本",
+    cleanupAfterUpgrade: "升级后自动清理",
+    cleanupAfterUpgradeDesc: "成功后删除下载缓存和升级备份；关闭可保留回滚文件",
     autoCheck: "自动检查更新",
     autoCheckDesc: "连接后台时按上次检查时间判断，成功后 24 小时内不重复查询",
     cliCommand: "等效 CLI 命令",

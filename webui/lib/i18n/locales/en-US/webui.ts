@@ -1066,6 +1066,9 @@ export const enUSWebui = {
     forceUpgrade: "Force upgrade",
     forceUpgradeDesc:
       "Ignore version comparison and reinstall the selected release.",
+    cleanupAfterUpgrade: "Clean up after upgrade",
+    cleanupAfterUpgradeDesc:
+      "Delete download caches and upgrade backups after success; disable to keep rollback files.",
     autoCheck: "Auto-check for Updates",
     autoCheckDesc:
       "Check on connection only when due; successful checks are reused for 24 hours",

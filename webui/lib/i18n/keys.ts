@@ -980,6 +980,8 @@ export const WEBUI = {
     allowPrereleaseDesc: "webui.settings.allowPrereleaseDesc",
     forceUpgrade: "webui.settings.forceUpgrade",
     forceUpgradeDesc: "webui.settings.forceUpgradeDesc",
+    cleanupAfterUpgrade: "webui.settings.cleanupAfterUpgrade",
+    cleanupAfterUpgradeDesc: "webui.settings.cleanupAfterUpgradeDesc",
     autoCheck: "webui.settings.autoCheck",
     autoCheckDesc: "webui.settings.autoCheckDesc",
     cliCommand: "webui.settings.cliCommand",
