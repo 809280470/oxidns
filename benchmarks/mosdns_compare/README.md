@@ -2,7 +2,13 @@
 
 This directory keeps a compare pack for OxiDNS vs mosdns.
 
-There are now two runners with different goals:
+There are now three runners with different goals:
+
+- `run_publishable_compare.py`
+  - recommended for periodic milestone and documentation results
+  - sweeps outstanding-query levels and records QPS, loss, p50/p95/p99/max
+    latency, process CPU, RSS, and thread count
+  - generates SVG line/bar charts, raw JSON, `summary.tsv`, and `report.md`
 
 - `run_dnsperf_compare.sh`
   - throughput-oriented, better for saturated or higher-concurrency comparisons
@@ -30,12 +36,33 @@ mosdns examples.
 2. Make sure `dnsperf` is available in `PATH`.
 3. Run `./run_dnsperf_compare.sh`.
 
+For a new public comparison, prepare a clean Debian/Ubuntu host and use the
+publishable runner instead:
+
+```bash
+./prepare_server.sh
+DNSPERF_BIN_PATH="./.tools/dnsperf-install/bin/dnsperf" \
+  ./run_publishable_compare.py --publish-docs
+```
+
+`prepare_server.sh` downloads the latest OxiDNS release by default and pins
+mosdns and dnsperf to the versions declared at the top of the script. Set
+`OXIDNS_VERSION=v1.5.1` to pin OxiDNS explicitly, or set
+`BENCH_BUILD_OXIDNS=1` to benchmark the current checkout.
+
 With no selector, the runner now defaults to the `core` tag instead of running
 all microbenchmarks. That makes the default report much closer to an actual
 selection workflow.
 
 Useful commands:
 
+- `./run_publishable_compare.py --dry-run`
+  - validate the default publication matrix without starting either engine
+- `BENCH_LOAD_LEVELS="1,4,16,64,256,1024" BENCH_REPEATS=3 ./run_publishable_compare.py`
+  - run the default stable local-path matrix
+- `./run_publishable_compare.py 01-baseline-udp-forward`
+  - explicitly run a network-sensitive scenario; keep it separate from local
+    request-path conclusions
 - `./run_dnsperf_compare.sh`
   - run the default `core` scenarios
 - `./run_dnsperf_latency_compare.sh`
@@ -123,6 +150,15 @@ Important artifacts:
 - `report.md`
   - ready-to-read Markdown report with parameters, environment, and pair table
 
+The publishable runner writes a separate `results/publishable-*` directory:
+
+- `summary.raw.json`: every engine/repeat/load point
+- `summary.tsv`: median values across repeats
+- `*.resources.tsv`: process CPU/RSS/thread samples (200 ms by default)
+- `charts/throughput.svg`, `charts/cpu.svg`, `charts/memory.svg`
+- `charts/scaling.svg`, `charts/tail-latency.svg`
+- `environment.json` and `report.md`
+
 The latency runner writes the same artifact names under a `results/latency-*`
 directory, but the pair table is keyed by client count and puts latency plus
 jitter ahead of QPS.
@@ -164,12 +200,30 @@ Interpretation rules:
   business-logic variance and make UDP/TCP server plugin overhead easier to
   compare directly
 
-## Current Tooling Gaps
+## Representativeness and Limits
+
+The default publication matrix deliberately includes only stable local paths:
+large warm-cache lookups, local answers, domain/IP datasets, a composite
+provider chain, and minimal UDP/TCP listener paths. Together they separate the
+transport ceiling from cache, policy, dataset, and integrated pipeline costs.
+
+The concurrency sweep makes saturation and queueing visible instead of quoting
+one arbitrary high-concurrency point. Tail latency comes from dnsperf's native
+log-linear histogram. CPU is aggregate process CPU (`100%` means one fully
+occupied logical CPU), and memory is sampled resident set size. A point is
+excluded from “maximum stable throughput” when median packet loss exceeds 0.1%.
+
+This remains a same-host loopback comparison, so the load generator shares the
+host. For production capacity claims, run the same matrix from a separate load
+generator and retain environment snapshots for both machines.
+
+## Remaining Tooling Gaps
 
 - UDP and TCP server-path comparisons are now included through
   `47-server-local-udp` and `48-server-local-tcp`
-- The latency runner still depends on `dnsperf`, so it reports average latency
-  and latency standard deviation rather than full percentile histograms
+- The legacy latency runner still reports average/stddev. The publication
+  runner requires dnsperf JSON plus latency-histogram support and reports
+  p50/p95/p99/max.
 - `http_server` and `quic_server` are still not in the catalog because this
   compare pack is driven by `dnsperf` in UDP/TCP mode and does not exercise
   HTTP or QUIC transports directly

@@ -1,0 +1,53 @@
+# OxiDNS vs mosdns publishable benchmark report
+
+Generated: `2026-07-23T12:14:30.417665+08:00`
+
+## Method
+
+- repeats per point: `3`; measured duration: `8s`; warmup: `2s`
+- outstanding-query levels: `1,4,16,64,256,1024`
+- aggregation: median across repeats; stable capacity excludes points with loss above 0.1%
+- server CPU is aggregate process CPU (100% = one fully occupied logical CPU); memory is sampled RSS
+- engines run one at a time and their order alternates by repeat/load point
+
+## Environment
+
+- `timestamp=2026-07-23T12:14:30.417665+08:00`
+- `hostname=oxidns`
+- `kernel=Linux-7.0.14-4-pve-x86_64-with-glibc2.36`
+- `cpu=Model name:                              Intel(R) N100`
+- `logical_cpus=4`
+- `memory=Mem:           512Mi        63Mi        25Mi        88Ki       423Mi       448Mi`
+- `git_head=n/a (release artifact benchmark)`
+- `git_describe=n/a (release artifact benchmark)`
+- `oxidns_version=oxidns 1.5.1 (full)`
+- `oxidns_sha256=8cff1b81a6518f4436308750fb24700fd1389d747d171adaca809d1110e73518`
+- `mosdns_version=v5.3.4-0-gb732318`
+- `mosdns_sha256=5357fbb83c89f0a7acad275b72c33aa70d4c720cb5590525660132b10cee8af9`
+- `dnsperf_version=2.15.1`
+
+## Charts
+
+![Throughput](charts/throughput.svg)
+
+![Scaling](charts/scaling.svg)
+
+![Tail latency](charts/tail-latency.svg)
+
+![CPU](charts/cpu.svg)
+
+![Memory](charts/memory.svg)
+
+## Maximum stable point by scenario
+
+| Scenario | OxiDNS QPS | mosdns QPS | OxiDNS p99 | mosdns p99 | OxiDNS CPU | mosdns CPU | OxiDNS RSS | mosdns RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 02-cache-hotpath | 119,538.7 | 102,457.7 | 2.047 ms | 2.943 ms | 204.5% | 179.6% | 14.7 MiB | 23.1 MiB |
+| 06-local-answers | 113,114.7 | 109,150.1 | 1.983 ms | 2.559 ms | 204.5% | 154.7% | 13.7 MiB | 23.1 MiB |
+| 08-domain-set | 136,180.9 | 36,359.3 | 1.727 ms | 12.031 ms | 189.6% | 323.0% | 34.6 MiB | 44.4 MiB |
+| 43-composite-provider-chain | 137,398.4 | 25,925.3 | 1.855 ms | 6.399 ms | 194.7% | 344.2% | 35.1 MiB | 43.9 MiB |
+| 47-server-local-udp | 116,888.4 | 109,793.7 | 1.951 ms | 2.431 ms | 199.6% | 149.8% | 13.7 MiB | 22.8 MiB |
+
+## Interpretation limits
+
+This is a same-host loopback comparison. It is representative of local request-path cost and concurrency scaling on the recorded machine, not public-upstream quality or production capacity on other hardware. External-forward scenarios must be reported separately because upstream/network variance can dominate engine cost.

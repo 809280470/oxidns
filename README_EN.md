@@ -123,7 +123,7 @@ dig @127.0.0.1 example.com +tcp
 
 The WebUI is available at `http://SERVER_IP:9199/` by default. Before allowing access from other devices, enable `api.http.auth` and restrict sources with a firewall or reverse proxy. Run `oxidns check` after changing configuration.
 
-On OpenWrt, the same installer installs [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns). See the [complete Quick Start](https://oxidns.org/en/quickstart) for manual downloads, Docker, Debian packages, portable installs, uninstall steps, and platform paths; see [Custom Build](https://oxidns.org/en/custom-build) to strip optional protocols and plugins.
+On OpenWrt, the same installer installs [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns). Use the [Quick Start](https://oxidns.org/en/quickstart) for the first successful query; see “Installation & Deployment” in the manual for archives, Docker, Debian packages, portable installs, and uninstallation; see [Custom Build](https://oxidns.org/en/custom-build) to strip optional protocols and plugins.
 
 ## Who it is for
 
@@ -143,8 +143,9 @@ It is not an authoritative DNS server or a zero-configuration ad-blocking dashbo
 
 - **Get started**: [Quick Start](https://oxidns.org/en/quickstart) · [Configuration](https://oxidns.org/en/configuration) · [Common Scenarios](https://oxidns.org/en/scenarios) · [Migrate from mosdns](https://oxidns.org/en/migrate-from-mosdns)
 - **Reference**: [Plugin Overview](https://oxidns.org/en/plugin-reference/overview) · [Management API](https://oxidns.org/en/api) · [CLI](https://oxidns.org/en/cli) · [DNS Codes](https://oxidns.org/en/dns-codes)
-- **Deploy and operate**: [WebUI](https://oxidns.org/en/webui) · [OpenWrt](https://oxidns.org/en/openwrt) · [Custom Build](https://oxidns.org/en/custom-build)
-- **Understand the project**: [Architecture and Design](https://oxidns.org/en/architecture-and-design) · [Performance and Benchmarks](https://oxidns.org/en/benchmarks) · [Releases](https://oxidns.org/en/releases) · [Roadmap](https://oxidns.org/en/roadmap)
+- **Deploy and operate**: [Operations & Troubleshooting](https://oxidns.org/en/operations) · [Security Hardening](https://oxidns.org/en/security) · [WebUI](https://oxidns.org/en/webui) · [OpenWrt](https://oxidns.org/en/openwrt)
+- **Understand the project**: [Architecture and Design](https://oxidns.org/en/architecture-and-design) · [Performance and Benchmarks](https://oxidns.org/en/benchmarks) · [Documentation Versions](https://oxidns.org/en/documentation) · [Releases](https://oxidns.org/en/releases) · [Roadmap](https://oxidns.org/en/roadmap)
+- **Community**: [Contributing](https://oxidns.org/en/contributing) · [Support Project Development](https://oxidns.org/en/support-development) · [GitHub Discussions](https://github.com/svenshi/oxidns/discussions) · [Telegram](https://t.me/oxidns)
 
 ## Project Status
 
@@ -161,6 +162,25 @@ Join the Telegram group to chat with the author and other users: [**@OXIDNS** ·
 <a href="https://t.me/oxidns">
   <img src=".github/img/telegram-qr.png" alt="OxiDNS Telegram group QR code" width="220" />
 </a>
+
+---
+
+## Support Project Development
+
+If OxiDNS is useful to you, you can support its ongoing development and maintenance through WeChat Pay or Alipay. Support is entirely optional, and every contribution is sincerely appreciated.
+
+<table>
+  <tr>
+    <th align="center">WeChat Pay</th>
+    <th align="center">Alipay</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/static/img/support/wechat-pay.jpg" alt="WeChat Pay QR code for supporting OxiDNS development" width="260" /></td>
+    <td align="center"><img src="docs/static/img/support/alipay.jpg" alt="Alipay QR code for supporting OxiDNS development" width="260" /></td>
+  </tr>
+</table>
+
+Financial support does not establish a commercial service relationship or affect feature planning and issue priority. See the [contribution guide](https://oxidns.org/en/contributing) for other ways to help.
 
 ---
 

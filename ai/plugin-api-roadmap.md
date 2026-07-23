@@ -1,5 +1,8 @@
 # 插件 API 接入与 metrics 划分 Roadmap
 
+> 本文是维护者实施规划，不属于已发布的用户手册。面向用户的能力状态以
+> `docs/docs/roadmap.md`、插件参考和管理 API 文档为准。
+
 最后更新：2026-06-02
 
 本文档梳理 OxiDNS 插件在 **HTTP 管理 API** 与 **Prometheus metrics** 两个观测面上的现状与待办，给后端补接口、给 WebUI 接 API 时提供单一参考。

@@ -1,220 +1,112 @@
 ---
-title: 性能方法与历史基准
+title: 性能测试
 sidebar_position: 8
 ---
 
-本页提供 OxiDNS 的性能关注点、复现入口和公开历史基准快照。数据用于理解不同策略复杂度、并发水平和传输路径下的性能轮廓，不用于宣称绝对胜负。
+# 性能测试
 
-## 数据范围
+本页展示 OxiDNS `oxidns 1.5.1 (full)` 与 mosdns `v5.3.4-0-gb732318` 的阶段性实测快照，dnsperf 版本为 `2.15.1`。仅在架构、关键请求路径、测试口径或重要里程碑发生明显变化时更新，不要求每个版本重复测试。
 
-本页最新公开的 OxiDNS 与 mosdns 对比快照来自 `v0.3.0`。这些结果保留用于说明测试方法和当时版本的性能轮廓，**不代表当前 OxiDNS 版本**，也不能直接用于当前版本的容量规划或性能承诺。
+本轮数据采集于 `2026-07-23T12:14:30.417665+08:00`。测试参数见[完整原始报告](/benchmarks/staged/report.txt)。每个指标取多次重复的中位数；最大稳定吞吐只接受丢包率不高于 0.1% 的点。进程 CPU 的 100% 表示占满一个逻辑核。
 
-需要评价当前代码时，应在固定硬件、工具版本、配置、查询集和网络条件下重新运行仓库中的 compare pack，并记录被测 commit、二进制 hash 和完整参数。没有重新测量时，应引用具体历史版本，而不是把本页数字描述为“OxiDNS 当前性能”。
+## 被测环境
 
-## 性能关注点
+* CPU：`Model name:                              Intel(R) N100`，逻辑核 `4`
+* 内存：`Mem:           512Mi        63Mi        25Mi        88Ki       423Mi       448Mi`
+* OxiDNS：`oxidns 1.5.1 (full)`，SHA-256 `8cff1b81a6518f4436308750fb24700fd1389d747d171adaca809d1110e73518`
+* mosdns：`v5.3.4-0-gb732318`，SHA-256 `5357fbb83c89f0a7acad275b72c33aa70d4c720cb5590525660132b10cee8af9`
+* dnsperf：`2.15.1`
 
-OxiDNS 关注的不是“最简单场景下的极限数字”，而是下面这些更接近真实部署的问题：
+## 指标怎么看
 
-* 开启缓存、规则、回退、重写后，热路径是否仍然可控
-* 多上游并发竞争时，整体时延是否可接受
-* 新增协议和插件后，结构是否还能继续优化
-* 系统联动和观测逻辑是否会拖慢主响应路径
+* **QPS / 吞吐量：越高越好**，但前提是丢包率和尾延迟仍在可接受范围内。
+* **p50、p95、p99、最大延迟：越低越好**。p99 表示 99% 已完成请求的响应时间不超过该值，比平均值更容易看出排队和长尾卡顿。
+* **丢包率：越低越好**。本报告只有在丢包率中位数不超过 0.1% 时，才把该并发点计为“稳定”。
+* **CPU：相同吞吐量下越低越好**。不能脱离 QPS 单看 CPU；如果使用更多 CPU 换来了明显更高吞吐，仍可能是合理结果。这里 100% 表示占满一个逻辑核。
+* **RSS 内存：相同负载下越低越好**，表示测试过程中进程实际驻留在物理内存中的容量。
+* 看折线图时，理想状态是并发增加后 QPS 继续上升，同时 p99 和丢包保持稳定；如果 QPS 已经走平而 p99 快速升高，说明服务已经进入饱和区。
 
-## 指标说明
+## 吞吐与并发扩展
 
-* `QPS` 越高越好
-* 平均延迟与抖动（latency stddev）越低越好
-* `run_dnsperf_compare.sh` 更适合看中高并发吞吐与排队效应
-* `run_dnsperf_latency_compare.sh` 更适合看低并发延迟，固定 `clients == outstanding`
-* 这两组快照更适合分别观察 OxiDNS 相对 mosdns 的优势分布
-* 由于 2026-04-13 的 compare pack 已更新场景目录、查询集和部分 workload 口径，`v0.1.0` 与 `v0.3.0` 的绝对数字不建议直接做版本回归比较
+<div className="row margin-bottom--lg">
+  <div className="col col--8">
+    <img src="/img/benchmarks/staged/throughput.svg" alt="各场景最大稳定吞吐量柱状图" />
+  </div>
+  <div className="col col--4">
+    <p><strong>越高越好</strong></p>
+    <p>柱子越高表示稳定状态下每秒完成的 DNS 请求越多。仍需结合 p99 和丢包判断，不能把高丢包下的峰值当作有效容量。</p>
+  </div>
+</div>
 
-源码内提供以下 Criterion 微基准：
+<div className="row margin-bottom--lg">
+  <div className="col col--8">
+    <img src="/img/benchmarks/staged/scaling.svg" alt="并发扩展折线图" />
+  </div>
+  <div className="col col--4">
+    <p><strong>上升且不过早走平更好</strong></p>
+    <p>并发增加时 QPS 应继续上升。曲线走平表示接近吞吐上限；此时若 p99 同时快速升高，说明已经进入排队和饱和区。</p>
+  </div>
+</div>
 
-```bash
-cargo bench --bench message_codec
-cargo bench --bench response_classification
-cargo bench --bench domain_rule_matcher
-cargo bench --bench ip_rule_matcher
-cargo bench --bench plugin_local_answers
-```
+## 尾延迟
 
-`response_classification` 覆盖 direct A、1/4/16 跳 CNAME、CNAME-only、CNAME+NODATA 和 NXDOMAIN。微基准用于定位特定实现成本，不替代完整 DNS 请求路径的端到端测试。
+<div className="row margin-bottom--lg">
+  <div className="col col--8">
+    <img src="/img/benchmarks/staged/tail-latency.svg" alt="p99 尾延迟折线图" />
+  </div>
+  <div className="col col--4">
+    <p><strong>越低越好</strong></p>
+    <p>p99 越低，绝大多数请求的最慢部分越可控。随着并发增加仍保持平缓的曲线，比只看平均延迟更可靠。</p>
+  </div>
+</div>
 
-说明：
+## CPU 与内存
 
-* <span className="benchmark-delta benchmark-delta--up">绿色</span> 表示 OxiDNS 在该指标上更优
-* <span className="benchmark-delta benchmark-delta--down">红色</span> 表示 mosdns 在该指标上更优
-* <span className="benchmark-delta benchmark-delta--neutral">中性色</span> 表示差距较小，仅用于辅助阅读，不代表统计显著性
+<div className="row margin-bottom--lg">
+  <div className="col col--8">
+    <img src="/img/benchmarks/staged/cpu.svg" alt="CPU 占用柱状图" />
+  </div>
+  <div className="col col--4">
+    <p><strong>相同吞吐量下越低越好</strong></p>
+    <p>100% 等于占满一个逻辑核。CPU 必须和 QPS 配合看：CPU 更高但吞吐提升更大并不一定更差，也可进一步比较每万 QPS 的 CPU 成本。</p>
+  </div>
+</div>
 
-## v0.3.0
+<div className="row margin-bottom--lg">
+  <div className="col col--8">
+    <img src="/img/benchmarks/staged/memory.svg" alt="RSS 内存柱状图" />
+  </div>
+  <div className="col col--4">
+    <p><strong>相同负载下越低越好</strong></p>
+    <p>RSS 表示进程实际驻留的物理内存。柱子越低，常驻内存压力越小；比较时应确保场景、规则数据和负载一致。</p>
+  </div>
+</div>
 
-### 高并发吞吐与平均延迟
+## 各场景最大稳定点
 
-测试环境：
+| 场景 | OxiDNS QPS | mosdns QPS | OxiDNS p99 | mosdns p99 | OxiDNS CPU | mosdns CPU | OxiDNS RSS | mosdns RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 02-cache-hotpath | 119,538.7 | 102,457.7 | 2.047 ms | 2.943 ms | 204.5% | 179.6% | 14.7 MiB | 23.1 MiB |
+| 06-local-answers | 113,114.7 | 109,150.1 | 1.983 ms | 2.559 ms | 204.5% | 154.7% | 13.7 MiB | 23.1 MiB |
+| 08-domain-set | 136,180.9 | 36,359.3 | 1.727 ms | 12.031 ms | 189.6% | 323.0% | 34.6 MiB | 44.4 MiB |
+| 43-composite-provider-chain | 137,398.4 | 25,925.3 | 1.855 ms | 6.399 ms | 194.7% | 344.2% | 35.1 MiB | 43.9 MiB |
+| 47-server-local-udp | 116,888.4 | 109,793.7 | 1.951 ms | 2.431 ms | 199.6% | 149.8% | 13.7 MiB | 22.8 MiB |
 
-* 时间：2026-04-13
-* 系统：Linux `6.8.12-2-pve` `x86_64`
-* 选择器：`core`
-* 对比版本：OxiDNS `v0.3.0`，mosdns `v5.3.4-0-gb732318`
+## 客观评价
 
-压测参数：
+* **简单本地路径优势温和，并非全面拉开差距。** 最大稳定吞吐相对 mosdns 分别为：缓存热路径 +16.7%、本地回答 +3.6%、最小 UDP 路径 +6.5%。其中本地回答和最小 UDP 路径只有个位数差距；部分中等并发点两者接近，因此不应概括成所有负载下都有大幅领先。
+* **复杂规则路径差异明显。** OxiDNS 最大稳定吞吐相对 mosdns：域名集合为 3.75 倍、复合 provider 链为 5.30 倍；p99 降幅分别为：域名集合低 85.6%、复合 provider 链低 71.0%。这说明本轮优势主要集中在真实数据集查询和复合 provider/matcher 链，而不是只来自 UDP 协议框架。
+* **常驻内存更低。** 五个场景中 OxiDNS 的 RSS 均低于 mosdns，降幅约为 20.0%–40.6%。
+* **CPU 结果需要结合吞吐解释。** 在本地回答和最小 UDP 路径的最大稳定点，OxiDNS 使用了更多 CPU，但吞吐只小幅提高；这些场景下不能仅凭 QPS 宣称效率全面更好。复杂规则路径中 OxiDNS 则同时取得更高吞吐和更低 CPU。
+* **结论强度有限。** 每点 3 次重复适合作为阶段性工程对比，但不足以替代更大样本、置信区间和跨机器复测。这里的数值应理解为该主机和该工作负载下的性能轮廓，不是通用容量承诺。
 
-* 工具：`dnsperf`
-* `warmup_seconds=2`
-* `bench_seconds=8`
-* `bench_repeats=3`
-* `dnsperf_clients=32`
-* `dnsperf_threads=4`
-* `dnsperf_outstanding=1024`
-* `dnsperf_max_qps=unlimited`
 
-结果阅读方式：
+## 代表性判断
 
-* `baseline UDP forward`、`concurrent upstreams`、`dual-entry UDP/TCP` 这类带上游转发或上游竞争的场景，主要反映的是端到端体验，结果会明显受到上游链路时延、上游响应稳定性和竞争策略影响，不应简单理解为“本地处理开销谁更小”
-* `cache hotpath`、`local answers`、`server local UDP/TCP` 更接近本地处理成本
-* `domain set`、`composite provider chain` 更适合看复杂规则、数据集和插件组合下的表现
+本矩阵对**稳定的本地 UDP 请求路径**具有代表性：最小监听器、本地回答、热缓存、真实域名集合查询和复合 provider/matcher 链被分开测试，并通过多档并发展示扩展、饱和与排队，而不是只比较一个峰值 QPS。
 
-下表展示按 repeat 聚合后的中位数：
+它不能代表冷启动/热重载、TCP/DoT/DoH/DoQ、以缓存未命中为主的流量、公网上游质量、跨机网络开销，或 ipset/nftset 等宿主机副作用。生产容量测试还应使用独立压测机，并为这些路径建立单独矩阵。
 
-| 场景 | OxiDNS QPS | mosdns QPS | QPS 对比 | OxiDNS 平均延迟 | mosdns 平均延迟 |
-| ------------------------ | -----------: | ---------: | --------: | ----------------: | --------------: |
-| baseline UDP forward     |     35,498.1 |   36,883.2 | <span className="benchmark-delta benchmark-delta--neutral">-3.8%</span> | <span className="benchmark-latency benchmark-latency--better">7.735 ms</span> | <span className="benchmark-latency benchmark-latency--worse">11.244 ms</span> |
-| cache hotpath            |    139,133.9 |  134,881.6 | <span className="benchmark-delta benchmark-delta--neutral">+3.1%</span> | <span className="benchmark-latency benchmark-latency--better">0.637 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.721 ms</span> |
-| dual-entry UDP           |     35,800.9 |   35,382.3 | <span className="benchmark-delta benchmark-delta--neutral">+1.2%</span> | <span className="benchmark-latency benchmark-latency--better">7.092 ms</span> | <span className="benchmark-latency benchmark-latency--worse">10.170 ms</span> |
-| dual-entry TCP           |     37,295.1 |   37,221.2 | <span className="benchmark-delta benchmark-delta--neutral">+0.2%</span> | <span className="benchmark-latency benchmark-latency--better">24.646 ms</span> | <span className="benchmark-latency benchmark-latency--worse">25.083 ms</span> |
-| concurrent upstreams     |     21,038.7 |   13,319.4 | <span className="benchmark-delta benchmark-delta--up">+58.0%</span> | <span className="benchmark-latency benchmark-latency--better">10.404 ms</span> | <span className="benchmark-latency benchmark-latency--worse">20.601 ms</span> |
-| local answers            |    126,268.4 |  149,119.6 | <span className="benchmark-delta benchmark-delta--down">-15.3%</span> | <span className="benchmark-latency benchmark-latency--worse">0.783 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.639 ms</span> |
-| domain set               |    165,647.7 |   36,383.7 | <span className="benchmark-delta benchmark-delta--up">+355.3%</span> | <span className="benchmark-latency benchmark-latency--better">0.549 ms</span> | <span className="benchmark-latency benchmark-latency--worse">4.078 ms</span> |
-| ip set                   |    133,355.1 |  150,756.7 | <span className="benchmark-delta benchmark-delta--down">-11.5%</span> | <span className="benchmark-latency benchmark-latency--worse">0.740 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.637 ms</span> |
-| composite provider chain |    158,693.6 |   25,972.4 | <span className="benchmark-delta benchmark-delta--up">+511.0%</span> | <span className="benchmark-latency benchmark-latency--better">0.532 ms</span> | <span className="benchmark-latency benchmark-latency--worse">6.251 ms</span> |
+## 口径限制
 
-### 低并发延迟扫图
-
-测试环境：
-
-* 时间：2026-04-13
-* 系统：Linux `6.8.12-2-pve` `x86_64`
-* 选择器：`latency-core`
-* 对比版本：OxiDNS `v0.3.0`，mosdns `v5.3.4-0-gb732318`
-
-压测参数：
-
-* 工具：`dnsperf`
-* `warmup_seconds=1`
-* `bench_seconds=5`
-* `bench_repeats=3`
-* `latency_client_levels=1 2 4`
-* `dnsperf_threads=1`
-* `dnsperf_timeout=5`
-* `dnsperf_outstanding=matches_client_count`
-
-下面三张表优先展示平均延迟与抖动，`QPS` 只作为辅助校验指标。颜色沿用上面的规则：延迟或抖动更低的一侧为绿色，更高的一侧为红色，持平时使用中性色。
-
-#### clients=1, outstanding=1
-
-| 场景 | OxiDNS 平均延迟 | mosdns 平均延迟 | 延迟对比 | OxiDNS 抖动 | mosdns 抖动 | 抖动对比 |
-| ------------------------ | ----------------: | --------------: | -------: | ------------: | ----------: | -------: |
-| baseline UDP forward     | <span className="benchmark-latency benchmark-latency--worse">6.716 ms</span> | <span className="benchmark-latency benchmark-latency--better">5.708 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+17.66%</span> | <span className="benchmark-latency benchmark-latency--better">0.170 ms</span> | <span className="benchmark-latency benchmark-latency--worse">1.140 ms</span> | <span className="benchmark-latency benchmark-latency--better">-85.09%</span> |
-| cache hotpath            | <span className="benchmark-latency benchmark-latency--better">0.029 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.031 ms</span> | <span className="benchmark-latency benchmark-latency--better">-6.45%</span> | <span className="benchmark-latency benchmark-latency--better">0.017 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.021 ms</span> | <span className="benchmark-latency benchmark-latency--better">-19.05%</span> |
-| dual-entry UDP           | <span className="benchmark-latency benchmark-latency--better">5.949 ms</span> | <span className="benchmark-latency benchmark-latency--worse">6.394 ms</span> | <span className="benchmark-latency benchmark-latency--better">-6.96%</span> | <span className="benchmark-latency benchmark-latency--better">0.426 ms</span> | <span className="benchmark-latency benchmark-latency--worse">2.364 ms</span> | <span className="benchmark-latency benchmark-latency--better">-81.98%</span> |
-| dual-entry TCP           | <span className="benchmark-latency benchmark-latency--better">5.984 ms</span> | <span className="benchmark-latency benchmark-latency--worse">6.118 ms</span> | <span className="benchmark-latency benchmark-latency--better">-2.19%</span> | <span className="benchmark-latency benchmark-latency--better">0.380 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.829 ms</span> | <span className="benchmark-latency benchmark-latency--better">-54.16%</span> |
-| local answers            | <span className="benchmark-latency benchmark-latency--better">0.026 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.029 ms</span> | <span className="benchmark-latency benchmark-latency--better">-10.34%</span> | <span className="benchmark-latency benchmark-latency--better">0.016 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.019 ms</span> | <span className="benchmark-latency benchmark-latency--better">-15.79%</span> |
-| domain set               | <span className="benchmark-latency benchmark-latency--better">0.025 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.108 ms</span> | <span className="benchmark-latency benchmark-latency--better">-76.85%</span> | <span className="benchmark-latency benchmark-latency--better">0.011 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.095 ms</span> | <span className="benchmark-latency benchmark-latency--better">-88.42%</span> |
-| composite provider chain | <span className="benchmark-latency benchmark-latency--better">0.025 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.156 ms</span> | <span className="benchmark-latency benchmark-latency--better">-83.97%</span> | <span className="benchmark-latency benchmark-latency--better">0.012 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.129 ms</span> | <span className="benchmark-latency benchmark-latency--better">-90.70%</span> |
-| server local UDP         | <span className="benchmark-latency benchmark-latency--better">0.025 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.027 ms</span> | <span className="benchmark-latency benchmark-latency--better">-7.41%</span> | <span className="benchmark-delta benchmark-delta--neutral">0.013 ms</span> | <span className="benchmark-delta benchmark-delta--neutral">0.013 ms</span> | <span className="benchmark-delta benchmark-delta--neutral">+0.00%</span> |
-| server local TCP         | <span className="benchmark-latency benchmark-latency--better">0.027 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.030 ms</span> | <span className="benchmark-latency benchmark-latency--better">-10.00%</span> | <span className="benchmark-latency benchmark-latency--better">0.009 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.018 ms</span> | <span className="benchmark-latency benchmark-latency--better">-50.00%</span> |
-
-#### clients=2, outstanding=2
-
-| 场景 | OxiDNS 平均延迟 | mosdns 平均延迟 | 延迟对比 | OxiDNS 抖动 | mosdns 抖动 | 抖动对比 |
-| ------------------------ | ----------------: | --------------: | -------: | ------------: | ----------: | -------: |
-| baseline UDP forward     | <span className="benchmark-latency benchmark-latency--better">6.001 ms</span> | <span className="benchmark-latency benchmark-latency--worse">7.382 ms</span> | <span className="benchmark-latency benchmark-latency--better">-18.71%</span> | <span className="benchmark-latency benchmark-latency--better">0.262 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.858 ms</span> | <span className="benchmark-latency benchmark-latency--better">-69.46%</span> |
-| cache hotpath            | <span className="benchmark-latency benchmark-latency--better">0.033 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.037 ms</span> | <span className="benchmark-latency benchmark-latency--better">-10.81%</span> | <span className="benchmark-latency benchmark-latency--better">0.050 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.053 ms</span> | <span className="benchmark-latency benchmark-latency--better">-5.66%</span> |
-| dual-entry UDP           | <span className="benchmark-latency benchmark-latency--worse">6.408 ms</span> | <span className="benchmark-latency benchmark-latency--better">5.923 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+8.19%</span> | <span className="benchmark-latency benchmark-latency--worse">1.247 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.488 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+155.53%</span> |
-| dual-entry TCP           | <span className="benchmark-latency benchmark-latency--worse">5.651 ms</span> | <span className="benchmark-latency benchmark-latency--better">5.633 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+0.32%</span> | <span className="benchmark-latency benchmark-latency--better">0.417 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.518 ms</span> | <span className="benchmark-latency benchmark-latency--better">-19.50%</span> |
-| local answers            | <span className="benchmark-latency benchmark-latency--worse">0.040 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.031 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+29.03%</span> | <span className="benchmark-latency benchmark-latency--worse">0.021 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.018 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+16.67%</span> |
-| domain set               | <span className="benchmark-latency benchmark-latency--better">0.029 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.111 ms</span> | <span className="benchmark-latency benchmark-latency--better">-73.87%</span> | <span className="benchmark-latency benchmark-latency--better">0.013 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.104 ms</span> | <span className="benchmark-latency benchmark-latency--better">-87.50%</span> |
-| composite provider chain | <span className="benchmark-latency benchmark-latency--better">0.029 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.165 ms</span> | <span className="benchmark-latency benchmark-latency--better">-82.42%</span> | <span className="benchmark-latency benchmark-latency--better">0.014 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.141 ms</span> | <span className="benchmark-latency benchmark-latency--better">-90.07%</span> |
-| server local UDP         | <span className="benchmark-latency benchmark-latency--worse">0.030 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.029 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+3.45%</span> | <span className="benchmark-delta benchmark-delta--neutral">0.016 ms</span> | <span className="benchmark-delta benchmark-delta--neutral">0.016 ms</span> | <span className="benchmark-delta benchmark-delta--neutral">+0.00%</span> |
-| server local TCP         | <span className="benchmark-latency benchmark-latency--better">0.028 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.030 ms</span> | <span className="benchmark-latency benchmark-latency--better">-6.67%</span> | <span className="benchmark-latency benchmark-latency--better">0.014 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.015 ms</span> | <span className="benchmark-latency benchmark-latency--better">-6.67%</span> |
-
-#### clients=4, outstanding=4
-
-| 场景 | OxiDNS 平均延迟 | mosdns 平均延迟 | 延迟对比 | OxiDNS 抖动 | mosdns 抖动 | 抖动对比 |
-| ------------------------ | ----------------: | --------------: | -------: | ------------: | ----------: | -------: |
-| baseline UDP forward     | <span className="benchmark-latency benchmark-latency--worse">5.977 ms</span> | <span className="benchmark-latency benchmark-latency--better">5.910 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+1.13%</span> | <span className="benchmark-latency benchmark-latency--better">0.355 ms</span> | <span className="benchmark-latency benchmark-latency--worse">2.700 ms</span> | <span className="benchmark-latency benchmark-latency--better">-86.85%</span> |
-| cache hotpath            | <span className="benchmark-latency benchmark-latency--better">0.044 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.060 ms</span> | <span className="benchmark-latency benchmark-latency--better">-26.67%</span> | <span className="benchmark-latency benchmark-latency--better">0.028 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.063 ms</span> | <span className="benchmark-latency benchmark-latency--better">-55.56%</span> |
-| dual-entry UDP           | <span className="benchmark-latency benchmark-latency--worse">6.637 ms</span> | <span className="benchmark-latency benchmark-latency--better">5.426 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+22.32%</span> | <span className="benchmark-latency benchmark-latency--worse">25.556 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.435 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+5774.94%</span> |
-| dual-entry TCP           | <span className="benchmark-latency benchmark-latency--better">6.451 ms</span> | <span className="benchmark-latency benchmark-latency--worse">6.941 ms</span> | <span className="benchmark-latency benchmark-latency--better">-7.06%</span> | <span className="benchmark-latency benchmark-latency--better">4.422 ms</span> | <span className="benchmark-latency benchmark-latency--worse">26.437 ms</span> | <span className="benchmark-latency benchmark-latency--better">-83.27%</span> |
-| local answers            | <span className="benchmark-latency benchmark-latency--worse">0.056 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.040 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+40.00%</span> | <span className="benchmark-latency benchmark-latency--worse">0.030 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.025 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+20.00%</span> |
-| domain set               | <span className="benchmark-latency benchmark-latency--better">0.034 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.155 ms</span> | <span className="benchmark-latency benchmark-latency--better">-78.06%</span> | <span className="benchmark-latency benchmark-latency--better">0.016 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.141 ms</span> | <span className="benchmark-latency benchmark-latency--better">-88.65%</span> |
-| composite provider chain | <span className="benchmark-latency benchmark-latency--better">0.034 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.221 ms</span> | <span className="benchmark-latency benchmark-latency--better">-84.62%</span> | <span className="benchmark-latency benchmark-latency--better">0.015 ms</span> | <span className="benchmark-latency benchmark-latency--worse">0.172 ms</span> | <span className="benchmark-latency benchmark-latency--better">-91.28%</span> |
-| server local UDP         | <span className="benchmark-latency benchmark-latency--worse">0.042 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.038 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+10.53%</span> | <span className="benchmark-delta benchmark-delta--neutral">0.024 ms</span> | <span className="benchmark-delta benchmark-delta--neutral">0.024 ms</span> | <span className="benchmark-delta benchmark-delta--neutral">+0.00%</span> |
-| server local TCP         | <span className="benchmark-latency benchmark-latency--worse">0.042 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.039 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+7.69%</span> | <span className="benchmark-latency benchmark-latency--worse">0.026 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.022 ms</span> | <span className="benchmark-latency benchmark-latency--worse">+18.18%</span> |
-
-### v0.3.0 结果分析
-
-* 对于依赖复杂规则集、多数据集匹配，或经常做多上游并发竞争的部署，`v0.3.0` 下 OxiDNS 的整体表现更有优势；`domain set`、`composite provider chain` 和 `concurrent upstreams` 都明显领先。
-* `cache hotpath` 这一轮已经转为小幅领先，说明在缓存命中这类高频路径上，OxiDNS 与 mosdns 的差距已经明显缩小。
-* 本地应答场景下，OxiDNS 与 mosdns 的差距已经不大；响应侧 `ip set` 过滤的结果也更多是在受本地应答路径性能上限影响，而不是一条完全独立的短板。
-* 对于 `forward`、`dual-entry`、`concurrent upstreams` 这类场景，应把结果理解为端到端代理体验，其中上游链路延迟和上游响应稳定性是主要因素，而不是单纯的本地实现差异。
-* 低并发延迟扫图里，`domain set`、`composite provider chain`、`cache hotpath` 和 `server local TCP` 的延迟和抖动都更稳定；`dual-entry UDP` 在 `clients=4` 时抖动明显偏高，说明这个场景的稳定性还需要继续观察。
-
-## v0.1.0
-
-下面保留 2026-03-26 公开结果，作为 `v0.1.0` 历史快照。
-
-### 高并发吞吐与平均延迟
-
-测试环境：
-
-* CPU：Intel N100，4 核
-* 内存：1 GB
-* 环境：PVE 虚拟机内的 LXC
-* 系统：Linux `6.8.12-2-pve` `x86_64`
-* 时间：2026-03-26
-* 被测版本：`oxidns v0.1.0`，mosdns `v5.3.4-0-gb732318`
-
-压测参数：
-
-* 工具：`dnsperf`
-* `warmup_seconds=2`
-* `bench_seconds=8`
-* `bench_repeats=3`
-* `dnsperf_clients=32`
-* `dnsperf_threads=4`
-* `dnsperf_outstanding=1024`
-* `dnsperf_max_qps=unlimited`
-
-下表为每个场景 3 次测试平均值：
-
-| 场景                    | OxiDNS QPS | mosdns QPS | QPS 对比 | OxiDNS 平均延迟 | mosdns 平均延迟 |
-| --------------------- | -----------: | ---------: | ------: | ------------: | ----------: |
-| baseline UDP forward  |     37,789.6 |   37,269.2 | <span className="benchmark-delta benchmark-delta--neutral">+1.4%</span> | <span className="benchmark-latency benchmark-latency--better">9.142 ms</span> | <span className="benchmark-latency benchmark-latency--worse">12.312 ms</span> |
-| cache hotpath         |    131,982.3 |  133,380.3 | <span className="benchmark-delta benchmark-delta--neutral">-1.0%</span> | <span className="benchmark-latency benchmark-latency--worse">1.235 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.696 ms</span> |
-| dual-entry UDP        |     39,614.4 |   34,356.8 | <span className="benchmark-delta benchmark-delta--up">+15.3%</span> | <span className="benchmark-latency benchmark-latency--better">8.946 ms</span> | <span className="benchmark-latency benchmark-latency--worse">10.009 ms</span> |
-| dual-entry TCP        |     36,257.9 |   35,975.4 | <span className="benchmark-delta benchmark-delta--neutral">+0.8%</span> | <span className="benchmark-latency benchmark-latency--better">25.403 ms</span> | <span className="benchmark-latency benchmark-latency--worse">25.577 ms</span> |
-| concurrent upstreams  |     21,694.8 |   13,195.4 | <span className="benchmark-delta benchmark-delta--up">+64.4%</span> | <span className="benchmark-latency benchmark-latency--better">15.065 ms</span> | <span className="benchmark-latency benchmark-latency--worse">23.790 ms</span> |
-| fallback standby      |     22,259.9 |   23,223.9 | <span className="benchmark-delta benchmark-delta--neutral">-4.2%</span> | <span className="benchmark-latency benchmark-latency--worse">16.376 ms</span> | <span className="benchmark-latency benchmark-latency--better">10.616 ms</span> |
-| local answers         |    132,286.6 |  146,754.3 | <span className="benchmark-delta benchmark-delta--down">-9.9%</span> | <span className="benchmark-latency benchmark-latency--worse">1.250 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.636 ms</span> |
-| DoH upstream (HTTP/2) |     29,781.6 |   25,835.7 | <span className="benchmark-delta benchmark-delta--up">+15.3%</span> | <span className="benchmark-latency benchmark-latency--worse">13.363 ms</span> | <span className="benchmark-latency benchmark-latency--better">11.445 ms</span> |
-| domain set            |    172,061.7 |   35,966.1 | <span className="benchmark-delta benchmark-delta--up">+378.4%</span> | <span className="benchmark-latency benchmark-latency--better">0.901 ms</span> | <span className="benchmark-latency benchmark-latency--worse">4.210 ms</span> |
-| ip set                |    134,257.4 |  150,923.0 | <span className="benchmark-delta benchmark-delta--down">-11.0%</span> | <span className="benchmark-latency benchmark-latency--worse">1.227 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.625 ms</span> |
-| sequence base         |    131,995.6 |  150,301.5 | <span className="benchmark-delta benchmark-delta--down">-12.2%</span> | <span className="benchmark-latency benchmark-latency--worse">1.265 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.622 ms</span> |
-| match true            |    135,326.0 |  153,289.5 | <span className="benchmark-delta benchmark-delta--down">-11.7%</span> | <span className="benchmark-latency benchmark-latency--worse">1.217 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.629 ms</span> |
-| match false           |    136,740.1 |  152,297.5 | <span className="benchmark-delta benchmark-delta--down">-10.2%</span> | <span className="benchmark-latency benchmark-latency--worse">1.201 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.630 ms</span> |
-| match qname           |    132,289.4 |  152,203.6 | <span className="benchmark-delta benchmark-delta--down">-13.1%</span> | <span className="benchmark-latency benchmark-latency--worse">1.248 ms</span> | <span className="benchmark-latency benchmark-latency--better">0.638 ms</span> |
-
-### v0.1.0 当时的结论
-
-* OxiDNS 在多上游并发、DoH 上游、双入口 UDP 和大规模 `domain_set` 场景下更有优势
-* mosdns 在缓存命中、本地应答、基础 `sequence` 和轻量 matcher 场景下目前仍然更快
-* `fallback standby` 这类链路还有继续优化空间
-
-## 原始资料
-
-* 基准目录：[`benchmarks/mosdns_compare/README.md`](https://github.com/svenshi/oxidns/tree/main/benchmarks/mosdns_compare)
-* 场景列表：[`benchmarks/mosdns_compare/scenarios.tsv`](https://github.com/svenshi/oxidns/blob/main/benchmarks/mosdns_compare/scenarios.tsv)
-* 高并发脚本：[`benchmarks/mosdns_compare/run_dnsperf_compare.sh`](https://github.com/svenshi/oxidns/blob/main/benchmarks/mosdns_compare/run_dnsperf_compare.sh)
-* 低并发延迟脚本：[`benchmarks/mosdns_compare/run_dnsperf_latency_compare.sh`](https://github.com/svenshi/oxidns/blob/main/benchmarks/mosdns_compare/run_dnsperf_latency_compare.sh)
+本轮是同机 loopback 对比，适合观察本地请求路径成本、并发扩展和排队，不代表其他硬件上的生产容量，也不把公网转发上游波动混进默认结论。可下载：[完整报告](/benchmarks/staged/report.txt)、[聚合 TSV](/benchmarks/staged/summary.tsv)、[逐轮 JSON](/benchmarks/staged/summary.raw.json)、[环境快照](/benchmarks/staged/environment.json)。
