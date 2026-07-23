@@ -5,7 +5,21 @@ const sidebars = {
       type: 'category',
       label: '入门',
       collapsed: false,
-      items: ['quickstart', 'scenarios', 'migrate-from-mosdns'],
+      items: [
+        'quickstart',
+        {
+          type: 'category',
+          label: '安装与部署',
+          items: [
+            'installation/native',
+            'installation/packages',
+            'installation/docker',
+            'openwrt',
+          ],
+        },
+        'scenarios',
+        'migrate-from-mosdns',
+      ],
     },
     {
       type: 'category',
@@ -26,7 +40,7 @@ const sidebars = {
     {
       type: 'category',
       label: '部署与运维',
-      items: ['openwrt', 'webui', 'operations', 'security'],
+      items: ['webui', 'operations', 'security'],
     },
     {
       type: 'category',

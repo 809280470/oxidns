@@ -123,7 +123,7 @@ dig @127.0.0.1 example.com +tcp
 
 The WebUI is available at `http://SERVER_IP:9199/` by default. Before allowing access from other devices, enable `api.http.auth` and restrict sources with a firewall or reverse proxy. Run `oxidns check` after changing configuration.
 
-On OpenWrt, the same installer installs [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns). See the [complete Quick Start](https://oxidns.org/en/quickstart) for manual downloads, Docker, Debian packages, portable installs, uninstall steps, and platform paths; see [Custom Build](https://oxidns.org/en/custom-build) to strip optional protocols and plugins.
+On OpenWrt, the same installer installs [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns). Use the [Quick Start](https://oxidns.org/en/quickstart) for the first successful query; see “Installation & Deployment” in the manual for archives, Docker, Debian packages, portable installs, and uninstallation; see [Custom Build](https://oxidns.org/en/custom-build) to strip optional protocols and plugins.
 
 ## Who it is for
 

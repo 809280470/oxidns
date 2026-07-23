@@ -7,6 +7,10 @@
     "message": "Getting Started",
     "description": "The label for category '入门' in sidebar 'docsSidebar'"
   },
+  "sidebar.docsSidebar.category.安装与部署": {
+    "message": "Installation & Deployment",
+    "description": "The label for category '安装与部署' in sidebar 'docsSidebar'"
+  },
   "sidebar.docsSidebar.category.配置指南": {
     "message": "Configuration",
     "description": "The label for category '配置指南' in sidebar 'docsSidebar'"

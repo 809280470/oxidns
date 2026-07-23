@@ -123,7 +123,7 @@ dig @127.0.0.1 example.com +tcp
 
 WebUI 默认地址为 `http://服务器IP:9199/`。允许其他设备访问前，请启用 `api.http.auth` 并通过防火墙或反向代理限制来源。修改配置后，请先使用 `oxidns check` 校验。
 
-OpenWrt 会通过同一个安装脚本安装 [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns)。手动下载、Docker、Debian 包、便携安装、卸载和平台目录说明见[完整快速开始](https://oxidns.org/quickstart)；按需裁剪协议和插件见[自定义编译](https://oxidns.org/custom-build)。
+OpenWrt 会通过同一个安装脚本安装 [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns)。完成首次查询见[快速开始](https://oxidns.org/quickstart)；手动下载、Docker、Debian 包、便携安装和卸载见文档中的“安装与部署”；按需裁剪协议和插件见[自定义编译](https://oxidns.org/custom-build)。
 
 ## 适合谁
 
