@@ -527,6 +527,7 @@ body:has(.oxi-hero) .pagination-nav {
 .oxi-hero__install-tab:focus-visible,
 .oxi-hero__install-copy:focus-visible,
 .oxi-hero__community-cta:focus-visible,
+.oxi-hero__community-support:focus-visible,
 .oxi-hero__community-qr:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--ifm-color-primary) 55%, white);
   outline-offset: 3px;
@@ -1508,6 +1509,13 @@ body:has(.oxi-hero) .pagination-nav {
   margin: 0 0 1rem;
 }
 
+.oxi-hero__community-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+}
+
 .oxi-hero__community-cta {
   display: inline-flex;
   align-items: center;
@@ -1531,6 +1539,24 @@ body:has(.oxi-hero) .pagination-nav {
 .oxi-hero__community-cta svg {
   width: 1rem;
   height: 1rem;
+}
+
+.oxi-hero__community-support {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--ifm-color-primary-dark) !important;
+  font-size: 0.92rem;
+  font-weight: 750;
+  text-decoration: none !important;
+}
+
+.oxi-hero__community-support span {
+  transition: transform 0.15s ease;
+}
+
+.oxi-hero__community-support:hover span {
+  transform: translateX(2px);
 }
 
 .oxi-hero__community-qr {
@@ -1561,6 +1587,82 @@ body:has(.oxi-hero) .pagination-nav {
 
 [data-theme='dark'] .oxi-hero__community-desc {
   color: #94a3b8;
+}
+
+[data-theme='dark'] .oxi-hero__community-support {
+  color: var(--ifm-color-primary-light) !important;
+}
+
+/* Voluntary support page */
+.support-payment-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 300px));
+  gap: 1.25rem;
+  margin: 1.75rem 0;
+}
+
+.support-payment-card {
+  margin: 0;
+  padding: 1.15rem;
+  border: 1px solid var(--doc-border-subtle);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.07);
+}
+
+.support-payment-card__title {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-bottom: 0.9rem;
+  color: var(--ifm-heading-color);
+  font-size: 1rem;
+  font-weight: 800;
+}
+
+.support-payment-card__dot {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 999px;
+  box-shadow: 0 0 0 4px rgba(15, 23, 42, 0.04);
+}
+
+.support-payment-card__dot--wechat {
+  background: #07c160;
+}
+
+.support-payment-card__dot--alipay {
+  background: #1677ff;
+}
+
+.support-payment-card img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: contain;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.support-payment-card figcaption {
+  margin-top: 0.85rem;
+  color: var(--doc-text-muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
+[data-theme='dark'] .support-payment-card {
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(15, 23, 42, 0.58);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
+}
+
+@media (max-width: 680px) {
+  .support-payment-grid {
+    grid-template-columns: minmax(0, 1fr);
+    max-width: 340px;
+  }
 }
 
 @media (max-width: 1100px) {

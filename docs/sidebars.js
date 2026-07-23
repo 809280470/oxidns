@@ -121,6 +121,7 @@ const sidebars = {
       items: [
         'documentation',
         'contributing',
+        'support-development',
         'roadmap',
         {
           type: 'category',

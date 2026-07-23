@@ -176,6 +176,7 @@ const config = {
             title: '社区',
             items: [
               {label: '参与贡献', to: '/contributing'},
+              {label: '支持项目开发', to: '/support-development'},
               {label: 'GitHub Discussions', href: 'https://github.com/svenshi/oxidns/discussions'},
               {label: 'Telegram', href: 'https://t.me/oxidns'},
             ],

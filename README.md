@@ -145,7 +145,7 @@ OxiDNS 适合需要长期运行、精细控制和完整可观测性的 DNS 环�
 - **参考手册**：[插件总览](https://oxidns.org/plugin-reference/overview) · [管理 API](https://oxidns.org/api) · [命令行工具](https://oxidns.org/cli) · [DNS 编码速查](https://oxidns.org/dns-codes)
 - **部署运维**：[运维与故障排查](https://oxidns.org/operations) · [安全加固](https://oxidns.org/security) · [WebUI](https://oxidns.org/webui) · [OpenWrt](https://oxidns.org/openwrt)
 - **了解项目**：[架构与设计](https://oxidns.org/architecture-and-design) · [性能与基准](https://oxidns.org/benchmarks) · [文档版本](https://oxidns.org/documentation) · [版本更新](https://oxidns.org/releases) · [路线图](https://oxidns.org/roadmap)
-- **参与社区**：[贡献指南](https://oxidns.org/contributing) · [GitHub Discussions](https://github.com/svenshi/oxidns/discussions) · [Telegram](https://t.me/oxidns)
+- **参与社区**：[贡献指南](https://oxidns.org/contributing) · [支持项目开发](https://oxidns.org/support-development) · [GitHub Discussions](https://github.com/svenshi/oxidns/discussions) · [Telegram](https://t.me/oxidns)
 
 ## 项目状态
 
@@ -162,6 +162,25 @@ OxiDNS 仍在持续开发，适合高级家庭网络、软路由、Homelab 和�
 <a href="https://t.me/oxidns">
   <img src=".github/img/telegram-qr.png" alt="OxiDNS Telegram 群二维码" width="220" />
 </a>
+
+---
+
+## 支持项目开发
+
+如果 OxiDNS 对你有帮助，可以通过微信或支付宝支持项目的持续开发与维护。支持完全自愿，感谢每一份认可。
+
+<table>
+  <tr>
+    <th align="center">微信支付</th>
+    <th align="center">支付宝</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/static/img/support/wechat-pay.jpg" alt="支持 OxiDNS 项目开发的微信支付收款码" width="260" /></td>
+    <td align="center"><img src="docs/static/img/support/alipay.jpg" alt="支持 OxiDNS 项目开发的支付宝收款码" width="260" /></td>
+  </tr>
+</table>
+
+资金支持不会建立商业服务关系，也不会影响功能规划或问题处理的优先级。其他支持方式请参阅[贡献指南](https://oxidns.org/contributing)。
 
 ---
 
