@@ -95,7 +95,7 @@ chmod +x oxidns
 .\oxidns.exe start -c .\config.yaml
 ```
 
-手动 archive 不会自动建立系统服务。长期运行可使用内置 `oxidns service install`，完整参数见[命令行工具](../cli.md#service)。
+手动 archive 不会自动建立系统服务。长期运行可使用内置 `oxidns service install`，完整参数见[运行、探测与系统服务](../cli/runtime.md#service)。
 
 ## Debian 包
 
@@ -161,4 +161,3 @@ cargo build --release
 5. 启用 API 时，`readyz`、WebUI 和认证行为符合预期。
 
 生产替换前还应保留上一份二进制、WebUI、配置和持久化数据，具体见[升级与回滚](../operations.md#升级与回滚)。
-

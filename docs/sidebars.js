@@ -50,7 +50,27 @@ const sidebars = {
     {
       type: 'category',
       label: '接口参考',
-      items: ['cli', 'api', 'dns-codes'],
+      items: [
+        {
+          type: 'category',
+          label: '命令行',
+          link: {type: 'doc', id: 'cli'},
+          items: ['cli/runtime', 'cli/tools', 'cli/upgrade'],
+        },
+        {
+          type: 'category',
+          label: '管理 API',
+          link: {type: 'doc', id: 'api'},
+          items: [
+            'api/conventions',
+            'api/control',
+            'api/configuration',
+            'api/plugins',
+            'api/metrics',
+          ],
+        },
+        'dns-codes',
+      ],
     },
     {
       type: 'category',

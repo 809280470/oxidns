@@ -27,6 +27,14 @@
     "message": "Interface Reference",
     "description": "The label for category '接口参考' in sidebar 'docsSidebar'"
   },
+  "sidebar.docsSidebar.category.命令行": {
+    "message": "Command Line",
+    "description": "The label for category '命令行' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.管理 API": {
+    "message": "Management API",
+    "description": "The label for category '管理 API' in sidebar 'docsSidebar'"
+  },
   "sidebar.docsSidebar.category.架构与开发": {
     "message": "Architecture & Development",
     "description": "The label for category '架构与开发' in sidebar 'docsSidebar'"

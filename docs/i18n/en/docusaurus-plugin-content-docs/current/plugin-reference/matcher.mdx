@@ -21,7 +21,7 @@ Both fixed modes skip the internal predicate and fix its base Boolean value, but
 
 The runtime mode is shared by matcher tag, while reference semantics remain local to each reference. If the same tag appears as `$matcher` and `!$matcher` in one or more sequences, both references share the fixed base value but their final results remain opposites. Child references in `any_match` follow the same rule; control the `any_match` tag itself when the entire composition must be fixed.
 
-This state is not written to the configuration, and a full reload or process restart restores `normal`. Quick-setup matchers do not have stable public tags and therefore do not expose runtime modes; extract the expression into a standalone matcher when control is required. See the [Management API](../api.mdx#matcher) for endpoint details.
+This state is not written to the configuration, and a full reload or process restart restores `normal`. Quick-setup matchers do not have stable public tags and therefore do not expose runtime modes; extract the expression into a standalone matcher when control is required. See the [Plugin Extension APIs](../api/plugins.mdx#matcher) for endpoint details.
 
 ## Matcher Expression Rules
 
