@@ -24,7 +24,12 @@ const sidebars = {
     {
       type: 'category',
       label: '配置指南',
-      items: ['configuration'],
+      link: {type: 'doc', id: 'configuration'},
+      items: [
+        'configuration/global',
+        'configuration/sequence',
+        'configuration/rules',
+      ],
     },
     {
       type: 'category',
