@@ -535,6 +535,14 @@ API 路由分成三类：
 
 清空缓存。
 
+#### `GET /api/plugins/<cache_tag>/dump`
+
+导出缓存 dump。
+
+#### `POST /api/plugins/<cache_tag>/load_dump`
+
+导入缓存 dump。
+
 ### matcher
 
 配置在 `plugins:` 中、具有稳定 tag 的 matcher 都会注册以下运行时控制接口：
@@ -596,14 +604,6 @@ WebUI 对 `always_false` 与 `always_true` 都要求二次确认；恢复 `norma
 * 如果变更涉及 `config.yaml`、provider 依赖拓扑、插件列表或其它非 provider 结构，仍然需要使用 `POST /api/reload`。
 
 WebUI 在所有已应用的 provider 卡片和详情页中提供“重新加载数据”操作。该操作不会弹出配置变更确认；执行期间会阻止同一 provider 的重复请求，并展示成功、失败或 busy 结果。
-
-#### `GET /api/plugins/<cache_tag>/dump`
-
-导出缓存 dump。
-
-#### `POST /api/plugins/<cache_tag>/load_dump`
-
-导入缓存 dump。
 
 ### reverse\_lookup
 

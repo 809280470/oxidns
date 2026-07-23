@@ -119,7 +119,7 @@ api:
 
 ### `short_circuit`：命中即短路
 
-`forward`、`cache`、`hosts`、`fallback`、`black_hole`、`dual_selector` 等执行器插件均支持 `short_circuit` 选项。开启后，命中时立即结束当前 sequence 的后续步骤，无需额外写 `has_resp` + `accept`。
+`forward`、`cache`、`hosts`、`fallback`、`black_hole`、`prefer_ipv4`、`prefer_ipv6` 等执行器插件均支持 `short_circuit` 选项。开启后，命中时立即结束当前 sequence 的后续步骤，无需额外写 `has_resp` + `accept`。
 
 ```yaml
 - tag: cache_main

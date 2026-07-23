@@ -52,6 +52,7 @@ server -> sequence
 | [`cache`](executor.mdx#cache) | 对响应做 TTL 感知缓存，支持负缓存与持久化。 |
 | [`hosts`](executor.mdx#hosts) | 按域名规则直接返回静态 `A` / `AAAA`。 |
 | [`arbitrary`](executor.mdx#arbitrary) | 加载任意静态 DNS 记录并在命中时直接构造应答。 |
+| [`response`](executor.mdx#response) | 使用 zone record 模板构造完整 DNS 响应，包括记录区、RCODE 与响应标志。 |
 | [`redirect`](executor.mdx#redirect) | 把请求域名改写为另一个目标域名，并在返回阶段补回客户端可见的 CNAME。 |
 | [`ecs_handler`](executor.mdx#ecs_handler) | 处理 EDNS Client Subnet：保留、改写或按来源 IP 自动补齐。 |
 | [`forward_edns0opt`](executor.mdx#forward_edns0opt) | 把指定 EDNS0 option code 从请求转发到最终响应中。 |
@@ -61,6 +62,7 @@ server -> sequence
 | 插件 | 作用 |
 | --- | --- |
 | [`ttl`](executor.mdx#ttl) | 改写响应 TTL（统一值或上下限裁剪）。 |
+| [`ip_selector`](executor.mdx#ip_selector) | 对响应中的多个 IP 主动探测并按评分选择或重排地址。 |
 | [`prefer_ipv4` / `prefer_ipv6`](executor.mdx#prefer_ipv4--prefer_ipv6) | 双栈优选器，对偏好类型做学习，对非偏好类型做抑制。 |
 | [`black_hole`](executor.mdx#black_hole) | 按 `nxdomain` / `nodata` / `null` / `custom` / `refused` 模式生成全 qtype 拦截响应。 |
 | [`drop_resp`](executor.mdx#drop_resp) | 清空当前上下文中的响应。 |

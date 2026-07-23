@@ -143,8 +143,9 @@ It is not an authoritative DNS server or a zero-configuration ad-blocking dashbo
 
 - **Get started**: [Quick Start](https://oxidns.org/en/quickstart) · [Configuration](https://oxidns.org/en/configuration) · [Common Scenarios](https://oxidns.org/en/scenarios) · [Migrate from mosdns](https://oxidns.org/en/migrate-from-mosdns)
 - **Reference**: [Plugin Overview](https://oxidns.org/en/plugin-reference/overview) · [Management API](https://oxidns.org/en/api) · [CLI](https://oxidns.org/en/cli) · [DNS Codes](https://oxidns.org/en/dns-codes)
-- **Deploy and operate**: [WebUI](https://oxidns.org/en/webui) · [OpenWrt](https://oxidns.org/en/openwrt) · [Custom Build](https://oxidns.org/en/custom-build)
+- **Deploy and operate**: [Operations & Troubleshooting](https://oxidns.org/en/operations) · [Security Hardening](https://oxidns.org/en/security) · [WebUI](https://oxidns.org/en/webui) · [OpenWrt](https://oxidns.org/en/openwrt)
 - **Understand the project**: [Architecture and Design](https://oxidns.org/en/architecture-and-design) · [Performance and Benchmarks](https://oxidns.org/en/benchmarks) · [Releases](https://oxidns.org/en/releases) · [Roadmap](https://oxidns.org/en/roadmap)
+- **Community**: [Contributing](https://oxidns.org/en/contributing) · [GitHub Discussions](https://github.com/svenshi/oxidns/discussions) · [Telegram](https://t.me/oxidns)
 
 ## Project Status
 

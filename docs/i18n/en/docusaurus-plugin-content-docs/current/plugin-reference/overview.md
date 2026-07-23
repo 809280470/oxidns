@@ -52,6 +52,7 @@ See [Executor Plugins](executor.mdx) for full field reference. Grouped as: polic
 | [`cache`](executor.mdx#cache) | TTL-aware response caching with negative cache and persistence support. |
 | [`hosts`](executor.mdx#hosts) | Returns local static `A` / `AAAA` answers using host-style entries. |
 | [`arbitrary`](executor.mdx#arbitrary) | Injects arbitrary DNS records from zone-style rule strings. |
+| [`response`](executor.mdx#response) | Builds complete DNS responses from zone-record templates, including sections, RCODE, and response flags. |
 | [`redirect`](executor.mdx#redirect) | Rewrites a query name toward another target and restores the visible CNAME on the way back. |
 | [`ecs_handler`](executor.mdx#ecs_handler) | Handles EDNS Client Subnet: keep, rewrite, or auto-fill from source IP. |
 | [`forward_edns0opt`](executor.mdx#forward_edns0opt) | Forwards selected EDNS0 options from the request into the final response. |
@@ -61,6 +62,7 @@ See [Executor Plugins](executor.mdx) for full field reference. Grouped as: polic
 | Plugin | Purpose |
 | --- | --- |
 | [`ttl`](executor.mdx#ttl) | Rewrites response TTL values (fixed value or min/max clamp). |
+| [`ip_selector`](executor.mdx#ip_selector) | Actively probes multiple response IPs and selects or reorders them by score. |
 | [`prefer_ipv4` / `prefer_ipv6`](executor.mdx#prefer_ipv4--prefer_ipv6) | Dual-stack selector: learns presence of the preferred family and suppresses the other. |
 | [`black_hole`](executor.mdx#black_hole) | Generates full-qtype interception responses using `nxdomain`, `nodata`, `null`, `custom`, or `refused` mode. |
 | [`drop_resp`](executor.mdx#drop_resp) | Drops the current response from the context. |

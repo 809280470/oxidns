@@ -53,6 +53,35 @@ wget -O- https://oxidns.org/install.sh | sh
   </TabItem>
 </Tabs>
 
+安装脚本完成后先做最小验证，再继续阅读后面的高级安装选项：
+
+<Tabs groupId="os">
+  <TabItem value="unix" label="Linux / macOS" default>
+
+```bash
+oxidns --version
+oxidns build-info
+curl -fsS http://127.0.0.1:9199/api/readyz
+dig @127.0.0.1 example.com
+```
+
+  </TabItem>
+  <TabItem value="windows" label="Windows">
+
+```powershell
+oxidns.exe --version
+oxidns.exe build-info
+Invoke-RestMethod http://127.0.0.1:9199/api/readyz
+Resolve-DnsName example.com -Server 127.0.0.1
+```
+
+  </TabItem>
+</Tabs>
+
+如果 health API 正常但 DNS 查询失败，请直接查看[运维与故障排查](operations.md)。允许其它设备访问 WebUI/API 前，请先阅读[安全加固](security.md)。
+
+OpenWrt 安装脚本只安装 LuCI 插件；请先在 `Services -> OxiDNS -> Core` 中安装并启动 OxiDNS 内核，再通过 LuCI 状态页和 DNS 查询完成验证。
+
 默认安装位置：
 
 | 平台 | 默认安装目录 | PATH 行为 |
@@ -616,3 +645,5 @@ curl -fsS http://127.0.0.1:9199/api/health
 1. [配置总览](configuration.md)
 2. [插件总览](plugin-reference/overview.md)
 3. [常见策略场景](scenarios.md)
+4. [运维与故障排查](operations.md)
+5. [安全加固](security.md)

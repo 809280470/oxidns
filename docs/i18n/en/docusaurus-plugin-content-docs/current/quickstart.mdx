@@ -53,6 +53,35 @@ wget -O- https://oxidns.org/install.sh | sh
   </TabItem>
 </Tabs>
 
+After the installer completes, run a minimal verification before reading the advanced installation options below:
+
+<Tabs groupId="os">
+  <TabItem value="unix" label="Linux / macOS" default>
+
+```bash
+oxidns --version
+oxidns build-info
+curl -fsS http://127.0.0.1:9199/api/readyz
+dig @127.0.0.1 example.com
+```
+
+  </TabItem>
+  <TabItem value="windows" label="Windows">
+
+```powershell
+oxidns.exe --version
+oxidns.exe build-info
+Invoke-RestMethod http://127.0.0.1:9199/api/readyz
+Resolve-DnsName example.com -Server 127.0.0.1
+```
+
+  </TabItem>
+</Tabs>
+
+If the health API works but DNS queries fail, go directly to [Operations and Troubleshooting](operations.md). Before allowing other devices to reach the WebUI or API, read [Security Hardening](security.md).
+
+On OpenWrt, the installer only installs the LuCI app. Install and start the OxiDNS core from `Services -> OxiDNS -> Core`, then verify it from the LuCI status page and with a DNS query.
+
 Default install locations:
 
 | Platform | Default install directory | PATH behavior |
@@ -616,3 +645,5 @@ After the first successful start, continue with:
 1. [Configuration Overview](configuration.md)
 2. [Plugin Overview](plugin-reference/overview.md)
 3. [Common Scenarios](scenarios.md)
+4. [Operations and Troubleshooting](operations.md)
+5. [Security Hardening](security.md)

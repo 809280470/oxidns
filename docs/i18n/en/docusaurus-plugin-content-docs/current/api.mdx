@@ -537,6 +537,14 @@ Query parameters:
 
 Clears the cache.
 
+#### `GET /api/plugins/<cache_tag>/dump`
+
+Exports a cache dump.
+
+#### `POST /api/plugins/<cache_tag>/load_dump`
+
+Imports a cache dump.
+
 ### matcher
 
 Every matcher declared in `plugins:` with a stable tag registers these runtime-control endpoints:
@@ -600,14 +608,6 @@ Good fit:
 </Admonition>
 
 The WebUI exposes **Reload data** on every applied provider card and detail view. It does not show a configuration-change confirmation; while the command is running, duplicate requests for the same provider are disabled and the success, failure, or busy result is surfaced inline.
-
-#### `GET /api/plugins/<cache_tag>/dump`
-
-Exports a cache dump.
-
-#### `POST /api/plugins/<cache_tag>/load_dump`
-
-Imports a cache dump.
 
 ### reverse_lookup
 

@@ -119,7 +119,7 @@ Persists every request, response, and sequence execution path to SQLite. Provide
 
 ### `short_circuit`: Stop on Match
 
-Executor plugins including `forward`, `cache`, `hosts`, `fallback`, `black_hole`, and `dual_selector` all support a `short_circuit` option. When enabled, the plugin immediately ends the current sequence's remaining steps upon a hit — no extra `has_resp` + `accept` needed.
+Executor plugins including `forward`, `cache`, `hosts`, `fallback`, `black_hole`, `prefer_ipv4`, and `prefer_ipv6` all support a `short_circuit` option. When enabled, the plugin immediately ends the current sequence's remaining steps upon a hit — no extra `has_resp` + `accept` needed.
 
 ```yaml
 - tag: cache_main
