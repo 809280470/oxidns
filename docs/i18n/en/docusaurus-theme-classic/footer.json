@@ -23,6 +23,10 @@
     "message": "Plugin Reference",
     "description": "The label of footer link with label=Plugin Reference"
   },
+  "link.item.label.文档版本": {
+    "message": "Documentation Versions",
+    "description": "The label of footer link with label=Documentation Versions"
+  },
   "link.item.label.运维与故障排查": {
     "message": "Operations & Troubleshooting",
     "description": "The label of footer link with label=Operations & Troubleshooting"

@@ -118,7 +118,22 @@ const sidebars = {
     {
       type: 'category',
       label: '项目与社区',
-      items: ['contributing', 'roadmap', 'releases'],
+      items: [
+        'documentation',
+        'contributing',
+        'roadmap',
+        {
+          type: 'category',
+          label: '版本更新',
+          link: {type: 'doc', id: 'releases'},
+          items: [
+            'releases/2026-06',
+            'releases/2026-05',
+            'releases/2026-04',
+            'releases/2026-03',
+          ],
+        },
+      ],
     },
   ],
 };

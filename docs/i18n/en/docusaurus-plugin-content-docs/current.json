@@ -58,5 +58,9 @@
   "sidebar.docsSidebar.category.项目与社区": {
     "message": "Project & Community",
     "description": "The label for category '项目与社区' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.版本更新": {
+    "message": "Release Notes",
+    "description": "The label for category '版本更新' in sidebar 'docsSidebar'"
   }
 }

@@ -161,6 +161,7 @@ const config = {
               {label: '快速开始', to: '/quickstart'},
               {label: '配置指南', to: '/configuration'},
               {label: '插件参考', to: '/plugin-reference/overview'},
+              {label: '文档版本', to: '/documentation'},
             ],
           },
           {

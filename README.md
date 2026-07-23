@@ -144,7 +144,7 @@ OxiDNS 适合需要长期运行、精细控制和完整可观测性的 DNS 环�
 - **开始使用**：[快速开始](https://oxidns.org/quickstart) · [配置总览](https://oxidns.org/configuration) · [常见场景](https://oxidns.org/scenarios) · [从 mosdns 迁移](https://oxidns.org/migrate-from-mosdns)
 - **参考手册**：[插件总览](https://oxidns.org/plugin-reference/overview) · [管理 API](https://oxidns.org/api) · [命令行工具](https://oxidns.org/cli) · [DNS 编码速查](https://oxidns.org/dns-codes)
 - **部署运维**：[运维与故障排查](https://oxidns.org/operations) · [安全加固](https://oxidns.org/security) · [WebUI](https://oxidns.org/webui) · [OpenWrt](https://oxidns.org/openwrt)
-- **了解项目**：[架构与设计](https://oxidns.org/architecture-and-design) · [性能与基准](https://oxidns.org/benchmarks) · [版本更新](https://oxidns.org/releases) · [路线图](https://oxidns.org/roadmap)
+- **了解项目**：[架构与设计](https://oxidns.org/architecture-and-design) · [性能与基准](https://oxidns.org/benchmarks) · [文档版本](https://oxidns.org/documentation) · [版本更新](https://oxidns.org/releases) · [路线图](https://oxidns.org/roadmap)
 - **参与社区**：[贡献指南](https://oxidns.org/contributing) · [GitHub Discussions](https://github.com/svenshi/oxidns/discussions) · [Telegram](https://t.me/oxidns)
 
 ## 项目状态
