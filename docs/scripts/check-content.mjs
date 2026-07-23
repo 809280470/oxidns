@@ -47,10 +47,10 @@ function extractReferencePlugins(markdown) {
   return plugins;
 }
 
-function extractOverviewPlugins(markdown, category) {
+function extractCatalogPlugins(markdown, category) {
   const plugins = new Set();
   const linkPattern = new RegExp(
-    `\\[([^\\]]+)\\]\\(${category}\\.mdx#[^)]+\\)`,
+    `\\[([^\\]]+)\\]\\(${category}(?:\\.mdx|/[^)#]+\\.mdx)#[^)]+\\)`,
     'g',
   );
 
@@ -60,6 +60,14 @@ function extractOverviewPlugins(markdown, category) {
     }
   }
   return plugins;
+}
+
+function extractLegacyAnchors(markdown) {
+  return new Set(
+    [...markdown.matchAll(/<span id="([^"]+)"><\/span>/g)].map(
+      (match) => match[1],
+    ),
+  );
 }
 
 function reportSetDifference(errors, label, expected, actual) {
@@ -99,18 +107,41 @@ async function checkPluginCatalog(errors) {
     const allPlugins = new Set();
 
     for (const category of pluginCategories) {
-      const reference = await readFile(
+      const landing = await readFile(
         join(root, 'plugin-reference', `${category}.mdx`),
         'utf8',
       );
-      const referencePlugins = extractReferencePlugins(reference);
-      const overviewPlugins = extractOverviewPlugins(overview, category);
+      const referencePlugins = new Set();
+      for (const path of await walk(
+        join(root, 'plugin-reference', category),
+        ['.md', '.mdx'],
+      )) {
+        const reference = await readFile(path, 'utf8');
+        for (const plugin of extractReferencePlugins(reference)) {
+          referencePlugins.add(plugin);
+        }
+      }
+      const overviewPlugins = extractCatalogPlugins(overview, category);
+      const landingPlugins = extractCatalogPlugins(landing, category);
+      const legacyAnchors = extractLegacyAnchors(landing);
       reportSetDifference(
         errors,
         `${locale} ${category} overview`,
         referencePlugins,
         overviewPlugins,
       );
+      reportSetDifference(
+        errors,
+        `${locale} ${category} landing`,
+        referencePlugins,
+        landingPlugins,
+      );
+      const missingLegacyAnchors = difference(referencePlugins, legacyAnchors);
+      if (missingLegacyAnchors.length > 0) {
+        errors.push(
+          `${locale} ${category} legacy anchors: missing ${missingLegacyAnchors.join(', ')}`,
+        );
+      }
       for (const plugin of referencePlugins) {
         allPlugins.add(plugin);
       }

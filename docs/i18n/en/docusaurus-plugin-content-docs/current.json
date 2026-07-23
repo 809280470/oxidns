@@ -19,6 +19,22 @@
     "message": "Plugin Reference",
     "description": "The label for category '插件参考' in sidebar 'docsSidebar'"
   },
+  "sidebar.docsSidebar.category.服务端": {
+    "message": "Servers",
+    "description": "The label for category '服务端' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.执行器": {
+    "message": "Executors",
+    "description": "The label for category '执行器' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.匹配器": {
+    "message": "Matchers",
+    "description": "The label for category '匹配器' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.数据提供器": {
+    "message": "Providers",
+    "description": "The label for category '数据提供器' in sidebar 'docsSidebar'"
+  },
   "sidebar.docsSidebar.category.部署与运维": {
     "message": "Deployment & Operations",
     "description": "The label for category '部署与运维' in sidebar 'docsSidebar'"

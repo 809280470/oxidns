@@ -36,10 +36,48 @@ const sidebars = {
       label: '插件参考',
       items: [
         'plugin-reference/overview',
-        'plugin-reference/server',
-        'plugin-reference/executor',
-        'plugin-reference/matcher',
-        'plugin-reference/provider',
+        {
+          type: 'category',
+          label: '服务端',
+          link: {type: 'doc', id: 'plugin-reference/server'},
+          items: [
+            'plugin-reference/server/datagram-stream',
+            'plugin-reference/server/encrypted-http',
+          ],
+        },
+        {
+          type: 'category',
+          label: '执行器',
+          link: {type: 'doc', id: 'plugin-reference/executor'},
+          items: [
+            'plugin-reference/executor/control-flow',
+            'plugin-reference/executor/resolution',
+            'plugin-reference/executor/response',
+            'plugin-reference/executor/observability',
+            'plugin-reference/executor/integrations',
+            'plugin-reference/executor/maintenance',
+          ],
+        },
+        {
+          type: 'category',
+          label: '匹配器',
+          link: {type: 'doc', id: 'plugin-reference/matcher'},
+          items: [
+            'plugin-reference/matcher/request',
+            'plugin-reference/matcher/response',
+            'plugin-reference/matcher/context',
+            'plugin-reference/matcher/composition',
+          ],
+        },
+        {
+          type: 'category',
+          label: '数据提供器',
+          link: {type: 'doc', id: 'plugin-reference/provider'},
+          items: [
+            'plugin-reference/provider/domain',
+            'plugin-reference/provider/ip',
+          ],
+        },
       ],
     },
     {
