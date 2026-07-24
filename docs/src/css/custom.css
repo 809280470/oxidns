@@ -196,6 +196,42 @@ main {
   max-width: 960px;
 }
 
+.benchmark-chart-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(12rem, 1fr);
+  gap: 1.5rem;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 0 var(--ifm-spacing-vertical);
+  align-items: start;
+}
+
+.benchmark-chart-panel > .col--8,
+.benchmark-chart-panel > .col--4 {
+  flex: none;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  padding: 0;
+}
+
+.benchmark-chart-panel img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.benchmark-chart-panel .col--4 > p:first-child {
+  margin-top: 0;
+}
+
+@media (max-width: 996px) {
+  .benchmark-chart-panel {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.75rem;
+  }
+}
+
 .markdown code,
 .theme-code-block,
 pre code {
