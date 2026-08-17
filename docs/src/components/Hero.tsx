@@ -40,7 +40,7 @@ type Locale = 'zh' | 'en';
 type InstallTab = { label: string; prompt: string; code: string };
 type Feature = { icon: keyof typeof ICONS; title: string; desc: string; href: string };
 type NextStep = { num: number; label: string; href: string };
-type Community = { title: string; desc: string; cta: string; qrAlt: string };
+type Community = { title: string; desc: string; cta: string; supportCta: string; qrAlt: string };
 type HeroProps = { locale?: Locale };
 
 const TELEGRAM_URL = 'https://t.me/oxidns';
@@ -94,7 +94,7 @@ const COPY = {
         icon: 'plug',
         title: '系统联动',
         desc: 'ipset / nftset / MikroTik address-list / Prometheus，DNS 解析驱动网络行为。',
-        href: '/mikrotik-policy-routing',
+        href: '/plugin-reference/executor/integrations#ros_address_list',
       },
     ] satisfies Feature[],
     nextSteps: [
@@ -108,6 +108,7 @@ const COPY = {
       title: '加入社区',
       desc: '欢迎进入 Telegram 群与作者和其他用户交流配置、反馈问题或讨论新特性。',
       cta: 'Telegram · @OXIDNS',
+      supportCta: '支持项目开发',
       qrAlt: 'OxiDNS Telegram 群二维码',
     } satisfies Community,
   },
@@ -143,7 +144,7 @@ const COPY = {
         icon: 'plug',
         title: 'System integration',
         desc: 'ipset, nftset, MikroTik address lists, and Prometheus let DNS results drive network behavior.',
-        href: '/mikrotik-policy-routing',
+        href: '/plugin-reference/executor/integrations#ros_address_list',
       },
     ] satisfies Feature[],
     nextSteps: [
@@ -157,6 +158,7 @@ const COPY = {
       title: 'Join the community',
       desc: 'Hop into the Telegram group to chat with the author and other users about configuration, feedback, or upcoming features.',
       cta: 'Telegram · @OXIDNS',
+      supportCta: 'Support project development',
       qrAlt: 'OxiDNS Telegram group QR code',
     } satisfies Community,
   },
@@ -304,12 +306,17 @@ export default function Hero({ locale = 'zh' }: HeroProps): JSX.Element {
         <div className="oxi-hero__community-text">
           <h2 className="oxi-hero__community-title">{text.community.title}</h2>
           <p className="oxi-hero__community-desc">{text.community.desc}</p>
-          <Link className="oxi-hero__community-cta" to={TELEGRAM_URL}>
-            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-              <path d="M21.198 3.105 2.43 10.42c-1.281.514-1.273 1.235-.234 1.553l4.815 1.502 11.144-7.03c.527-.32 1.008-.148.612.204l-9.03 8.155h-.002l.002.001-.332 4.964c.488 0 .703-.224.976-.49l2.347-2.282 4.864 3.593c.897.494 1.541.24 1.764-.831l3.193-15.04c.327-1.317-.503-1.914-1.351-1.614Z"/>
-            </svg>
-            {text.community.cta}
-          </Link>
+          <div className="oxi-hero__community-actions">
+            <Link className="oxi-hero__community-cta" to={TELEGRAM_URL}>
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M21.198 3.105 2.43 10.42c-1.281.514-1.273 1.235-.234 1.553l4.815 1.502 11.144-7.03c.527-.32 1.008-.148.612.204l-9.03 8.155h-.002l.002.001-.332 4.964c.488 0 .703-.224.976-.49l2.347-2.282 4.864 3.593c.897.494 1.541.24 1.764-.831l3.193-15.04c.327-1.317-.503-1.914-1.351-1.614Z"/>
+              </svg>
+              {text.community.cta}
+            </Link>
+            <Link className="oxi-hero__community-support" to="/support-development">
+              {text.community.supportCta} <span aria-hidden="true">→</span>
+            </Link>
+          </div>
         </div>
         <a className="oxi-hero__community-qr" href={TELEGRAM_URL} target="_blank" rel="noopener noreferrer">
           <img src={TELEGRAM_QR} alt={text.community.qrAlt} loading="lazy" />

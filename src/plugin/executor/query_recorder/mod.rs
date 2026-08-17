@@ -12,6 +12,8 @@
 //!   `next`;
 //! - each recorder owns its own queue, SQLite connection, writer thread, tail
 //!   buffer, and SSE broadcaster;
+//! - recorders sharing a database path coordinate reads, writes, and
+//!   maintenance;
 //! - persistence uses one `records` table and one `steps` table per recorder
 //!   schema version.
 
@@ -32,6 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use jiff::Timestamp;
 use serde_yaml_ng::Value as YamlValue;
+use tracing::warn;
 
 use self::backend::RecorderBackend;
 use self::model::{PendingRecord, QueryRecorderConfig, ResolvedRecorderConfig};
@@ -79,7 +82,14 @@ impl Plugin for QueryRecorder {
             move || {
                 let recorder_backend = recorder_backend.clone();
                 async move {
-                    recorder_backend.cleanup(Timestamp::now().as_millisecond() - retention_ms);
+                    let cutoff_ms = Timestamp::now().as_millisecond() - retention_ms;
+                    match tokio::task::spawn_blocking(move || recorder_backend.cleanup(cutoff_ms))
+                        .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => warn!("query_recorder cleanup failed: {}", err),
+                        Err(err) => warn!("query_recorder cleanup task failed: {}", err),
+                    }
                 }
             },
         ));

@@ -1,6 +1,8 @@
 ![OxiDNS Banner](.github/img/logo-banner.png)
 
 [![oxidns downloads](https://img.shields.io/github/downloads/SvenShi/oxidns/total)](https://github.com/SvenShi/oxidns/releases)
+[![latest release](https://img.shields.io/github/v/release/svenshi/oxidns)](https://github.com/svenshi/oxidns/releases/latest)
+[![license](https://img.shields.io/github/license/svenshi/oxidns)](LICENSE)
 [![Rust CI](https://github.com/svenshi/oxidns/actions/workflows/rust-ci.yml/badge.svg?branch=main)](https://github.com/svenshi/oxidns/actions/workflows/rust-ci.yml)
 [![WebUI CI](https://github.com/svenshi/oxidns/actions/workflows/webui-ci.yml/badge.svg)](https://github.com/svenshi/oxidns/actions/workflows/webui-ci.yml)
 
@@ -10,63 +12,70 @@
 
 **面向复杂网络的高性能 DNS 策略编排引擎。**
 
-OxiDNS 是一个使用 Rust 构建的现代 DNS 引擎，受 [mosdns](https://github.com/IrineSistiana/mosdns) 启发，但不止于规则分流。
+OxiDNS 是一个使用 Rust 构建、面向软路由、OpenWrt、Homelab 和高级自建网络的插件化 DNS 引擎。它通过声明式策略组合匹配、缓存、转发、回退、改写、本地应答和系统联动，并提供 WebUI、管理 API、查询记录、Prometheus 指标和实时日志。
 
-它关注的是 DNS 查询在真实网络环境中的完整生命周期：接入、匹配、缓存、转发、回退、改写、本地应答与系统联动，并内置查询记录、Prometheus 指标采集和实时日志能力。
+项目受 [mosdns](https://github.com/IrineSistiana/mosdns) 启发，但不止于规则分流：OxiDNS 将 DNS 请求、上游响应和网络副作用放进同一条可组合、可解释的策略管线，让复杂行为仍然能够被配置、验证和追踪。
 
-OxiDNS 的核心不是“提供更多开关”，而是提供一套清晰、可组合、可调试的策略管线，让你能够用声明式配置描述复杂 DNS 行为。
+[快速开始](https://oxidns.org/quickstart) · [配置总览](https://oxidns.org/configuration) · [常见场景](https://oxidns.org/scenarios) · [性能与基准](https://oxidns.org/benchmarks)
+
+## 为什么选择 OxiDNS
+
+- **策略可编排**：`sequence` 将 matcher、executor 和 provider 组合成可复用的条件分支、跳转和回退链。
+- **决策可解释**：查询记录、执行路径、结构化日志和指标可以回答一次查询匹配了什么、执行了什么、为何选择当前结果。
+- **接入与出口统一**：同一策略可服务 UDP、TCP、DoT、DoQ 和 DoH，并统一管理上游解析、连接复用、并发裁决与代理出口。
+- **DNS 驱动网络行为**：解析结果可以直接联动 Linux `ipset` / `nftset`、RouterOS 地址列表与静态路由、HTTP webhook 和外部脚本。
+
+OxiDNS 使用自有 DNS 消息模型与 wire 编解码层，并把规则编译、依赖分析和连接初始化尽可能移出请求热路径；设计方法和历史测试结果见[性能与基准](https://oxidns.org/benchmarks)。
+
+核心请求路径保持清晰：
 
 ```text
-server -> DnsContext -> matcher / executor / provider -> upstream
+client -> server -> sequence (matcher + executor + provider)
+                         |-> upstream / local answer -> response
+                         `-> side effects
 ```
 
-项目仍在持续开发中，适合需要精细化控制 DNS 行为，并愿意理解其策略模型的用户。
+## 策略配置是什么样的
 
----
+下面的配置把 `corp.lan` 交给内网 DNS，其余域名使用加密上游。Provider、matcher、executor 和 server 通过 tag 组合，不需要把策略写进协议入口：
 
-## 为什么是 OxiDNS
+```yaml
+plugins:
+  - tag: internal_domains
+    type: domain_set
+    args:
+      exps: ["domain:corp.lan"]
 
-DNS 在复杂网络里往往不只是“查询一个域名”。
+  - tag: forward_internal
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://192.168.1.1:53"
 
-你可能需要：
+  - tag: forward_public
+    type: forward
+    args:
+      upstreams:
+        - addr: "tls://dns.quad9.net:853"
+          bootstrap: "9.9.9.9:53"
 
-- 根据域名、客户端、查询类型、响应 IP、返回码选择不同上游
-- 为不同设备、网段或场景应用不同策略
-- 在多个上游之间并发、回退、兜底或按结果决策
-- 对响应进行 TTL 调整、ECS 处理、重写或本地应答
-- 将 DNS 结果同步到 `ipset`、`nftset` 或 MikroTik RouterOS
-- 记录查询过程，并通过日志、查询记录和 Prometheus 插件指标理解系统状态
-- 在不中断服务的情况下热更新配置、规则和 Provider
+  - tag: main
+    type: sequence
+    args:
+      - matches: "qname $internal_domains"
+        exec: "$forward_internal"
+      - matches: "!has_resp"
+        exec: "$forward_public"
+      - exec: accept
 
-OxiDNS 为这些场景提供的是一套统一的编排模型，而不是分散的功能补丁。
+  - tag: dns_server
+    type: udp_server
+    args:
+      entry: main
+      listen: ":5335"
+```
 
----
-
-## 设计原则
-
-### 可组合
-
-OxiDNS 将 DNS 处理过程拆分为 `matcher`、`executor`、`provider` 和 `sequence`。
-
-每个组件只负责一类明确职责，再通过管线组合成完整策略。
-
-### 可调试
-
-DNS 策略一旦复杂，最重要的问题不是“能不能跑”，而是“为什么这样跑”。
-
-OxiDNS 提供查询记录（`query_recorder`）、查询摘要统计（`query_summary`）、Prometheus 插件指标（`metrics_collector`）、实时结构化日志和配置校验。用户可以明确了解一次查询经过了哪些匹配、执行了哪些动作、选择了哪个上游，以及为什么进入回退路径。
-
-### 可演进
-
-OxiDNS 面向长期运行的自建网络环境设计。
-
-它支持全量热重载、Provider 级热重载、独立构建的 WebUI 托管，并保留面向插件化和运维能力继续演进的空间。
-
-### 可控
-
-OxiDNS 不试图替你隐藏复杂性。
-
-它更适合希望明确掌控 DNS 行为的用户，而不是只想要一个一键安装面板的用户。
+完整配置结构、复用规则和更多部署模板见[配置总览](https://oxidns.org/configuration)与[常见场景](https://oxidns.org/scenarios)。
 
 ---
 
@@ -74,69 +83,21 @@ OxiDNS 不试图替你隐藏复杂性。
 
 | 类别 | 能力 |
 | --- | --- |
-| 协议 | UDP、TCP、DoT、DoQ、DoH |
-| 策略模型 | `sequence`、`matcher`、`executor`、`provider` |
-| 执行器 | `forward`、`cache`、`fallback`、`hosts`、`arbitrary`、`redirect`、`ecs_handler`、`ttl`、`black_hole`、`ip_selector`、`download`、`upgrade`、`reload`、`reload_provider`、`script`、`http_request`、`learn_domain`、`query_summary`、`query_recorder`、`metrics_collector` |
-| 匹配器 | `qname`、`question`、`qtype`、`qclass`、`client_ip`、`resp_ip`、`rcode`、`rate_limiter` 等 |
-| 数据集 | `domain_set`、`dynamic_domain_set`、`ip_set`、`geoip`、`geosite`、`adguard_rule` |
-| 出站网络 | `network.outbound` 统一配置 HTTP 下载、升级检查、webhook 与 upstream 使用的 nameservers 与 SOCKS5 |
-| 系统联动 | `ipset`、`nftset`、`ros_address_list`、`reverse_lookup` |
-| 调试与运维 | 健康检查、配置校验、热重载、查询记录、Prometheus 插件指标、实时日志 |
-| 部署能力 | 多平台构建、Debian 包、OpenWrt LuCI 插件、独立 WebUI 托管、服务化安装 |
+| 协议接入 | UDP、TCP、DoT、DoQ、DoH（HTTP/1.1、HTTP/2、HTTP/3） |
+| 策略编排 | `sequence`、条件匹配、执行器组合、跳转与回退链 |
+| 上游与出口 | 多协议上游、并发响应裁决、连接复用、bootstrap、SOCKS5、统一 `network.outbound` |
+| 响应处理 | TTL 感知缓存与负缓存、ECS、本地记录、重定向、响应构造、双栈与 IP 优选 |
+| 规则数据 | 域名与 IP 集、GeoIP、GeoSite、AdGuard 规则、动态域名学习 |
+| 系统联动 | Linux `ipset` / `nftset`、RouterOS address-list / static route、HTTP webhook、外部脚本 |
+| 可观测性 | 查询审计与执行路径、实时日志、Prometheus 指标、上游探测、健康检查 |
+| 运行时管理 | 配置校验与热重载、matcher 基础结果固定、provider 定向重载、缓存与升级管理 |
+| 部署能力 | 多平台构建、Debian 包、OpenWrt LuCI 插件、内置 WebUI 与管理 API、服务化安装 |
+
+完整的内置组件和配置字段见[插件参考](https://oxidns.org/plugin-reference/overview)。
 
 ---
 
-## 适合的使用场景
-
-OxiDNS 适合部署在需要长期运行、可调试、可扩展的 DNS 环境中。
-
-典型场景包括：
-
-- 家庭网关、旁路由、OpenWrt、NAS、Homelab
-- 多上游并发查询、主备回退、协议混合接入
-- 可配置并发上游结果选择策略，在速度与负向答案可靠性之间取舍
-- 基于域名、客户端、响应结果的精细化策略路由
-- DNS 结果驱动的 `ipset` / `nftset` / MikroTik 地址列表同步
-- 广告过滤、域名分流、本地覆盖、双栈偏好和 ECS 控制
-- 自建可控、可调试的 DNS 基础设施
-- 需要通过同一管理端口托管独立 WebUI 的轻量部署
-
----
-
-## 不适合的场景
-
-OxiDNS 不是一个面向所有人的一键 DNS 面板。
-
-如果你主要需要：
-
-- 简单、开箱即用的家庭广告过滤
-- 完整的图形化 DNS 管理体验
-- 权威 DNS 托管服务
-- Kubernetes Service Discovery 插件框架
-- 不需要理解配置模型的即装即用工具
-
-那么 AdGuard Home、Pi-hole、Technitium DNS Server 或 CoreDNS 可能更合适。
-
-OxiDNS 更适合希望以配置方式明确描述 DNS 行为，并愿意为控制力承担一定复杂度的用户。
-
----
-
-## 与其他项目的关系
-
-OxiDNS 不试图替代所有 DNS 工具：
-
-| 项目 | 更适合的方向 |
-| --- | --- |
-| AdGuard Home | 开箱即用的家庭广告过滤和 DNS 管理 |
-| Pi-hole | 简单、成熟、社区广泛的家庭 DNS 过滤 |
-| CoreDNS | 云原生和服务发现插件框架 |
-| Technitium DNS Server | 功能完整的通用 DNS 服务器 |
-| mosdns | 灵活的 DNS 分流与策略处理 |
-| OxiDNS | 高性能、可调试、可扩展的 DNS 策略编排引擎 |
-
----
-
-## 下载
+## 快速开始
 
 一条命令安装最新 release，并默认注册和启动为系统服务：
 
@@ -150,135 +111,47 @@ Windows 管理员 PowerShell：
 irm https://oxidns.org/install.ps1 | iex
 ```
 
-默认情况下，Linux / macOS 会安装到 `/opt/oxidns`，在 `/usr/local/bin` 创建 `oxidns` 命令，并安装、启动系统服务。Windows 会安装到 `%ProgramFiles%\OxiDNS`，加入 Machine PATH，并安装、启动系统服务。仅需便携安装时，可设置 `OXIDNS_INSTALL_SERVICE=0`，详见快速开始。
+默认情况下，安装脚本会下载对应平台的 release、安装 WebUI，并注册和启动系统服务。
 
-OpenWrt 用户可通过同一个安装脚本一键安装 [luci-app-oxidns](https://github.com/svenshi/luci-app-oxidns) LuCI 插件：
-
-```sh
-curl -fsSL https://oxidns.org/install.sh | sh
-# 或：
-wget -O- https://oxidns.org/install.sh | sh
-```
-
-脚本检测到 OpenWrt 后会自动下载并安装 LuCI 插件包；安装后可在 `Services -> OxiDNS` 中安装 OxiDNS 内核、托管 init 服务、编辑配置并查看日志。LuCI 插件不内置 OxiDNS 内核，首次安装内核时会从 OxiDNS 官方 GitHub Releases 下载并校验对应 Linux musl archive。
-
-卸载时默认保留 `config.yaml`：
+安装完成后，可以验证管理端和默认 DNS 服务：
 
 ```bash
-curl -fsSL https://oxidns.org/uninstall.sh | sudo sh
+curl -fsS http://127.0.0.1:9199/api/health
+dig @127.0.0.1 example.com
+dig @127.0.0.1 example.com +tcp
 ```
 
-OpenWrt：
+WebUI 默认地址为 `http://服务器IP:9199/`。允许其他设备访问前，请启用 `api.http.auth` 并通过防火墙或反向代理限制来源。修改配置后，请先使用 `oxidns check` 校验。
 
-```sh
-curl -fsSL https://oxidns.org/uninstall.sh | sh
-```
+OpenWrt 会通过同一个安装脚本安装 [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns)。完成首次查询见[快速开始](https://oxidns.org/quickstart)；手动下载、Docker、Debian 包、便携安装和卸载见文档中的“安装与部署”；按需裁剪协议和插件见[自定义编译](https://oxidns.org/custom-build)。
 
-Windows 管理员 PowerShell：
+## 适合谁
 
-```powershell
-irm https://oxidns.org/uninstall.ps1 | iex
-```
+OxiDNS 适合需要长期运行、精细控制和完整可观测性的 DNS 环境，例如：
 
-如果安装时使用了 `sudo` 或自定义 `OXIDNS_INSTALL_DIR`，卸载时也请保持相同权限和目录变量。
+- 家庭网关、旁路由、OpenWrt、NAS 和 Homelab
+- 按域名、客户端、查询类型或响应结果进行策略路由
+- 多上游并发、主备回退、加密 DNS 与自定义出口
+- 广告过滤、本地覆盖、双栈偏好、ECS 和动态规则学习
+- 由 DNS 结果驱动防火墙集合、地址列表或策略路由
 
-如果你准备手动下载 GitHub Releases，可按系统选择：
-
-| 系统 / 环境 | 推荐 release 文件 |
-| --- | --- |
-| Linux x86_64 | `oxidns-x86_64-unknown-linux-musl.tar.gz` |
-| Linux ARM64 | `oxidns-aarch64-unknown-linux-musl.tar.gz` |
-| Debian / Ubuntu x86_64 服务安装 | `*_amd64.deb` |
-| Debian / Ubuntu ARM64 服务安装 | `*_arm64.deb` |
-| OpenWrt / LuCI | OxiDNS 安装脚本，或 [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxidns) 的 `.ipk` / `.apk` 包 |
-| Alpine Linux x86_64 | `oxidns-x86_64-unknown-linux-musl.tar.gz` |
-| Alpine Linux ARM64 | `oxidns-aarch64-unknown-linux-musl.tar.gz` |
-| 32 位 ARM Linux，如部分树莓派 | `oxidns-arm-unknown-linux-musleabihf.tar.gz` |
-| macOS Intel | `oxidns-x86_64-apple-darwin.tar.gz` |
-| macOS Apple Silicon | `oxidns-aarch64-apple-darwin.tar.gz` |
-| Windows x64 | `oxidns-x86_64-pc-windows-msvc.zip` |
-| Windows 32-bit | `oxidns-i686-pc-windows-msvc.zip` |
-| Windows ARM64 | `oxidns-aarch64-pc-windows-msvc.zip` |
-| FreeBSD x86_64 | `oxidns-x86_64-unknown-freebsd.tar.gz` |
-
-Linux 下如果不确定兼容性，建议优先选择 `musl` 构建。
-
-不确定当前系统和架构时，可执行：
-
-```bash
-uname -s && uname -m
-```
-
-Windows 可在 PowerShell 中执行：
-
-```powershell
-(Get-CimInstance Win32_OperatingSystem).OSArchitecture
-```
-
-完整安装流程请参考 [快速开始](https://oxidns.org/quickstart)。
-
-### 按需裁剪
-
-OxiDNS 支持通过 Cargo features 裁剪可选协议和插件。从源码构建时:
-
-```bash
-cargo build --release                                                  # 默认 = full
-cargo build --release --no-default-features --features minimal         # 最小转发器
-cargo build --release --no-default-features --features standard        # 家用 / 路由器
-```
-
-公开协议 feature 按能力分层：`resolver-*` 用于 `network.outbound.resolver.nameservers`，`upstream-*` 用于 DNS 上游转发，`server-*` 用于入站服务协议。`standard` 包含常用的 DoT/DoH/DoQ resolver 与 upstream 能力，`full` 额外包含 DoH3。
-
-详见 [自定义编译](https://oxidns.org/custom-build)。
+它不是权威 DNS 服务，也不是无需理解配置模型的一键广告过滤面板。如果你的首要需求是开箱即用的图形化管理，其他面向该场景的产品可能更合适；OxiDNS 更适合愿意用一定配置复杂度换取控制力和可解释性的用户。
 
 ---
 
 ## 文档
 
-- [配置总览](https://oxidns.org/configuration)
-- [快速开始](https://oxidns.org/quickstart)
-- [OpenWrt LuCI 插件](https://oxidns.org/openwrt)
-- [插件总览](https://oxidns.org/plugin-reference/overview)
-- [管理 API](https://oxidns.org/api)
-- [MikroTik 策略路由](https://oxidns.org/mikrotik-policy-routing)
-- [常见场景](https://oxidns.org/scenarios)
-- [架构与设计](https://oxidns.org/architecture-and-design)
-- [性能与基准](https://oxidns.org/benchmarks)
-- [路线图](https://oxidns.org/roadmap)
+- **开始使用**：[快速开始](https://oxidns.org/quickstart) · [配置总览](https://oxidns.org/configuration) · [常见场景](https://oxidns.org/scenarios) · [从 mosdns 迁移](https://oxidns.org/migrate-from-mosdns)
+- **参考手册**：[插件总览](https://oxidns.org/plugin-reference/overview) · [管理 API](https://oxidns.org/api) · [命令行工具](https://oxidns.org/cli) · [DNS 编码速查](https://oxidns.org/dns-codes)
+- **部署运维**：[运维与故障排查](https://oxidns.org/operations) · [安全加固](https://oxidns.org/security) · [WebUI](https://oxidns.org/webui) · [OpenWrt](https://oxidns.org/openwrt)
+- **了解项目**：[架构与设计](https://oxidns.org/architecture-and-design) · [性能与基准](https://oxidns.org/benchmarks) · [文档版本](https://oxidns.org/documentation) · [版本更新](https://oxidns.org/releases) · [路线图](https://oxidns.org/roadmap)
+- **参与社区**：[贡献指南](https://oxidns.org/contributing) · [支持项目开发](https://oxidns.org/support-development) · [GitHub Discussions](https://github.com/svenshi/oxidns/discussions) · [Telegram](https://t.me/oxidns)
 
----
+## 项目状态
 
-## 路线图
-
-以下是当前规划和近期已落地的方向，按顺序排列。详细说明请参考[文档路线图](https://oxidns.org/roadmap)。
-
-1. **编译定制化**：按功能模块拆分编译，用户 fork 后可自由组合插件，构建精简的定制版本，并通过自定义仓库实现自动更新
-2. **IP 优选**：对 DNS 响应中的多个 A/AAAA 地址并行测速，自动选出延迟最低的 IP 返回给客户端
-3. **OpenWrt LuCI 插件**：通过 `luci-app-oxidns` 在 LuCI 中安装内核、托管服务、编辑配置并查看日志
-4. **MikroTik 深度集成**：新增从 RouterOS 拉取地址列表作为数据源，以及将本地 IP 集主动推送到 RouterOS 的能力
-5. **WebUI 与指标增强**：为各新增插件补充管理界面，扩展 Prometheus 指标覆盖范围
-
-长期来看，计划探索 WebAssembly 插件和动态链接库插件两种扩展机制，支持第三方开发者独立开发和分发插件。
-
----
-
-## 状态
-
-OxiDNS 仍处于持续开发阶段。
-
-当前版本适合高级用户、测试环境和自建网络场景试用。对于生产环境，请在充分理解配置、日志和回退策略后再部署。
+OxiDNS 仍在持续开发，适合高级家庭网络、软路由、Homelab 和其他可控的自建网络环境。用于生产或关键网络前，请完成配置与回退验证、容量评估和监控建设。DNS 配置会直接影响网络可用性，请在变更前保留可恢复的配置和旁路方案。
 
 欢迎提交 Issue、反馈真实场景、改进文档或贡献插件。
-
----
-
-## 免责声明
-
-本项目按"现状"提供，不对其适用性、稳定性或安全性作出保证。
-
-DNS 基础设施直接影响网络可用性、域名解析结果和访问行为。配置错误可能导致断网、DNS 泄漏或解析异常。在生产或关键环境中部署前，请充分理解配置模型、测试回退路径，并做好监控。
-
-项目维护者不对因使用本软件造成的服务中断、数据损失或安全事件承担责任。使用者应自行确保部署和使用方式符合适用的法律法规及第三方服务条款。
 
 ---
 
@@ -289,6 +162,25 @@ DNS 基础设施直接影响网络可用性、域名解析结果和访问行为�
 <a href="https://t.me/oxidns">
   <img src=".github/img/telegram-qr.png" alt="OxiDNS Telegram 群二维码" width="220" />
 </a>
+
+---
+
+## 支持项目开发
+
+如果 OxiDNS 对你有帮助，可以通过微信或支付宝支持项目的持续开发与维护。支持完全自愿，感谢每一份认可。
+
+<table>
+  <tr>
+    <th align="center">微信支付</th>
+    <th align="center">支付宝</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/static/img/support/wechat-pay.jpg" alt="支持 OxiDNS 项目开发的微信支付收款码" width="260" /></td>
+    <td align="center"><img src="docs/static/img/support/alipay.jpg" alt="支持 OxiDNS 项目开发的支付宝收款码" width="260" /></td>
+  </tr>
+</table>
+
+资金支持不会建立商业服务关系，也不会影响功能规划或问题处理的优先级。其他支持方式请参阅[贡献指南](https://oxidns.org/contributing)。
 
 ---
 

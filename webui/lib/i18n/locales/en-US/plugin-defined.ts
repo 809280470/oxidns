@@ -710,6 +710,63 @@ export const enUSPluginDefined = {
         },
       },
     },
+    response: {
+      name: "Response",
+      description:
+        "Build and replace a complete DNS response with explicit record sections",
+      fields: {
+        rcode: {
+          label: "Response code",
+          description:
+            "Base DNS RCODE as a decimal number or case-insensitive mnemonic.",
+          placeholder: "NOERROR / NXDOMAIN / 3",
+        },
+        authoritative: {
+          label: "Authoritative answer (AA)",
+          description: "Set the DNS Authoritative Answer flag.",
+        },
+        authentic_data: {
+          label: "Authentic data (AD)",
+          description: "Set the DNS Authentic Data flag.",
+        },
+        answers: {
+          label: "Answer records",
+          description:
+            "One zone-style RR per item; {qname} and {qclass} refer to the first query name and class.",
+          placeholder: "{qname} 300 {qclass} A 192.0.2.10",
+        },
+        "answers[]": {
+          label: "Enter value",
+          placeholder: "{qname} 300 {qclass} A 192.0.2.10",
+        },
+        authorities: {
+          label: "Authority records",
+          description:
+            "One zone-style RR per item; configure SOA here for NODATA negative caching.",
+          placeholder:
+            "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300",
+        },
+        "authorities[]": {
+          label: "Enter value",
+          placeholder:
+            "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300",
+        },
+        additionals: {
+          label: "Additional records",
+          description: "One zone-style RR per item.",
+          placeholder: "mail.example.com. 300 IN A 192.0.2.25",
+        },
+        "additionals[]": {
+          label: "Enter value",
+          placeholder: "mail.example.com. 300 IN A 192.0.2.25",
+        },
+        short_circuit: {
+          label: "Stop after generating response",
+          description:
+            "Stops the current executor chain by default; disable to continue with later rules.",
+        },
+      },
+    },
     redirect: {
       name: "Redirect",
       description:
@@ -1593,9 +1650,137 @@ export const enUSPluginDefined = {
         },
       },
     },
+    ros_route: {
+      name: "RouterOS Route",
+      description:
+        "Sync response IPs as per-IP static routes in a RouterOS routing table",
+      fields: {
+        address: {
+          label: "RouterOS API address",
+          placeholder: "172.16.1.1:8728",
+        },
+        username: { label: "Username" },
+        password: { label: "Password" },
+        tls: {
+          label: "TLS",
+          description: "Enable RouterOS API-SSL, typically on port 8729.",
+        },
+        "tls.server_name": { label: "Server name" },
+        "tls.ca": { label: "Custom CA file" },
+        "tls.insecure": { label: "Skip certificate verification" },
+        connect_timeout: { label: "Connect timeout" },
+        send_timeout: { label: "Send timeout" },
+        receive_timeout: { label: "Receive timeout" },
+        async: { label: "Async submission" },
+        wait_timeout: {
+          label: "Synchronous wait timeout",
+          description:
+            "Applies only when async is false; accepted work continues in the background after the timeout.",
+        },
+        queue_capacity: {
+          label: "Queue capacity",
+          description:
+            "Limits distinct route keys independently in the ingress queue and retry backlog.",
+        },
+        routing_table: { label: "Routing table", placeholder: "via_proxy" },
+        gateway4: { label: "IPv4 gateway", placeholder: "192.168.88.2@main" },
+        gateway6: { label: "IPv6 gateway", placeholder: "fe80::2%ether1" },
+        distance: { label: "Route distance" },
+        comment_prefix: { label: "Comment prefix" },
+        persistent: {
+          label: "Persistent routes",
+          description:
+            "Desired state recovered at startup and reconciled every 180 seconds; dynamic routes are excluded.",
+        },
+        "persistent.ips": {
+          label: "IP / CIDR",
+          description: "Declare persistent IP or CIDR routes inline.",
+          placeholder: "1.1.1.1\n100.64.1.0/24",
+        },
+        "persistent.ips[]": { label: "Value", placeholder: "1.1.1.1" },
+        "persistent.files": {
+          label: "Files",
+          description: "Load persistent IP or CIDR routes from external files.",
+          placeholder: "/etc/oxidns/persistent_routes.txt",
+        },
+        "persistent.files[]": {
+          label: "Value",
+          placeholder: "/etc/oxidns/persistent_routes.txt",
+        },
+        min_ttl: { label: "Minimum dynamic-route TTL" },
+        max_ttl: { label: "Maximum dynamic-route TTL" },
+        fixed_ttl: {
+          label: "Fixed dynamic-route TTL",
+          description:
+            "Set to 0 to disable time-based expiry; only later DNS observations refresh dynamic routes.",
+        },
+        conntrack_guard: {
+          label: "Connection tracking guard",
+          description:
+            "Check exact target IPs before deleting expired dynamic host routes and defer when a connection exists.",
+        },
+        cleanup_on_shutdown: {
+          label: "Clean up on shutdown",
+          description:
+            "Also applies during application-level reload, which uses shutdown/restart semantics without transferring pending observations from the old instance.",
+        },
+      },
+      metrics: {
+        labels: {
+          ros_route_observe_total: "Address observations",
+          ros_route_dropped_total: "Async drops",
+          ros_route_sync_error_total: "Sync failures",
+          ros_route_sync_timeout_total: "Sync timeouts",
+          ros_route_write_success_total: "Successful writes",
+          ros_route_write_error_total: "Failed writes",
+          ros_route_last_write_success_timestamp_seconds:
+            "Last successful write",
+          ros_route_delete_deferred_total: "Deferred deletions",
+          ros_route_connection_check_error_total: "Connection check failures",
+          ros_route_pending_observations: "Pending observations",
+          ros_route_managed_entries: "Managed routes",
+          ros_route_coalesced_total: "Coalesced observations",
+          ros_route_reconnect_total: "Reconnects",
+          ros_route_connect_attempt_total: "Connection attempts",
+          ros_route_backoff_total: "Backoffs",
+          ros_route_reconcile_error_total: "Reconciliation failures",
+          ros_route_last_reconcile_success_timestamp_seconds:
+            "Last successful reconciliation",
+          ros_route_degraded: "Degraded connection",
+          ros_route_cleanup_error_total: "Cleanup failures",
+        },
+        help: {
+          ros_route_observe_total:
+            "The total number of address observations submitted to the RouterOS route manager.",
+          ros_route_dropped_total:
+            "The total number of observations dropped because the asynchronous queue was unavailable.",
+          ros_route_sync_error_total:
+            "The total number of synchronous observations that failed in the RouterOS route manager.",
+          ros_route_sync_timeout_total:
+            "The total number of synchronous observations that timed out waiting for manager completion.",
+          ros_route_write_success_total:
+            "The total number of successful RouterOS route upserts.",
+          ros_route_write_error_total:
+            "The total number of failed RouterOS route upserts.",
+          ros_route_last_write_success_timestamp_seconds:
+            "The Unix timestamp of the most recent successful RouterOS route upsert.",
+          ros_route_delete_deferred_total:
+            "The total number of route deletions deferred because RouterOS conntrack still has a target connection.",
+          ros_route_connection_check_error_total:
+            "The total number of RouterOS conntrack queries that failed during route deletion.",
+          ros_route_pending_observations:
+            "The current number of coalesced observations waiting for the manager.",
+          ros_route_managed_entries:
+            "The number of route entries currently retained by the manager.",
+          ros_route_degraded:
+            "Whether the RouterOS transport is currently degraded.",
+        },
+      },
+    },
     ros_address_list: {
       name: "RouterOS Address List",
-      description: "Synchronize answering IP to RouterOS address-list",
+      description:
+        "Sync response IPs into an address-list consumed by firewall, mangle, or routing rules",
       fields: {
         address: {
           label: "RouterOS API address",
@@ -1611,6 +1796,13 @@ export const enUSPluginDefined = {
           label: "password",
           description: "Specify the RouterOS API login password.",
         },
+        tls: {
+          label: "TLS",
+          description: "Enable RouterOS API-SSL, typically on port 8729.",
+        },
+        "tls.server_name": { label: "Server name" },
+        "tls.ca": { label: "Custom CA file" },
+        "tls.insecure": { label: "Skip certificate verification" },
         connect_timeout: {
           label: "Connection timeout",
           description:
@@ -1631,6 +1823,16 @@ export const enUSPluginDefined = {
           description:
             "Controls whether address writing behavior is asynchronous.",
         },
+        wait_timeout: {
+          label: "Synchronous wait timeout",
+          description:
+            "Applies only when async is false; accepted work continues in the background after the timeout.",
+        },
+        queue_capacity: {
+          label: "Queue capacity",
+          description:
+            "Limits distinct IPs independently in the ingress queue and retry backlog.",
+        },
         address_list4: {
           label: "IPv4 Address List",
           description:
@@ -1649,7 +1851,7 @@ export const enUSPluginDefined = {
         persistent: {
           label: "Resident address",
           description:
-            "Define a set of static addresses that need to be retained for a long time.",
+            "Desired state recovered at startup and reconciled every 180 seconds; dynamic entries are excluded.",
         },
         "persistent.ips": {
           label: "IP / CIDR",
@@ -1682,30 +1884,58 @@ export const enUSPluginDefined = {
         },
         fixed_ttl: {
           label: "Dynamic items fixed TTL",
-          description: "Specify a fixed TTL for all dynamic writes.",
+          description:
+            "Specify a fixed TTL for dynamic entries; only later DNS observations trigger refresh.",
         },
         cleanup_on_shutdown: {
           label: "Clean up on shutdown",
           description:
-            "Controls whether entries managed by the plugin are cleaned up when it exits.",
+            "Controls cleanup during normal shutdown and application-level reload. Reload uses shutdown/restart semantics and does not transfer pending observations from the old instance.",
         },
       },
       metrics: {
         labels: {
-          ros_address_list_observe_total: "Observation domain name",
+          ros_address_list_observe_total: "Address observations",
           ros_address_list_dropped_total: "Asynchronous discard",
           ros_address_list_sync_error_total: "Sync failed",
           ros_address_list_sync_timeout_total: "Sync timeout",
+          ros_address_list_write_success_total: "Successful writes",
+          ros_address_list_write_error_total: "Failed writes",
+          ros_address_list_last_write_success_timestamp_seconds:
+            "Last successful write",
+          ros_address_list_pending_observations: "Pending observations",
+          ros_address_list_managed_entries: "Managed entries",
+          ros_address_list_coalesced_total: "Coalesced observations",
+          ros_address_list_reconnect_total: "Reconnects",
+          ros_address_list_connect_attempt_total: "Connection attempts",
+          ros_address_list_backoff_total: "Backoffs",
+          ros_address_list_reconcile_error_total: "Reconciliation failures",
+          ros_address_list_last_reconcile_success_timestamp_seconds:
+            "Last successful reconciliation",
+          ros_address_list_degraded: "Degraded connection",
+          ros_address_list_cleanup_error_total: "Cleanup failures",
         },
         help: {
           ros_address_list_observe_total:
-            "The total number of domain name observations submitted to the RouterOS address-list manager.",
+            "The total number of address observations submitted to the RouterOS address-list manager.",
           ros_address_list_dropped_total:
             "The total number of observations dropped in asynchronous mode because the queue was full or the channel was closed.",
           ros_address_list_sync_error_total:
             "The total number of observations that failed on the RouterOS manager side in sync mode.",
           ros_address_list_sync_timeout_total:
-            "The total number of observations that were queued or waited for timeout in sync mode.",
+            "The total number of synchronous observations that timed out waiting for manager completion.",
+          ros_address_list_write_success_total:
+            "The total number of successful RouterOS address-list upserts.",
+          ros_address_list_write_error_total:
+            "The total number of failed RouterOS address-list upserts.",
+          ros_address_list_last_write_success_timestamp_seconds:
+            "The Unix timestamp of the most recent successful RouterOS address-list upsert.",
+          ros_address_list_pending_observations:
+            "The current number of coalesced observations waiting for the manager.",
+          ros_address_list_managed_entries:
+            "The number of address-list entries currently retained by the manager.",
+          ros_address_list_degraded:
+            "Whether the RouterOS transport is currently degraded.",
         },
       },
     },
@@ -2259,6 +2489,67 @@ export const enUSPluginDefined = {
       },
       quickSetup: {
         paramPlaceholder: "0.1",
+      },
+    },
+    time: {
+      name: "Time",
+      description: "Match by timezone, time window, weekday, and day of month",
+      fields: {
+        timezone: {
+          label: "Timezone",
+          description:
+            "Leave empty to use the system timezone, or enter a valid IANA timezone to make policy evaluation explicit.",
+          placeholder: "Asia/Shanghai",
+        },
+        periods: {
+          label: "Time windows",
+          description:
+            "Any matching window returns true; time, weekday, and day-of-month conditions in one window must all match.",
+          placeholder:
+            '[{"start":"09:00","end":"18:00","weekdays":["mon","tue","wed","thu","fri"]}]',
+        },
+        "periods[]": {
+          label: "Time window",
+        },
+        "periods[].start": {
+          label: "Start time",
+          description: "Use HH:MM and set it together with the end time.",
+          placeholder: "09:00",
+        },
+        "periods[].end": {
+          label: "End time",
+          description:
+            "Use HH:MM; an earlier value than start crosses midnight.",
+          placeholder: "18:00",
+        },
+        "periods[].weekdays": {
+          label: "Weekdays",
+          description: "Leave empty to allow every weekday.",
+          placeholder: "mon\ntue\nwed\nthu\nfri",
+        },
+        "periods[].weekdays[]": {
+          options: {
+            mon: "Monday",
+            tue: "Tuesday",
+            wed: "Wednesday",
+            thu: "Thursday",
+            fri: "Friday",
+            sat: "Saturday",
+            sun: "Sunday",
+          },
+        },
+        "periods[].monthdays": {
+          label: "Days of month",
+          description:
+            "Enter values from 1 to 31; leave empty to allow every day.",
+          placeholder: "1\n15",
+        },
+        "periods[].monthdays[]": {
+          placeholder: "1",
+        },
+      },
+      quickSetup: {
+        paramPlaceholder: "09:00-18:00",
       },
     },
     rate_limiter: {

@@ -14,6 +14,7 @@
 //!
 //! - [`api`]: management and health HTTP endpoints.
 //! - [`app`]: foreground runtime bootstrap and process orchestration.
+//! - [`build_info`]: compiled feature and runtime plugin capability reporting.
 //! - [`cli`]: command-line definitions and option parsing.
 //! - [`config`]: YAML configuration schema, loading, and validation.
 //! - [`core`]: DNS request execution context and policy matching primitives.
@@ -28,6 +29,7 @@ pub mod api;
 #[path = "api/macros.rs"]
 mod api_macros;
 pub mod app;
+pub mod build_info;
 pub mod cli;
 pub mod config;
 pub mod core;

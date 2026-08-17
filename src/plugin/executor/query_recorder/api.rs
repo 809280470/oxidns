@@ -133,8 +133,10 @@ where
         .acquire_owned()
         .await
         .map_err(|err| DnsError::runtime(format!("query_recorder reader closed: {err}")))?;
+    let database_coordinator = backend.database_coordinator.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _access = database_coordinator.read_access()?;
         op(backend)
     })
     .await

@@ -10,7 +10,7 @@ After installation, LuCI adds `Services -> OxiDNS` pages for installing the OxiD
 
 <Admonition type="info" title="App boundary">
 
-`luci-app-oxidns` does not embed the OxiDNS core binary and no longer manages a separate OpenWrt `oxidns` package. LuCI downloads the official OxiDNS GitHub Release archive, verifies the SHA256 digest, and installs the binary as an OpenWrt service. Future OxiDNS core upgrades should use the upgrade feature built into the OxiDNS WebUI / API / CLI.
+`luci-app-oxidns` does not embed the OxiDNS core binary. LuCI downloads the official OxiDNS GitHub Release archive, verifies the SHA256 digest, and installs the binary as an OpenWrt service. Future OxiDNS core upgrades should use the upgrade feature built into the OxiDNS WebUI / API / CLI.
 
 </Admonition>
 
@@ -66,20 +66,6 @@ If the menu does not appear after installation, restart `rpcd`:
 Then open LuCI: `Services -> OxiDNS`.
 
 ## Install OxiDNS Core
-
-If you are migrating from the old OpenWrt `oxidns` package model, stop the service and remove the old runtime package first so it no longer owns `/usr/bin/oxidns` or `/etc/init.d/oxidns`:
-
-```sh
-/etc/init.d/oxidns stop
-opkg remove oxidns
-```
-
-On systems using `apk`, run:
-
-```sh
-/etc/init.d/oxidns stop
-apk del oxidns
-```
 
 1. Open `Services -> OxiDNS -> Settings` and confirm `Core repository` is `svenshi/oxidns` and `Core bundle` is `full`.
 2. Open `Services -> OxiDNS -> Core` and click `Install Core`. For offline installs, click `Upload Core` to upload an official `.tar.gz` archive or a single `oxidns` binary.

@@ -14,9 +14,9 @@ paths**:
 
 | Approach | Best for | Needs local Rust toolchain? |
 |---|---|---|
-| [Template repo + GitHub Actions](#path-1-template-repo-automated-builds) | "Rebuild my own version every time upstream releases," without forking | ❌ |
-| [Local `cargo build`](#path-2-local-cargo-build) | One-off custom binary, you already have Rust installed | ✅ |
-| [Fork the whole project](#path-3-fork-the-project) | Long-term source modifications, diverging from upstream | ✅ |
+| [Template repo + GitHub Actions](#template-build) | "Rebuild my own version every time upstream releases," without forking | ❌ |
+| [Local `cargo build`](#local-build) | One-off custom binary, you already have Rust installed | ✅ |
+| [Fork the whole project](#fork-build) | Long-term source modifications, diverging from upstream | ✅ |
 
 <Admonition type="tip" title="Cargo Default Features">
 
@@ -28,19 +28,24 @@ slim-build mode.
 
 ---
 
-## Bundles
+## Bundles \{#preset-capability-matrix}
 
-| Bundle | Use case | Approx. size |
+| Bundle | Use case | Relative size |
 |---|---|---|
-| `minimal` | Low-memory devices / containers / experiments — UDP/TCP forwarding only | ~8.9 MB |
-| `standard` | Home router — WebUI + encrypted protocols + common plugins | between the two |
-| `full` (default) | Everything, equivalent to the official release | ~21 MB |
+| `minimal` | Low-memory devices / containers / experiments — UDP/TCP forwarding only | smallest |
+| `standard` | Home router — WebUI + encrypted protocols + common plugins | medium |
+| `full` (default) | Everything, equivalent to the official release | largest |
 
 <Admonition type="note">
 
 When you mix and match features yourself, the actual capability is the one
 reported by `oxidns build-info` or `GET /api/build`. The list below describes
 the **official preset** contents.
+
+Binary size varies with the Rust toolchain, dependency versions, target,
+linking mode, and UPX processing. For capacity planning, measure the target
+release asset or a local artifact built with the same flags instead of treating
+historical sizes as a fixed commitment.
 
 </Admonition>
 
@@ -57,7 +62,7 @@ optional plugins are dropped. The dependency closure excludes hyper / rustls
 - Providers: `domain_set`, `ip_set`
 - Matchers: all
 - Executors: `sequence`, `forward`, `cache`, `fallback`, `hosts`, `redirect`,
-  `dual_selector`, `ecs_handler`, `ttl`, `drop_resp`, `black_hole`,
+  `prefer_ipv4`, `prefer_ipv6`, `ecs_handler`, `ttl`, `drop_resp`, `black_hole`,
   `debug_print`, `reload`
 - In-process metric counters (no HTTP endpoint)
 
@@ -76,9 +81,12 @@ of `minimal`.
 
 - Management: HTTP API, WebUI, Prometheus `/metrics`, `metrics_collector`
 - Inbound / upstream: DoT, DoH (HTTP/1.1 / HTTP/2), DoQ
-- Providers: `geoip`, `geosite`, `v2ray_dat`, `adguard_rule`
-- Executors: `arbitrary`, `cron`, `download`, `http_request`,
-  `reverse_lookup`, `query_recorder`, `script`
+- `network.outbound` resolver: DoT, DoH (HTTP/2), and DoQ nameservers
+- Providers: `geoip`, `geosite`, `v2ray_dat`, `adguard_rule`,
+  `dynamic_domain_set`
+- Executors: `arbitrary`, `response`, `cron`, `download`, `http_request`,
+  `reverse_lookup`, `query_recorder`, `script`, `ip_selector`, and
+  `learn_domain`
 - `upgrade` CLI subcommand and `upgrade` executor
 
 ### `full` (default) — everything
@@ -87,8 +95,8 @@ Adds DoH3 and platform integrations on top of `standard`.
 
 **Additional**
 
-- Inbound / upstream: DoH HTTP/3
-- Executors: `ros_address_list` (MikroTik), `ipset`, `nftset`
+- Inbound / upstream / `network.outbound` resolver: DoH HTTP/3
+- Executors: `ros_address_list` / `ros_route` (MikroTik), `ipset`, `nftset`
 
 ### Official release matrix
 
@@ -114,6 +122,10 @@ preset.
 | `server-doh` | DoH (HTTP/1.1 / HTTP/2 over TLS) inbound server, hyper server + rustls |
 | `server-doq` | DoQ (QUIC) inbound server, `quinn` |
 | `server-doh3` | HTTP/3 leg on the DoH server (requires `server-doh`), adds `h3` / `h3-quinn` / `quinn` |
+| `resolver-dot` | Allow `network.outbound.resolver.nameservers` to use DoT |
+| `resolver-doh` | Allow `network.outbound.resolver.nameservers` to use DoH (HTTP/2) |
+| `resolver-doq` | Allow `network.outbound.resolver.nameservers` to use DoQ |
+| `resolver-doh3` | Allow `network.outbound.resolver.nameservers` to use DoH HTTP/3 (requires `resolver-doh`) |
 | `upstream-dot` | DoT upstreams (`tls://` scheme) |
 | `upstream-doh` | DoH (HTTP/2) upstreams (`https://` scheme) |
 | `upstream-doq` | DoQ upstreams (`quic://` / `doq://` scheme) |
@@ -149,12 +161,17 @@ path.
 
 | Feature | Plugin | Main dependency |
 |---|---|---|
-| `plugin-mikrotik` | `ros_address_list` | `mikrotik-rs` |
+| `plugin-mikrotik` | Aggregate feature for `ros_address_list` + `ros_route` | `mikrotik-rs` |
+| `plugin-ros-address-list` | `ros_address_list` | `mikrotik-rs` |
+| `plugin-ros-route` | `ros_route` | `mikrotik-rs` |
 | `plugin-query-recorder` | `query_recorder` | `rusqlite` (bundled SQLite) |
 | `plugin-ipset` | `ipset` + `nftset` | `ripset` (Linux only) |
 | `plugin-cron` | `cron` | `cronexpr` |
+| `plugin-dynamic-domain` | `dynamic_domain_set` provider + `learn_domain` executor | — |
+| `plugin-ip-selector` | `ip_selector` | — |
 | `plugin-script` | `script` | — |
 | `plugin-arbitrary` | `arbitrary` | `oxidns-zoneparser` |
+| `plugin-response` | `response` | `oxidns-zoneparser` |
 | `plugin-download` | `download` | — |
 | `plugin-http-request` | `http_request` | — |
 | `plugin-reverse-lookup` | `reverse_lookup` | — |
@@ -164,7 +181,7 @@ path.
 
 ---
 
-## Path 1: template repo (automated builds)
+## Path 1: template repo (automated builds) \{#template-build}
 
 If you don't want to fork the project but still want **"every time upstream
 releases, automatically rebuild with my own feature set and target list,
@@ -181,7 +198,7 @@ and publish to my own release feed"**, start from the official template:
 ```
 svenshi/oxidns                     you/oxidns-build (from template)
 ─────────────                      ────────────────────────────────
- release v1.2.0  ─poll every 30m─▶ watch-upstream.yml
+ release vX.Y.Z  ─poll every 30m─▶ watch-upstream.yml
                                             │
                                             ▼  reads build.config.yml
                                     build.yml (~50-line shell)
@@ -295,11 +312,11 @@ breaks `oxidns upgrade`.
 
 ### Supported targets
 
-Identical to upstream's `release.yml` — 12 targets:
+Identical to upstream's `release.yml` — 13 targets:
 
 - `x86_64-unknown-linux-gnu` / `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-gnu` / `aarch64-unknown-linux-musl`
-- `i686-unknown-linux-musl` / `arm-unknown-linux-musleabihf`
+- `i686-unknown-linux-musl` / `arm-unknown-linux-musleabihf` / `armv7-unknown-linux-musleabihf`
 - `x86_64-apple-darwin` / `aarch64-apple-darwin`
 - `x86_64-unknown-freebsd`
 - `x86_64-pc-windows-msvc` / `i686-pc-windows-msvc` / `aarch64-pc-windows-msvc`
@@ -308,7 +325,7 @@ Comment out the targets you don't need in `build.config.yml` to shorten CI.
 
 ---
 
-## Path 2: local `cargo build`
+## Path 2: local `cargo build` \{#local-build}
 
 When you already have Rust installed and just want a one-off custom binary:
 
@@ -322,8 +339,11 @@ cargo build --release --no-default-features --features minimal
 # Home router (API, DoT/DoH/DoQ, geo, adguard, ...)
 cargo build --release --no-default-features --features standard
 
-# minimal + MikroTik integration on top
+# minimal + both MikroTik plugins on top
 cargo build --release --no-default-features --features "minimal,plugin-mikrotik"
+
+# Or add only one of the plugins
+cargo build --release --no-default-features --features "minimal,plugin-ros-address-list"
 
 # Plain forwarder + management API, no heavy plugins
 cargo build --release --no-default-features --features "minimal,api"
@@ -335,7 +355,7 @@ WebUI assets need a separate build — see
 
 ---
 
-## Path 3: fork the project
+## Path 3: fork the project \{#fork-build}
 
 For long-term source modifications:
 
@@ -396,7 +416,7 @@ mid-run crash.
 what do I do?**
 A: Usually nothing. The template's `build.yml` pins to
 `svenshi/oxidns@main`, so the next trigger picks up the latest logic
-automatically. Pin to `@v1.2.0` (or any tag) for a fixed version.
+automatically. Pin to an actual tag in the form `@vX.Y.Z` for a fixed version.
 
 **Q: Can I build a PR branch or a specific commit?**
 A: The template supports release tags only today. To build branches or

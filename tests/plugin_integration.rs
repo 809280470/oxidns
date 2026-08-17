@@ -36,11 +36,13 @@ use oxidns::infra::network::transport::udp::UdpTransport;
 use oxidns::plugin;
 use oxidns::plugin::executor::ExecStep;
 use oxidns::plugin::{PluginRegistry, PluginType};
+#[cfg(any(feature = "plugin-dynamic-domain", feature = "plugin-response"))]
+use oxidns::proto::RData;
+#[cfg(feature = "plugin-dynamic-domain")]
+use oxidns::proto::Record;
 #[cfg(feature = "plugin-dynamic-domain")]
 use oxidns::proto::rdata::A;
 use oxidns::proto::{DNSClass, Message, Name, Question, Rcode, RecordType};
-#[cfg(feature = "plugin-dynamic-domain")]
-use oxidns::proto::{RData, Record};
 use tempfile::TempDir;
 #[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -656,6 +658,73 @@ plugins:
     Ok(())
 }
 
+#[cfg(feature = "plugin-ros-route")]
+#[tokio::test]
+async fn test_ros_route_plugin_init_accepts_config_and_registers_executor() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: ros_route_policy
+    type: ros_route
+    args:
+      address: "127.0.0.1:9"
+      username: "api-user"
+      password: "secret"
+      connect_timeout: 1
+      send_timeout: 1
+      receive_timeout: 1
+      routing_table: "via_proxy"
+      gateway4: "192.0.2.1@main"
+      fixed_ttl: 0
+      cleanup_on_shutdown: false
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let route = registry
+        .get_plugin("ros_route_policy")
+        .expect("ros_route plugin should be registered");
+
+    assert_eq!(route.plugin_type, PluginType::Executor);
+    assert_eq!(route.plugin_name, "ros_route");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-ros-address-list")]
+#[tokio::test]
+async fn test_ros_address_list_plugin_init_accepts_tls() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: ros_address_list_policy
+    type: ros_address_list
+    args:
+      address: "127.0.0.1:9"
+      username: "api-user"
+      password: "secret"
+      tls:
+        insecure: true
+      connect_timeout: 1
+      send_timeout: 1
+      receive_timeout: 1
+      address_list4: "oxidns_ipv4"
+      fixed_ttl: 0
+      cleanup_on_shutdown: false
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let address_list = registry
+        .get_plugin("ros_address_list_policy")
+        .expect("ros_address_list plugin should be registered");
+
+    assert_eq!(address_list.plugin_type, PluginType::Executor);
+    assert_eq!(address_list.plugin_name, "ros_address_list");
+
+    registry.destroy().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_plugin_system_init_resolves_sequence_dependency_and_quick_setup() -> Result<()> {
     let yaml = r#"
@@ -1004,6 +1073,66 @@ plugins:
 }
 
 #[tokio::test]
+async fn test_time_matcher_config_and_quick_setup_initialize() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: office_hours
+    type: time
+    args:
+      timezone: Asia/Shanghai
+      periods:
+        - start: "09:00"
+          end: "18:00"
+          weekdays: [1, 2, 3, 4, 5]
+        - monthdays: [1, 15]
+  - tag: seq
+    type: sequence
+    args:
+      - matches: time 22:00-02:00
+        exec: accept
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("office_hours")
+        .expect("time matcher should be registered");
+    assert_eq!(matcher.plugin_type, PluginType::Matcher);
+    assert_eq!(matcher.plugin_name, "time");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_time_matcher_rejects_invalid_period_config() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: invalid_time
+    type: time
+    args:
+      periods:
+        - start: "09:00"
+          end: "09:00"
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("same time boundaries must be rejected");
+    assert!(
+        err.to_string()
+            .contains("periods[0].start and periods[0].end must differ")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_sequence_accept_in_jump_stops_current_and_parent_sequences() -> Result<()> {
     let yaml = r#"
 log:
@@ -1155,6 +1284,59 @@ plugins:
     assert_eq!(response.rcode(), Rcode::NoError);
     assert!(response.answers().is_empty());
     assert!(response.authorities().is_empty());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-response")]
+#[tokio::test]
+async fn test_response_plugin_builds_soa_backed_nodata() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: suppress_https
+    type: response
+    args:
+      rcode: NOERROR
+      authorities:
+        - "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300"
+  - tag: seq
+    type: sequence
+    args:
+      - matches: qtype HTTPS
+        exec: $suppress_https
+      - exec: reject SERVFAIL
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "apple.com.", RecordType::HTTPS);
+
+    assert!(matches!(
+        sequence.execute(&mut context).await?,
+        ExecStep::Stop
+    ));
+    let response = context
+        .response()
+        .expect("response plugin should set a response");
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.answers().is_empty());
+    assert_eq!(response.authorities().len(), 1);
+    let soa = &response.authorities()[0];
+    assert_eq!(soa.name(), &Name::from_ascii("apple.com.")?);
+    assert_eq!(soa.class(), DNSClass::IN);
+    assert_eq!(soa.rr_type(), RecordType::SOA);
+    assert_eq!(soa.ttl(), 300);
+    let RData::SOA(soa_rdata) = soa.data() else {
+        panic!("authority record should carry SOA data");
+    };
+    assert_eq!(soa_rdata.minimum(), 300);
 
     registry.destroy().await;
     Ok(())

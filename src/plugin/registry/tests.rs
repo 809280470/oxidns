@@ -44,10 +44,32 @@ fn test_get_nonexistent_plugin() {
     assert!(registry.get_plugin("nonexistent").is_none());
 }
 
+#[cfg(feature = "api")]
 #[tokio::test]
-async fn test_init_runtime_failure_preserves_current_runtime() {
+async fn matcher_runtime_control_is_not_attached_when_api_is_not_running() {
+    let mut registry = PluginRegistry::new();
+    registry.register_factory("qname", DependencyKind::Matcher, Box::new(QnameFactory {}));
+    let registry = Arc::new(registry);
+    let configs = vec![PluginConfig {
+        tag: "match_qname".to_string(),
+        plugin_type: "qname".to_string(),
+        args: Some(serde_yaml_ng::from_str("- example.com").unwrap()),
+    }];
+
+    registry
+        .clone()
+        .init_plugins_with_runtime_controls(configs, false)
+        .await
+        .expect("plugin init should succeed");
+
+    assert!(registry.runtime_controls().is_empty());
+    registry.destroy().await;
+}
+
+#[tokio::test]
+async fn test_init_runtime_failure_leaves_runtime_stopped() {
     let manager = PluginRuntimeManager::new();
-    let first = manager
+    manager
         .init_runtime(test_config(Vec::new()))
         .await
         .expect("empty runtime should initialize");
@@ -62,10 +84,7 @@ async fn test_init_runtime_failure_preserves_current_runtime() {
         .expect_err("unknown plugin type should fail initialization");
     assert!(err.to_string().contains("Unknown plugin type"));
 
-    let current = manager
-        .current_runtime()
-        .expect("previous runtime should remain installed");
-    assert!(Arc::ptr_eq(&first, &current));
+    assert!(manager.current_runtime().is_none());
 
     manager.destroy_runtime().await;
 }
@@ -118,6 +137,10 @@ impl Plugin for CaptureProvider {
 impl Provider for CaptureProvider {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    async fn reload(&self) -> Result<()> {
+        Ok(())
     }
 
     fn contains_name(&self, _name: &Name) -> bool {
@@ -232,6 +255,15 @@ async fn test_init_plugins_passes_quick_setup_dependents_to_create_context() {
             kind: DependencyKind::Executor,
             field: "args[0].matches[0] -> quick_setup(qname).domain_set_tags[0]".to_string(),
         }]
+    );
+    assert_eq!(
+        registry
+            .runtime_controls()
+            .into_iter()
+            .map(|(tag, _)| tag)
+            .collect::<Vec<_>>(),
+        vec!["zzz_provider"],
+        "quick-setup matchers must remain internal and must not expose runtime controls"
     );
 
     registry.destroy().await;

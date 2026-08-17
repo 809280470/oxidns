@@ -19,9 +19,7 @@ use crate::core::rule_matcher::IpPrefixMatcher;
 use crate::infra::clock::AppClock;
 use crate::infra::error::{DnsError, Result as DnsResult};
 use crate::plugin::provider::Provider;
-use crate::plugin::provider::v2ray_dat::{
-    Cidr, GeoIp, GeoIpList, geoip_code, normalized_selectors,
-};
+use crate::plugin::provider::v2ray::{Cidr, GeoIp, GeoIpList, geoip_code, normalized_selectors};
 use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
 use crate::plugin_factory;
 

@@ -255,6 +255,24 @@ plugins:
     );
 }
 
+#[cfg(not(feature = "plugin-response"))]
+#[tokio::test]
+async fn response_type_not_compiled_is_unknown_plugin() {
+    let yaml = r#"
+plugins:
+  - tag: response_main
+    type: response
+    args:
+      answers:
+        - "example.com. 60 IN A 192.0.2.10"
+"#;
+    let err = start_error(yaml).await;
+    assert!(
+        err.contains("Unknown plugin type"),
+        "expected an unknown-plugin-type error, got: {err}"
+    );
+}
+
 // --- Positive: protocol feature compiled in --------------------------------
 
 #[cfg(feature = "upstream-dot")]
@@ -284,6 +302,29 @@ plugins:
     type: sequence
     args:
       - exec: "$arbitrary_main"
+  - tag: udp_main
+    type: udp_server
+    args:
+      entry: entry
+      listen: "127.0.0.1:0"
+"#;
+    start_ok(yaml).await;
+}
+
+#[cfg(feature = "plugin-response")]
+#[tokio::test]
+async fn response_builds_when_compiled() {
+    let yaml = r#"
+plugins:
+  - tag: response_main
+    type: response
+    args:
+      answers:
+        - "{qname} 60 {qclass} A 192.0.2.10"
+  - tag: entry
+    type: sequence
+    args:
+      - exec: "$response_main"
   - tag: udp_main
     type: udp_server
     args:

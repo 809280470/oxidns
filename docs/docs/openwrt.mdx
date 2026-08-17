@@ -10,7 +10,7 @@ OxiDNS 支持通过 [`luci-app-oxidns`](https://github.com/svenshi/luci-app-oxid
 
 <Admonition type="info" title="插件边界">
 
-`luci-app-oxidns` 不内置 OxiDNS 内核，也不再管理独立的 OpenWrt `oxidns` 包。LuCI 负责从 OxiDNS 官方 GitHub Releases 下载 release archive、校验 SHA256 digest，并把二进制安装为 OpenWrt 服务。后续 OxiDNS 内核升级请使用 OxiDNS 自带的 WebUI / API / CLI 升级能力。
+`luci-app-oxidns` 不内置 OxiDNS 内核。LuCI 负责从 OxiDNS 官方 GitHub Releases 下载 release archive、校验 SHA256 digest，并把二进制安装为 OpenWrt 服务。后续 OxiDNS 内核升级请使用 OxiDNS 自带的 WebUI / API / CLI 升级能力。
 
 </Admonition>
 
@@ -66,20 +66,6 @@ apk add --allow-untrusted --no-network ./luci-i18n-oxidns-zh-cn_*.apk
 然后打开 LuCI：`Services -> OxiDNS`。
 
 ## 安装 OxiDNS 内核
-
-如果从旧的 OpenWrt `oxidns` 包模式迁移，先停止服务并移除旧内核包，避免它继续拥有 `/usr/bin/oxidns` 或 `/etc/init.d/oxidns`：
-
-```sh
-/etc/init.d/oxidns stop
-opkg remove oxidns
-```
-
-使用 `apk` 的系统对应执行：
-
-```sh
-/etc/init.d/oxidns stop
-apk del oxidns
-```
 
 1. 打开 `Services -> OxiDNS -> Settings`，确认 `Core repository` 为 `svenshi/oxidns`，`Core bundle` 为 `full`。
 2. 打开 `Services -> OxiDNS -> Core`，点击 `Install Core`。离线环境可点击 `Upload Core` 上传官方 `.tar.gz` archive 或单个 `oxidns` 二进制。
